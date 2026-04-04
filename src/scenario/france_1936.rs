@@ -3,8 +3,8 @@ use fory::ForyObject;
 use crate::data::{DataError, StructuredFrance1936Dataset};
 use crate::domain::{
     CountryLaws, DivisionTemplate, EquipmentDemand, EquipmentFactoryAllocation, EquipmentKind,
-    ForceGoalSpec, ForcePlan, GameDate, Milestone, MilestoneKind, ModeledEquipmentProfiles,
-    PivotWindow, ResourceLedger,
+    ForceGoalSpec, ForcePlan, GameDate, HardFocusGoal, IdeaDefinition, Milestone, MilestoneKind,
+    ModeledEquipmentProfiles, NationalFocus, PivotWindow, ResourceLedger,
 };
 use crate::sim::{
     CountryRuntime, CountryState, ProductionLine, SimulationConfig, StateDefinition, StateId,
@@ -36,6 +36,12 @@ pub struct France1936Scenario {
     pub equipment_profiles: ModeledEquipmentProfiles,
     pub domestic_resources: ResourceLedger,
     pub starting_fielded_divisions: u16,
+    pub starting_research_slots: u8,
+    pub starting_ideas: Box<[Box<str>]>,
+    pub starting_country_flags: Box<[Box<str>]>,
+    pub focuses: Box<[NationalFocus]>,
+    pub ideas: Box<[IdeaDefinition]>,
+    pub hard_focus_goals: Box<[HardFocusGoal]>,
     pub frontier_forts: [FrontierFortRequirement; 2],
     pub economic_construction_order: Box<[StateId]>,
     pub infrastructure_order: Box<[StateId]>,
@@ -74,6 +80,7 @@ impl France1936Scenario {
                 building_slots: 12,
                 economic_weight: 12,
                 infrastructure_target: 8,
+                is_core_of_root: true,
                 frontier: None,
                 resources: ResourceLedger {
                     steel: 4,
@@ -88,6 +95,7 @@ impl France1936Scenario {
                 building_slots: 9,
                 economic_weight: 10,
                 infrastructure_target: 7,
+                is_core_of_root: true,
                 frontier: Some(Frontier::Belgium),
                 resources: ResourceLedger {
                     steel: 8,
@@ -101,6 +109,7 @@ impl France1936Scenario {
                 building_slots: 8,
                 economic_weight: 9,
                 infrastructure_target: 7,
+                is_core_of_root: true,
                 frontier: None,
                 resources: ResourceLedger {
                     steel: 2,
@@ -114,6 +123,7 @@ impl France1936Scenario {
                 building_slots: 7,
                 economic_weight: 7,
                 infrastructure_target: 6,
+                is_core_of_root: true,
                 frontier: None,
                 resources: ResourceLedger {
                     steel: 1,
@@ -128,6 +138,7 @@ impl France1936Scenario {
                 building_slots: 8,
                 economic_weight: 8,
                 infrastructure_target: 6,
+                is_core_of_root: true,
                 frontier: None,
                 resources: ResourceLedger {
                     steel: 3,
@@ -142,6 +153,7 @@ impl France1936Scenario {
                 building_slots: 8,
                 economic_weight: 7,
                 infrastructure_target: 6,
+                is_core_of_root: true,
                 frontier: None,
                 resources: ResourceLedger {
                     tungsten: 3,
@@ -156,6 +168,7 @@ impl France1936Scenario {
                 building_slots: 8,
                 economic_weight: 9,
                 infrastructure_target: 7,
+                is_core_of_root: true,
                 frontier: None,
                 resources: ResourceLedger {
                     aluminium: 5,
@@ -170,6 +183,7 @@ impl France1936Scenario {
                 building_slots: 6,
                 economic_weight: 6,
                 infrastructure_target: 6,
+                is_core_of_root: true,
                 frontier: None,
                 resources: ResourceLedger {
                     tungsten: 4,
@@ -184,6 +198,7 @@ impl France1936Scenario {
                 building_slots: 9,
                 economic_weight: 9,
                 infrastructure_target: 7,
+                is_core_of_root: true,
                 frontier: Some(Frontier::Germany),
                 resources: ResourceLedger {
                     steel: 16,
@@ -198,6 +213,7 @@ impl France1936Scenario {
                 building_slots: 8,
                 economic_weight: 8,
                 infrastructure_target: 7,
+                is_core_of_root: true,
                 frontier: Some(Frontier::Germany),
                 resources: ResourceLedger {
                     steel: 10,
@@ -211,6 +227,7 @@ impl France1936Scenario {
                 building_slots: 8,
                 economic_weight: 8,
                 infrastructure_target: 6,
+                is_core_of_root: true,
                 frontier: None,
                 resources: ResourceLedger {
                     steel: 4,
@@ -224,6 +241,7 @@ impl France1936Scenario {
                 building_slots: 8,
                 economic_weight: 8,
                 infrastructure_target: 6,
+                is_core_of_root: true,
                 frontier: Some(Frontier::Belgium),
                 resources: ResourceLedger {
                     steel: 4,
@@ -335,6 +353,12 @@ impl France1936Scenario {
             equipment_profiles,
             domestic_resources,
             starting_fielded_divisions,
+            starting_research_slots: 2,
+            starting_ideas: Vec::new().into_boxed_slice(),
+            starting_country_flags: Vec::new().into_boxed_slice(),
+            focuses: Vec::new().into_boxed_slice(),
+            ideas: Vec::new().into_boxed_slice(),
+            hard_focus_goals: Vec::new().into_boxed_slice(),
             frontier_forts: Self::default_frontier_requirements(),
             economic_construction_order: vec![
                 Self::ILE_DE_FRANCE,
@@ -420,6 +444,7 @@ impl France1936Scenario {
                     building_slots: state.building_slots,
                     economic_weight: state.economic_weight,
                     infrastructure_target: state.infrastructure_target,
+                    is_core_of_root: state.is_core_of_root,
                     frontier: state.frontier,
                     resources: state.resources,
                 })
@@ -535,6 +560,12 @@ impl France1936Scenario {
             equipment_profiles: dataset.equipment_profiles,
             domestic_resources,
             starting_fielded_divisions: dataset.starting_fielded_divisions,
+            starting_research_slots: 2,
+            starting_ideas: Vec::new().into_boxed_slice(),
+            starting_country_flags: Vec::new().into_boxed_slice(),
+            focuses: Vec::new().into_boxed_slice(),
+            ideas: Vec::new().into_boxed_slice(),
+            hard_focus_goals: Vec::new().into_boxed_slice(),
             frontier_forts: Self::default_frontier_requirements(),
             economic_construction_order,
             infrastructure_order,
@@ -548,17 +579,58 @@ impl France1936Scenario {
     }
 
     pub fn bootstrap_runtime(&self) -> CountryRuntime {
-        CountryRuntime::new(
+        let mut runtime = CountryRuntime::new(
             self.initial_country,
             self.initial_state_defs.clone(),
             self.initial_states.clone(),
             self.initial_production_lines.clone(),
         )
+        .with_research_slots(self.starting_research_slots)
         .with_fielded_force(
             self.starting_fielded_divisions
                 .min(self.force_plan.frontline_divisions),
             self.force_plan.template.per_division_demand(),
-        )
+        );
+
+        for idea in self.starting_ideas.iter().cloned() {
+            runtime.add_idea(idea, None);
+        }
+        for flag in self.starting_country_flags.iter().cloned() {
+            runtime.set_country_flag(flag);
+        }
+
+        runtime
+    }
+
+    pub fn focus_by_id(&self, id: &str) -> Option<&NationalFocus> {
+        self.focuses.iter().find(|focus| focus.id.as_ref() == id)
+    }
+
+    pub fn idea_by_id(&self, id: &str) -> Option<&IdeaDefinition> {
+        self.ideas.iter().find(|idea| idea.id.as_ref() == id)
+    }
+
+    pub fn with_exact_focus_data(
+        mut self,
+        starting_research_slots: u8,
+        starting_ideas: Vec<Box<str>>,
+        starting_country_flags: Vec<Box<str>>,
+        focuses: Vec<NationalFocus>,
+        ideas: Vec<IdeaDefinition>,
+        hard_focus_goals: Vec<HardFocusGoal>,
+    ) -> Self {
+        self.starting_research_slots = starting_research_slots;
+        self.starting_ideas = starting_ideas.into_boxed_slice();
+        self.starting_country_flags = starting_country_flags.into_boxed_slice();
+        self.focuses = focuses.into_boxed_slice();
+        self.ideas = ideas.into_boxed_slice();
+        self.hard_focus_goals = hard_focus_goals.into_boxed_slice();
+        self
+    }
+
+    pub fn with_hard_focus_goals(mut self, hard_focus_goals: Vec<HardFocusGoal>) -> Self {
+        self.hard_focus_goals = hard_focus_goals.into_boxed_slice();
+        self
     }
 
     pub fn readiness_demand_for(&self, divisions: u16) -> EquipmentDemand {
@@ -986,6 +1058,7 @@ mod tests {
                     building_slots: 12,
                     economic_weight: 20,
                     infrastructure_target: 9,
+                    is_core_of_root: true,
                     frontier: None,
                     resources: ResourceLedger {
                         steel: 5,
@@ -1005,6 +1078,7 @@ mod tests {
                     building_slots: 8,
                     economic_weight: 15,
                     infrastructure_target: 8,
+                    is_core_of_root: true,
                     frontier: Some(Frontier::Belgium),
                     resources: ResourceLedger {
                         steel: 7,
@@ -1023,6 +1097,7 @@ mod tests {
                     building_slots: 8,
                     economic_weight: 14,
                     infrastructure_target: 8,
+                    is_core_of_root: true,
                     frontier: Some(Frontier::Germany),
                     resources: ResourceLedger {
                         steel: 10,

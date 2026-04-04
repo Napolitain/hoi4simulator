@@ -13,7 +13,7 @@ pub use rules::{
     ConstructionDecisionContext, FranceHeuristicRules, ProductionDecisionContext, RuleViolation,
 };
 pub use state::{
-    AdvisorRoster, ConstructionProject, CountryRuntime, CountryState, FocusProgress, FocusSummary,
-    FrancePlanningState, POLITICAL_POWER_UNIT, ProductionLine, ResearchSlotState, ResearchSummary,
-    StateDefinition, StateRuntime, Stockpile, StrategicPhase,
+    ActiveIdea, AdvisorRoster, CompletedFocus, ConstructionProject, CountryRuntime, CountryState,
+    FocusProgress, FrancePlanningState, POLITICAL_POWER_UNIT, ProductionLine, ResearchSlotState,
+    ResearchSummary, StateDefinition, StateRuntime, Stockpile, StrategicPhase,
 };

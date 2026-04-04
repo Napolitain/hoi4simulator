@@ -53,7 +53,17 @@ impl ClausewitzValue {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClausewitzAssignment {
     pub key: Box<str>,
+    pub operator: ClausewitzOperator,
     pub value: ClausewitzValue,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClausewitzOperator {
+    Assign,
+    GreaterThan,
+    GreaterOrEqual,
+    LessThan,
+    LessOrEqual,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,7 +80,10 @@ pub struct ClausewitzBlock {
 impl ClausewitzBlock {
     pub fn first_assignment(&self, key: &str) -> Option<&ClausewitzValue> {
         self.items.iter().find_map(|item| match item {
-            ClausewitzItem::Assignment(assignment) if assignment.key.as_ref() == key => {
+            ClausewitzItem::Assignment(assignment)
+                if assignment.key.as_ref() == key
+                    && assignment.operator == ClausewitzOperator::Assign =>
+            {
                 Some(&assignment.value)
             }
             _ => None,
@@ -82,7 +95,10 @@ impl ClausewitzBlock {
         key: &'a str,
     ) -> impl Iterator<Item = &'a ClausewitzValue> + 'a {
         self.items.iter().filter_map(move |item| match item {
-            ClausewitzItem::Assignment(assignment) if assignment.key.as_ref() == key => {
+            ClausewitzItem::Assignment(assignment)
+                if assignment.key.as_ref() == key
+                    && assignment.operator == ClausewitzOperator::Assign =>
+            {
                 Some(&assignment.value)
             }
             _ => None,
@@ -95,6 +111,10 @@ enum Token {
     LeftBrace,
     RightBrace,
     Equals,
+    GreaterThan,
+    GreaterOrEqual,
+    LessThan,
+    LessOrEqual,
     Atom(Box<str>),
     Quoted(Box<str>),
 }
@@ -124,6 +144,24 @@ fn tokenize(content: &str) -> Result<Vec<Token>, String> {
                 tokens.push(Token::Equals);
                 index += 1;
             }
+            '>' => {
+                if index + 1 < chars.len() && chars[index + 1] == '=' {
+                    tokens.push(Token::GreaterOrEqual);
+                    index += 2;
+                } else {
+                    tokens.push(Token::GreaterThan);
+                    index += 1;
+                }
+            }
+            '<' => {
+                if index + 1 < chars.len() && chars[index + 1] == '=' {
+                    tokens.push(Token::LessOrEqual);
+                    index += 2;
+                } else {
+                    tokens.push(Token::LessThan);
+                    index += 1;
+                }
+            }
             '"' => {
                 index += 1;
                 let mut value = String::new();
@@ -149,14 +187,14 @@ fn tokenize(content: &str) -> Result<Vec<Token>, String> {
                     index += 1;
                 }
             }
-            ch if ch.is_whitespace() => {
+            ch if ch.is_whitespace() || ch == '\u{feff}' => {
                 index += 1;
             }
             _ => {
                 let start = index;
                 while index < chars.len()
                     && !chars[index].is_whitespace()
-                    && !matches!(chars[index], '{' | '}' | '=' | '#')
+                    && !matches!(chars[index], '{' | '}' | '=' | '>' | '<' | '#')
                 {
                     index += 1;
                 }
@@ -205,10 +243,11 @@ impl Parser {
     fn parse_item(&mut self) -> Result<ClausewitzItem, String> {
         if self.looks_like_assignment() {
             let key = self.parse_key()?;
-            self.expect_equals()?;
+            let operator = self.parse_operator()?;
             let value = self.parse_value()?;
             return Ok(ClausewitzItem::Assignment(ClausewitzAssignment {
                 key,
+                operator,
                 value,
             }));
         }
@@ -227,6 +266,9 @@ impl Parser {
         match self.peek() {
             Some(Token::LeftBrace) => Ok(ClausewitzValue::Block(self.parse_block()?)),
             Some(Token::Atom(_)) | Some(Token::Quoted(_)) => self.parse_scalar_value(),
+            Some(
+                Token::GreaterThan | Token::GreaterOrEqual | Token::LessThan | Token::LessOrEqual,
+            ) => Err("unexpected comparison operator while reading value".to_string()),
             Some(Token::RightBrace) => {
                 Err("unexpected closing brace while reading value".to_string())
             }
@@ -244,7 +286,16 @@ impl Parser {
 
     fn looks_like_assignment(&self) -> bool {
         matches!(self.peek(), Some(Token::Atom(_) | Token::Quoted(_)))
-            && matches!(self.peek_n(1), Some(Token::Equals))
+            && matches!(
+                self.peek_n(1),
+                Some(
+                    Token::Equals
+                        | Token::GreaterThan
+                        | Token::GreaterOrEqual
+                        | Token::LessThan
+                        | Token::LessOrEqual
+                )
+            )
     }
 
     fn expect_left_brace(&mut self) -> Result<(), String> {
@@ -261,10 +312,14 @@ impl Parser {
         }
     }
 
-    fn expect_equals(&mut self) -> Result<(), String> {
+    fn parse_operator(&mut self) -> Result<ClausewitzOperator, String> {
         match self.next() {
-            Some(Token::Equals) => Ok(()),
-            _ => Err("expected '='".to_string()),
+            Some(Token::Equals) => Ok(ClausewitzOperator::Assign),
+            Some(Token::GreaterThan) => Ok(ClausewitzOperator::GreaterThan),
+            Some(Token::GreaterOrEqual) => Ok(ClausewitzOperator::GreaterOrEqual),
+            Some(Token::LessThan) => Ok(ClausewitzOperator::LessThan),
+            Some(Token::LessOrEqual) => Ok(ClausewitzOperator::LessOrEqual),
+            _ => Err("expected comparison operator".to_string()),
         }
     }
 
@@ -311,7 +366,7 @@ fn atom_to_value(atom: &str) -> ClausewitzValue {
 mod tests {
     use proptest::prelude::*;
 
-    use super::{ClausewitzItem, ClausewitzValue, parse_clausewitz};
+    use super::{ClausewitzItem, ClausewitzOperator, ClausewitzValue, parse_clausewitz};
 
     #[test]
     fn parser_handles_nested_blocks_and_scalar_lists() {
@@ -417,5 +472,54 @@ mod tests {
             .as_block()
             .unwrap();
         assert_eq!(block.first_assignment("amount").unwrap().as_i64(), Some(2));
+    }
+
+    #[test]
+    fn parser_preserves_comparison_operators() {
+        let parsed = parse_clausewitz(
+            "available = { has_war_support > 0.12 amount_research_slots < 5 free_building_slots >= 2 infrastructure <= 3 }",
+        )
+        .unwrap();
+        let available = parsed
+            .first_assignment("available")
+            .unwrap()
+            .as_block()
+            .unwrap();
+
+        let operators = available
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ClausewitzItem::Assignment(assignment) => {
+                    Some((assignment.key.as_ref(), assignment.operator))
+                }
+                ClausewitzItem::Value(_) => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            operators,
+            vec![
+                ("has_war_support", ClausewitzOperator::GreaterThan),
+                ("amount_research_slots", ClausewitzOperator::LessThan),
+                ("free_building_slots", ClausewitzOperator::GreaterOrEqual),
+                ("infrastructure", ClausewitzOperator::LessOrEqual),
+            ]
+        );
+    }
+
+    #[test]
+    fn parser_ignores_utf8_bom_prefix() {
+        let parsed = parse_clausewitz("\u{feff}focus_tree = { id = french_focus }").unwrap();
+        let focus_tree = parsed
+            .first_assignment("focus_tree")
+            .unwrap()
+            .as_block()
+            .unwrap();
+
+        assert_eq!(
+            focus_tree.first_assignment("id").unwrap().as_str(),
+            Some("french_focus")
+        );
     }
 }

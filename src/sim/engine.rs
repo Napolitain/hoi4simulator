@@ -1,4 +1,7 @@
-use crate::domain::GameDate;
+use crate::domain::{
+    FocusBuildingKind, FocusCondition, FocusEffect, FocusStateScope, GameDate, StateCondition,
+    StateOperation,
+};
 use crate::scenario::France1936Scenario;
 
 use super::actions::{
@@ -21,7 +24,6 @@ pub struct SimulationConfig {
     pub production_efficiency_gain_permille: u16,
     pub production_efficiency_cap_permille: u16,
     pub max_civs_per_project: u8,
-    pub focus_days: u16,
 }
 
 impl Default for SimulationConfig {
@@ -36,7 +38,6 @@ impl Default for SimulationConfig {
             production_efficiency_gain_permille: 5,
             production_efficiency_cap_permille: 1_000,
             max_civs_per_project: 15,
-            focus_days: 70,
         }
     }
 }
@@ -48,6 +49,10 @@ pub enum SimulationError {
     InvalidState(super::actions::StateId),
     NoFreeFactorySlot(super::actions::StateId),
     FocusAlreadyInProgress,
+    FocusUnavailable(Box<str>),
+    UnknownFocus(Box<str>),
+    UnsupportedFocusCondition(Box<str>),
+    UnsupportedFocusEffect(Box<str>),
     InsufficientPoliticalPower,
     ResearchSlotBusy(u8),
     InvalidResearchSlot(u8),
@@ -107,13 +112,13 @@ impl SimulationEngine {
             self.validate_same_day_actions(&country, &actions[day_start..action_index])?;
 
             for action in &actions[day_start..action_index] {
-                self.apply_action(scenario, &mut country, *action, pivot_date)?;
+                self.apply_action(scenario, &mut country, action.clone(), pivot_date)?;
             }
 
-            self.progress_focus(&mut country);
-            self.progress_research(&mut country);
-            self.advance_construction(&mut country);
-            self.advance_production(&mut country);
+            self.progress_focus(scenario, &mut country)?;
+            self.progress_research(scenario, &mut country);
+            self.advance_construction(scenario, &mut country);
+            self.advance_production(scenario, &mut country);
 
             if country.country.date == end {
                 break;
@@ -121,7 +126,8 @@ impl SimulationEngine {
 
             country
                 .country
-                .advance_day(country.political_power_daily_bonus_centi());
+                .advance_day(country.political_power_daily_bonus_centi(&scenario.ideas));
+            country.tick_active_ideas();
         }
 
         if action_index < actions.len() {
@@ -222,7 +228,7 @@ impl SimulationEngine {
                 self.apply_construction_action(scenario, country, action, pivot_date)
             }
             Action::Production(action) => self.apply_production_action(scenario, country, action),
-            Action::Focus(action) => self.apply_focus_action(country, action, pivot_date),
+            Action::Focus(action) => self.apply_focus_action(scenario, country, action),
             Action::Law(action) => self.apply_law_action(country, action, pivot_date),
             Action::Advisor(action) => self.apply_advisor_action(country, action, pivot_date),
             Action::Research(action) => self.apply_research_action(country, action),
@@ -247,9 +253,10 @@ impl SimulationEngine {
             phase,
             military_factory_target_met: country.total_military_factories()
                 >= scenario.force_plan.required_military_factories,
-            minimum_force_target_met: country
-                .supported_divisions(scenario.force_plan.template.per_division_demand())
-                >= scenario.force_goal.division_band().min,
+            minimum_force_target_met: country.supported_divisions(
+                scenario.force_plan.template.per_division_demand(),
+                &scenario.ideas,
+            ) >= scenario.force_goal.division_band().min,
             frontier_forts_met: country.frontier_forts_complete(&scenario.frontier_forts),
             civilian_exception: false,
             infrastructure_is_justified: runtime.infrastructure < definition.infrastructure_target,
@@ -280,20 +287,30 @@ impl SimulationEngine {
 
     fn apply_focus_action(
         &self,
+        scenario: &France1936Scenario,
         country: &mut CountryRuntime,
         action: FocusAction,
-        pivot_date: GameDate,
     ) -> Result<(), SimulationError> {
-        let phase = self.phase_for(country.country.date, pivot_date);
-        FranceHeuristicRules::validate_focus_branch(phase, action.branch)
-            .map_err(SimulationError::HeuristicViolation)?;
-
         if country.focus.is_some() {
             return Err(SimulationError::FocusAlreadyInProgress);
         }
+        if country.has_completed_focus(&action.focus_id) {
+            return Err(SimulationError::FocusUnavailable(action.focus_id));
+        }
+
+        let focus = scenario
+            .focus_by_id(&action.focus_id)
+            .ok_or_else(|| SimulationError::UnknownFocus(action.focus_id.clone()))?;
+        if !self.focus_is_available(country, &scenario.ideas, focus)? {
+            return Err(SimulationError::FocusUnavailable(action.focus_id));
+        }
+        if self.evaluate_focus_condition(country, &scenario.ideas, &focus.bypass)? {
+            country.record_focus_completion(action.focus_id);
+            return Ok(());
+        }
 
         country.focus = Some(FocusProgress {
-            branch: action.branch,
+            focus_id: action.focus_id,
             days_progress: 0,
         });
 
@@ -424,37 +441,49 @@ impl SimulationEngine {
         Ok(())
     }
 
-    fn progress_focus(&self, country: &mut CountryRuntime) {
-        let Some(mut focus) = country.focus else {
-            return;
+    fn progress_focus(
+        &self,
+        scenario: &France1936Scenario,
+        country: &mut CountryRuntime,
+    ) -> Result<(), SimulationError> {
+        let Some(mut focus) = country.focus.take() else {
+            return Ok(());
         };
+        let definition = scenario
+            .focus_by_id(&focus.focus_id)
+            .ok_or_else(|| SimulationError::UnknownFocus(focus.focus_id.clone()))?;
 
         focus.days_progress += 1;
-        if focus.days_progress >= self.config.focus_days {
-            country.apply_focus_completion(focus.branch);
-            country.focus = None;
-            return;
+        if focus.days_progress >= definition.days {
+            let effects = definition.effects.clone();
+            let focus_id = focus.focus_id.clone();
+            self.apply_focus_effects(scenario, country, &effects, None)?;
+            country.record_focus_completion(focus_id);
+            return Ok(());
         }
 
         country.focus = Some(focus);
+        Ok(())
     }
 
-    fn progress_research(&self, country: &mut CountryRuntime) {
+    fn progress_research(&self, scenario: &France1936Scenario, country: &mut CountryRuntime) {
         for slot_index in 0..country.research_slots.len() {
             let Some(branch) = country.research_slots[slot_index].branch else {
                 continue;
             };
 
             country.research_slots[slot_index].days_progress += 1;
-            if country.research_slots[slot_index].days_progress >= self.research_days(branch) {
+            if country.research_slots[slot_index].days_progress
+                >= self.research_days(branch, country.research_speed_bp(&scenario.ideas))
+            {
                 country.apply_research_completion(branch);
                 country.research_slots[slot_index] = super::state::ResearchSlotState::default();
             }
         }
     }
 
-    fn advance_construction(&self, country: &mut CountryRuntime) {
-        let available_civs = usize::from(country.available_civilian_factories());
+    fn advance_construction(&self, scenario: &France1936Scenario, country: &mut CountryRuntime) {
+        let available_civs = usize::from(country.available_civilian_factories(&scenario.ideas));
         if available_civs == 0 || country.construction_queue.is_empty() {
             return;
         }
@@ -472,7 +501,10 @@ impl SimulationEngine {
             let state_index = usize::from(country.construction_queue[index].state.0);
             let infrastructure = u32::from(country.states[state_index].infrastructure);
             let infrastructure_multiplier_bp = 10_000 + infrastructure * 1_000;
-            let construction_speed_bp = u32::from(country.construction_speed_bp());
+            let construction_speed_bp = u32::from(country.construction_speed_bp_for(
+                self.focus_building_kind(country.construction_queue[index].kind),
+                &scenario.ideas,
+            ));
             let daily_progress = u64::try_from(assigned_civs).unwrap_or(u64::MAX)
                 * u64::from(self.config.construction_output_centi_per_factory)
                 * u64::from(infrastructure_multiplier_bp)
@@ -508,8 +540,8 @@ impl SimulationEngine {
         }
     }
 
-    fn advance_production(&self, country: &mut CountryRuntime) {
-        let output_bonus_bp = u32::from(country.military_output_bp());
+    fn advance_production(&self, scenario: &France1936Scenario, country: &mut CountryRuntime) {
+        let output_bonus_bp = u32::from(country.military_output_bp(&scenario.ideas));
 
         for line in &mut country.production_lines {
             if line.factories == 0 {
@@ -538,13 +570,349 @@ impl SimulationEngine {
         }
     }
 
-    fn research_days(&self, branch: super::actions::ResearchBranch) -> u16 {
-        match branch {
-            super::actions::ResearchBranch::Industry => 140,
-            super::actions::ResearchBranch::Construction => 120,
-            super::actions::ResearchBranch::Electronics => 150,
-            super::actions::ResearchBranch::Production => 130,
+    pub(crate) fn focus_is_available(
+        &self,
+        country: &CountryRuntime,
+        ideas: &[crate::domain::IdeaDefinition],
+        focus: &crate::domain::NationalFocus,
+    ) -> Result<bool, SimulationError> {
+        if focus
+            .prerequisites
+            .iter()
+            .any(|prerequisite| !country.has_completed_focus(prerequisite))
+        {
+            return Ok(false);
         }
+        if focus
+            .mutually_exclusive
+            .iter()
+            .any(|blocked| country.has_completed_focus(blocked))
+        {
+            return Ok(false);
+        }
+
+        self.evaluate_focus_condition(country, ideas, &focus.available)
+    }
+
+    fn evaluate_focus_condition(
+        &self,
+        country: &CountryRuntime,
+        ideas: &[crate::domain::IdeaDefinition],
+        condition: &FocusCondition,
+    ) -> Result<bool, SimulationError> {
+        match condition {
+            FocusCondition::Always => Ok(true),
+            FocusCondition::All(conditions) => {
+                for condition in conditions {
+                    if !self.evaluate_focus_condition(country, ideas, condition)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            FocusCondition::Any(conditions) => {
+                for condition in conditions {
+                    if self.evaluate_focus_condition(country, ideas, condition)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            FocusCondition::Not(condition) => {
+                Ok(!self.evaluate_focus_condition(country, ideas, condition)?)
+            }
+            FocusCondition::HasCompletedFocus(id) => Ok(country.has_completed_focus(id)),
+            FocusCondition::HasCountryFlag(flag) => Ok(country.has_country_flag(flag)),
+            FocusCondition::HasIdea(id) => Ok(country.has_idea(id)),
+            FocusCondition::HasWarSupportAtLeast(value) => {
+                Ok(country.current_war_support_bp(ideas) >= *value)
+            }
+            FocusCondition::NumOfFactoriesAtLeast(value) => Ok(country.total_civilian_factories()
+                + country.total_military_factories()
+                >= *value),
+            FocusCondition::NumOfMilitaryFactoriesAtLeast(value) => {
+                Ok(country.total_military_factories() >= *value)
+            }
+            FocusCondition::AmountResearchSlotsGreaterThan(value) => {
+                Ok(country.research_slots.len() > usize::from(*value))
+            }
+            FocusCondition::AmountResearchSlotsLessThan(value) => {
+                Ok(country.research_slots.len() < usize::from(*value))
+            }
+            FocusCondition::AnyControlledState(limit)
+            | FocusCondition::AnyOwnedState(limit)
+            | FocusCondition::AnyState(limit) => {
+                for index in 0..country.states.len() {
+                    if self.evaluate_state_condition(country, index, limit)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            FocusCondition::Unsupported(name) => {
+                Err(SimulationError::UnsupportedFocusCondition(name.clone()))
+            }
+        }
+    }
+
+    fn evaluate_state_condition(
+        &self,
+        country: &CountryRuntime,
+        state_index: usize,
+        condition: &StateCondition,
+    ) -> Result<bool, SimulationError> {
+        match condition {
+            StateCondition::Always => Ok(true),
+            StateCondition::All(conditions) => {
+                for condition in conditions {
+                    if !self.evaluate_state_condition(country, state_index, condition)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            StateCondition::Any(conditions) => {
+                for condition in conditions {
+                    if self.evaluate_state_condition(country, state_index, condition)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            StateCondition::Not(condition) => {
+                Ok(!self.evaluate_state_condition(country, state_index, condition)?)
+            }
+            StateCondition::RawStateId(raw_state_id) => {
+                Ok(country.state_defs[state_index].raw_state_id == *raw_state_id)
+            }
+            StateCondition::IsControlledByRoot | StateCondition::IsOwnedByRoot => Ok(true),
+            StateCondition::IsCoreOfRoot => Ok(country.state_defs[state_index].is_core_of_root),
+            StateCondition::OwnerIsRootOrSubject => Ok(true),
+            StateCondition::HasStateFlag(flag) => {
+                Ok(country.has_state_flag_by_index(state_index, flag))
+            }
+            StateCondition::InfrastructureLessThan(value) => {
+                Ok(country.states[state_index].infrastructure < *value)
+            }
+            StateCondition::FreeSharedBuildingSlotsGreaterThan(value) => Ok(country.states
+                [state_index]
+                .free_slots(&country.state_defs[state_index])
+                > *value),
+            StateCondition::Unsupported(name) => {
+                Err(SimulationError::UnsupportedFocusCondition(name.clone()))
+            }
+        }
+    }
+
+    fn apply_focus_effects(
+        &self,
+        scenario: &France1936Scenario,
+        country: &mut CountryRuntime,
+        effects: &[FocusEffect],
+        anchor_state: Option<usize>,
+    ) -> Result<(), SimulationError> {
+        for effect in effects {
+            self.apply_focus_effect(scenario, country, effect, anchor_state)?;
+        }
+
+        Ok(())
+    }
+
+    fn apply_focus_effect(
+        &self,
+        scenario: &France1936Scenario,
+        country: &mut CountryRuntime,
+        effect: &FocusEffect,
+        anchor_state: Option<usize>,
+    ) -> Result<(), SimulationError> {
+        match effect {
+            FocusEffect::AddIdea(id) => {
+                if scenario.idea_by_id(id).is_none() {
+                    return Err(SimulationError::UnsupportedFocusEffect(id.clone()));
+                }
+                country.add_idea(id.clone(), None);
+            }
+            FocusEffect::AddTimedIdea { id, days } => {
+                if scenario.idea_by_id(id).is_none() {
+                    return Err(SimulationError::UnsupportedFocusEffect(id.clone()));
+                }
+                country.add_idea(id.clone(), Some(*days));
+            }
+            FocusEffect::SwapIdea { remove, add } => {
+                if scenario.idea_by_id(add).is_none() {
+                    return Err(SimulationError::UnsupportedFocusEffect(add.clone()));
+                }
+                country.remove_idea(remove);
+                country.add_idea(add.clone(), None);
+            }
+            FocusEffect::AddPoliticalPower(amount) => {
+                country.country.political_power_centi = country
+                    .country
+                    .political_power_centi
+                    .saturating_add(*amount);
+            }
+            FocusEffect::AddStability(amount) => {
+                country.country.stability_bp = country.country.stability_bp.saturating_add(*amount);
+            }
+            FocusEffect::AddWarSupport(amount) => {
+                country.country.war_support_bp =
+                    country.country.war_support_bp.saturating_add(*amount);
+            }
+            FocusEffect::AddManpower(amount) => {
+                country.country.population = country.country.population.saturating_add(*amount);
+            }
+            FocusEffect::AddResearchSlot(amount) => {
+                for _ in 0..*amount {
+                    country
+                        .research_slots
+                        .push(super::state::ResearchSlotState::default());
+                }
+            }
+            FocusEffect::SetCountryFlag(flag) => {
+                country.set_country_flag(flag.clone());
+            }
+            FocusEffect::AddEquipmentToStockpile { equipment, amount } => {
+                country.stockpile.add(*equipment, *amount);
+            }
+            FocusEffect::StateScoped(scope_effects) => {
+                let indices = self.select_focus_state_indices(
+                    country,
+                    scope_effects.scope,
+                    &scope_effects.limit,
+                    anchor_state,
+                )?;
+                for index in indices {
+                    for operation in &scope_effects.operations {
+                        self.apply_focus_state_operation(country, index, operation)?;
+                    }
+                }
+            }
+            FocusEffect::Unsupported(name) => {
+                return Err(SimulationError::UnsupportedFocusEffect(name.clone()));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn select_focus_state_indices(
+        &self,
+        country: &CountryRuntime,
+        scope: FocusStateScope,
+        limit: &StateCondition,
+        anchor_state: Option<usize>,
+    ) -> Result<Vec<usize>, SimulationError> {
+        let mut eligible = Vec::new();
+        for index in 0..country.states.len() {
+            if self.evaluate_state_condition(country, index, limit)? {
+                eligible.push(index);
+            }
+        }
+        eligible.sort_by_key(|index| {
+            (
+                country.state_defs[*index].frontier.is_some(),
+                std::cmp::Reverse(country.state_defs[*index].economic_weight),
+                country.state_defs[*index].raw_state_id,
+            )
+        });
+
+        Ok(match scope {
+            FocusStateScope::AnyState | FocusStateScope::EveryOwnedState => eligible,
+            FocusStateScope::RandomControlledState | FocusStateScope::RandomOwnedState => {
+                eligible.into_iter().take(1).collect()
+            }
+            FocusStateScope::RandomNeighborState => eligible
+                .iter()
+                .copied()
+                .find(|index| Some(*index) != anchor_state)
+                .into_iter()
+                .collect(),
+        })
+    }
+
+    fn apply_focus_state_operation(
+        &self,
+        country: &mut CountryRuntime,
+        state_index: usize,
+        operation: &StateOperation,
+    ) -> Result<(), SimulationError> {
+        match operation {
+            StateOperation::AddExtraSharedBuildingSlots(amount) => {
+                country.state_defs[state_index].building_slots = country.state_defs[state_index]
+                    .building_slots
+                    .saturating_add(*amount);
+            }
+            StateOperation::SetStateFlag(flag) => {
+                country.set_state_flag_by_index(state_index, flag.clone());
+            }
+            StateOperation::NestedScope(scope) => {
+                let indices = self.select_focus_state_indices(
+                    country,
+                    scope.scope,
+                    &scope.limit,
+                    Some(state_index),
+                )?;
+                for nested_index in indices {
+                    for operation in &scope.operations {
+                        self.apply_focus_state_operation(country, nested_index, operation)?;
+                    }
+                }
+            }
+            StateOperation::AddBuildingConstruction {
+                kind,
+                level,
+                instant,
+            } => {
+                if !instant {
+                    return Err(SimulationError::UnsupportedFocusEffect(
+                        "non-instant focus construction".into(),
+                    ));
+                }
+                for _ in 0..*level {
+                    self.finish_focus_building(country, state_index, *kind);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn finish_focus_building(
+        &self,
+        country: &mut CountryRuntime,
+        state_index: usize,
+        kind: FocusBuildingKind,
+    ) {
+        let definition = &country.state_defs[state_index];
+        if matches!(
+            kind,
+            FocusBuildingKind::CivilianFactory | FocusBuildingKind::MilitaryFactory
+        ) && country.states[state_index].free_slots(definition) == 0
+        {
+            return;
+        }
+
+        match kind {
+            FocusBuildingKind::CivilianFactory => {
+                country.states[state_index].civilian_factories += 1
+            }
+            FocusBuildingKind::MilitaryFactory => {
+                country.states[state_index].military_factories += 1
+            }
+            FocusBuildingKind::Infrastructure => country.states[state_index].infrastructure += 1,
+            FocusBuildingKind::LandFort => country.states[state_index].land_fort_level += 1,
+        }
+    }
+
+    fn research_days(&self, branch: super::actions::ResearchBranch, research_speed_bp: u16) -> u16 {
+        let base_days = match branch {
+            super::actions::ResearchBranch::Industry => 140_u16,
+            super::actions::ResearchBranch::Construction => 120_u16,
+            super::actions::ResearchBranch::Electronics => 150_u16,
+            super::actions::ResearchBranch::Production => 130_u16,
+        };
+        let speed_bp = u32::from(10_000_u16.saturating_add(research_speed_bp));
+        u16::try_from((u32::from(base_days) * 10_000).div_ceil(speed_bp)).unwrap_or(u16::MAX)
     }
 
     fn construction_cost(&self, kind: ConstructionKind) -> u32 {
@@ -592,18 +960,30 @@ impl SimulationEngine {
 
         Some(index)
     }
+
+    fn focus_building_kind(&self, kind: ConstructionKind) -> FocusBuildingKind {
+        match kind {
+            ConstructionKind::CivilianFactory => FocusBuildingKind::CivilianFactory,
+            ConstructionKind::MilitaryFactory => FocusBuildingKind::MilitaryFactory,
+            ConstructionKind::Infrastructure => FocusBuildingKind::Infrastructure,
+            ConstructionKind::LandFort => FocusBuildingKind::LandFort,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
 
-    use crate::domain::{EconomyLaw, GameDate};
+    use crate::domain::{
+        EconomyLaw, FocusBuildingKind, FocusCondition, FocusEffect, FocusStateScope, GameDate,
+        IdeaDefinition, IdeaModifiers, NationalFocus, StateCondition, StateOperation,
+        StateScopedEffects,
+    };
     use crate::scenario::France1936Scenario;
     use crate::sim::{
         Action, AdvisorAction, AdvisorKind, ConstructionAction, ConstructionKind, FocusAction,
-        FocusBranch, LawAction, LawCategory, LawTarget, ProductionAction, ResearchAction,
-        ResearchBranch,
+        LawAction, LawCategory, LawTarget, ProductionAction, ResearchAction, ResearchBranch,
     };
 
     use super::{SimulationConfig, SimulationEngine, SimulationError};
@@ -616,11 +996,11 @@ mod tests {
         let actions = [
             Action::Focus(FocusAction {
                 date: GameDate::new(1936, 2, 1),
-                branch: FocusBranch::Economy,
+                focus_id: "FRA_unsorted_a".into(),
             }),
             Action::Focus(FocusAction {
                 date: GameDate::new(1936, 1, 1),
-                branch: FocusBranch::Industry,
+                focus_id: "FRA_unsorted_b".into(),
             }),
         ];
 
@@ -897,6 +1277,117 @@ mod tests {
         );
 
         assert_eq!(result, Err(SimulationError::DuplicateProductionSlot(0)));
+    }
+
+    #[test]
+    fn simulator_applies_exact_focus_rewards_and_timed_ideas() {
+        let scenario = France1936Scenario::standard().with_exact_focus_data(
+            2,
+            Vec::new(),
+            Vec::new(),
+            vec![
+                NationalFocus {
+                    id: "FRA_devalue_the_franc".into(),
+                    days: 1,
+                    prerequisites: Vec::new(),
+                    mutually_exclusive: Vec::new(),
+                    available: FocusCondition::Always,
+                    bypass: FocusCondition::Not(Box::new(FocusCondition::Always)),
+                    search_filters: vec!["FOCUS_FILTER_INDUSTRY".into()],
+                    effects: vec![FocusEffect::AddTimedIdea {
+                        id: "FRA_devalued_currency".into(),
+                        days: 5,
+                    }],
+                },
+                NationalFocus {
+                    id: "FRA_begin_rearmament".into(),
+                    days: 1,
+                    prerequisites: vec!["FRA_devalue_the_franc".into()],
+                    mutually_exclusive: Vec::new(),
+                    available: FocusCondition::AmountResearchSlotsLessThan(5),
+                    bypass: FocusCondition::Not(Box::new(FocusCondition::Always)),
+                    search_filters: vec!["FOCUS_FILTER_INDUSTRY".into()],
+                    effects: vec![
+                        FocusEffect::AddResearchSlot(1),
+                        FocusEffect::StateScoped(StateScopedEffects {
+                            scope: FocusStateScope::RandomOwnedState,
+                            limit: StateCondition::IsCoreOfRoot,
+                            operations: vec![
+                                StateOperation::AddExtraSharedBuildingSlots(1),
+                                StateOperation::AddBuildingConstruction {
+                                    kind: FocusBuildingKind::MilitaryFactory,
+                                    level: 1,
+                                    instant: true,
+                                },
+                                StateOperation::SetStateFlag("FRA_rearmed".into()),
+                            ],
+                        }),
+                    ],
+                },
+            ],
+            vec![IdeaDefinition {
+                id: "FRA_devalued_currency".into(),
+                modifiers: IdeaModifiers {
+                    consumer_goods_bp: -1_000,
+                    ..IdeaModifiers::default()
+                },
+            }],
+            Vec::new(),
+        );
+        let runtime = scenario.bootstrap_runtime();
+        let engine = SimulationEngine::default();
+        let actions = [
+            Action::Focus(FocusAction {
+                date: GameDate::new(1936, 1, 1),
+                focus_id: "FRA_devalue_the_franc".into(),
+            }),
+            Action::Focus(FocusAction {
+                date: GameDate::new(1936, 1, 2),
+                focus_id: "FRA_begin_rearmament".into(),
+            }),
+        ];
+
+        let result = engine
+            .simulate(
+                &scenario,
+                runtime,
+                &actions,
+                GameDate::new(1936, 1, 2),
+                scenario.pivot_window.start,
+            )
+            .unwrap();
+
+        assert!(result.country.has_idea("FRA_devalued_currency"));
+        assert_eq!(result.country.active_ideas[0].remaining_days, Some(4));
+        assert_eq!(result.country.research_slots.len(), 3);
+        assert_eq!(
+            result
+                .country
+                .state(France1936Scenario::ILE_DE_FRANCE)
+                .military_factories,
+            scenario
+                .bootstrap_runtime()
+                .state(France1936Scenario::ILE_DE_FRANCE)
+                .military_factories
+                + 1
+        );
+        assert_eq!(
+            result
+                .country
+                .state_def(France1936Scenario::ILE_DE_FRANCE)
+                .building_slots,
+            scenario
+                .bootstrap_runtime()
+                .state_def(France1936Scenario::ILE_DE_FRANCE)
+                .building_slots
+                + 1
+        );
+        assert!(
+            result.country.state_flags[usize::from(France1936Scenario::ILE_DE_FRANCE.0)]
+                .iter()
+                .any(|flag| flag.as_ref() == "FRA_rearmed")
+        );
+        assert!(result.country.has_completed_focus("FRA_begin_rearmament"));
     }
 
     proptest! {

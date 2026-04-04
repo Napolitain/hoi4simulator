@@ -97,6 +97,22 @@ impl ResourceLedger {
         }
     }
 
+    pub fn scale_bp(self, basis_points: u16) -> Self {
+        let basis_points = u64::from(basis_points);
+        let scale = |value: u32| {
+            u32::try_from((u64::from(value) * basis_points) / 10_000).unwrap_or(u32::MAX)
+        };
+
+        Self {
+            steel: scale(self.steel),
+            aluminium: scale(self.aluminium),
+            tungsten: scale(self.tungsten),
+            chromium: scale(self.chromium),
+            oil: scale(self.oil),
+            rubber: scale(self.rubber),
+        }
+    }
+
     pub fn total(self) -> u32 {
         self.steel
             .saturating_add(self.aluminium)
@@ -182,6 +198,7 @@ mod tests {
         );
         assert_eq!(demand.scale(3).cap_at(available).tungsten, 3);
         assert_eq!(demand.scale(3).utilization_bp(available), 9_333);
+        assert_eq!(demand.scale_bp(15_000).steel, 4);
         assert_eq!(demand.get(ResourceKind::Steel), 3);
     }
 }

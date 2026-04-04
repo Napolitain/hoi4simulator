@@ -1,7 +1,10 @@
-use crate::domain::{CountryLaws, EquipmentDemand, EquipmentKind, GameDate, ResourceLedger};
+use crate::domain::{
+    CountryLaws, EquipmentDemand, EquipmentKind, FocusBuildingKind, GameDate, IdeaDefinition,
+    IdeaModifiers, ResourceLedger,
+};
 use crate::scenario::{Frontier, FrontierFortRequirement};
 
-use super::actions::{ConstructionKind, FocusBranch, ResearchBranch, StateId};
+use super::actions::{ConstructionKind, ResearchBranch, StateId};
 
 pub const POLITICAL_POWER_UNIT: u32 = 100;
 
@@ -17,18 +20,34 @@ pub struct CountryState {
     pub population: u64,
     pub political_power_centi: u32,
     pub political_power_daily_centi: u16,
+    pub stability_bp: u16,
+    pub war_support_bp: u16,
     pub laws: CountryLaws,
 }
 
 impl CountryState {
     pub fn new(date: GameDate, population: u64, laws: CountryLaws) -> Self {
+        Self::with_support_levels(date, population, laws, 5_000, 5_000)
+    }
+
+    pub fn with_support_levels(
+        date: GameDate,
+        population: u64,
+        laws: CountryLaws,
+        stability_bp: u16,
+        war_support_bp: u16,
+    ) -> Self {
         assert!(population > 0);
+        assert!(stability_bp <= 10_000);
+        assert!(war_support_bp <= 10_000);
 
         Self {
             date,
             population,
             political_power_centi: 0,
             political_power_daily_centi: 2 * POLITICAL_POWER_UNIT as u16,
+            stability_bp,
+            war_support_bp,
             laws,
         }
     }
@@ -65,6 +84,7 @@ pub struct StateDefinition {
     pub building_slots: u8,
     pub economic_weight: u16,
     pub infrastructure_target: u8,
+    pub is_core_of_root: bool,
     pub frontier: Option<Frontier>,
     pub resources: ResourceLedger,
 }
@@ -192,13 +212,6 @@ impl ProductionLine {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct FocusSummary {
-    pub economy: u16,
-    pub industry: u16,
-    pub military_industry: u16,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct ResearchSummary {
     pub industry: u16,
     pub construction: u16,
@@ -213,10 +226,22 @@ pub struct AdvisorRoster {
     pub military_industry: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FocusProgress {
-    pub branch: FocusBranch,
+    pub focus_id: Box<str>,
     pub days_progress: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletedFocus {
+    pub id: Box<str>,
+    pub completed_on: GameDate,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveIdea {
+    pub id: Box<str>,
+    pub remaining_days: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -236,8 +261,11 @@ pub struct CountryRuntime {
     pub production_lines: Box<[ProductionLine]>,
     pub construction_queue: Vec<ConstructionProject>,
     pub focus: Option<FocusProgress>,
-    pub completed_focuses: FocusSummary,
-    pub research_slots: [ResearchSlotState; 2],
+    pub completed_focuses: Vec<CompletedFocus>,
+    pub active_ideas: Vec<ActiveIdea>,
+    pub country_flags: Vec<Box<str>>,
+    pub state_flags: Box<[Vec<Box<str>>]>,
+    pub research_slots: Vec<ResearchSlotState>,
     pub completed_research: ResearchSummary,
     pub advisors: AdvisorRoster,
 }
@@ -250,6 +278,7 @@ impl CountryRuntime {
         production_lines: Box<[ProductionLine]>,
     ) -> Self {
         assert_eq!(state_defs.len(), states.len());
+        let state_count = states.len();
 
         Self {
             country,
@@ -261,11 +290,20 @@ impl CountryRuntime {
             production_lines,
             construction_queue: Vec::with_capacity(64),
             focus: None,
-            completed_focuses: FocusSummary::default(),
-            research_slots: [ResearchSlotState::default(), ResearchSlotState::default()],
+            completed_focuses: Vec::with_capacity(64),
+            active_ideas: Vec::with_capacity(32),
+            country_flags: Vec::with_capacity(32),
+            state_flags: vec![Vec::new(); state_count].into_boxed_slice(),
+            research_slots: vec![ResearchSlotState::default(), ResearchSlotState::default()],
             completed_research: ResearchSummary::default(),
             advisors: AdvisorRoster::default(),
         }
+    }
+
+    pub fn with_research_slots(mut self, count: u8) -> Self {
+        assert!(count > 0);
+        self.research_slots = vec![ResearchSlotState::default(); usize::from(count)];
+        self
     }
 
     pub fn with_fielded_force(
@@ -293,6 +331,16 @@ impl CountryRuntime {
     pub fn state_mut(&mut self, state: StateId) -> &mut StateRuntime {
         let index = self.state_index(state);
         &mut self.states[index]
+    }
+
+    pub fn state_def(&self, state: StateId) -> &StateDefinition {
+        let index = self.state_index(state);
+        &self.state_defs[index]
+    }
+
+    pub fn state_def_mut(&mut self, state: StateId) -> &mut StateDefinition {
+        let index = self.state_index(state);
+        &mut self.state_defs[index]
     }
 
     pub fn total_civilian_factories(&self) -> u16 {
@@ -334,69 +382,135 @@ impl CountryRuntime {
             .count() as u8
     }
 
-    pub fn consumer_goods_factories(&self) -> u16 {
-        let ratio_bp = match self.country.laws.economy {
+    pub fn consumer_goods_factories(&self, ideas: &[IdeaDefinition]) -> u16 {
+        let mut ratio_bp = i32::from(match self.country.laws.economy {
             crate::domain::EconomyLaw::CivilianEconomy => 3_000_u16,
             crate::domain::EconomyLaw::EarlyMobilization => 2_500_u16,
             crate::domain::EconomyLaw::PartialMobilization => 2_000_u16,
             crate::domain::EconomyLaw::WarEconomy => 1_500_u16,
-        };
+        });
+        ratio_bp += self.idea_modifiers(ideas).consumer_goods_bp;
+        ratio_bp = ratio_bp.clamp(0, 10_000);
 
         let total_factories =
             u32::from(self.total_civilian_factories() + self.total_military_factories());
-        let goods = (total_factories * u32::from(ratio_bp)).div_ceil(10_000);
+        let goods =
+            (total_factories * u32::try_from(ratio_bp).unwrap_or_default()).div_ceil(10_000);
 
         u16::try_from(goods).unwrap_or(u16::MAX)
     }
 
-    pub fn available_civilian_factories(&self) -> u16 {
+    pub fn available_civilian_factories(&self, ideas: &[IdeaDefinition]) -> u16 {
         self.total_civilian_factories()
-            .saturating_sub(self.consumer_goods_factories())
+            .saturating_sub(self.consumer_goods_factories(ideas))
     }
 
-    pub fn construction_speed_bp(&self) -> u16 {
-        let mut bonus = 0_u16;
-        bonus += self.completed_focuses.economy * 100;
-        bonus += self.completed_focuses.industry * 150;
-        bonus += self.completed_research.construction * 200;
-        bonus += self.completed_research.industry * 100;
+    pub fn construction_speed_bp_for(
+        &self,
+        kind: FocusBuildingKind,
+        ideas: &[IdeaDefinition],
+    ) -> u16 {
+        let mut bonus = self.idea_modifiers(ideas).construction_bonus_bp(kind);
+        bonus += i32::from(self.completed_research.construction) * 200;
+        bonus += i32::from(self.completed_research.industry) * 100;
 
         if self.advisors.industry {
             bonus += 100;
         }
 
-        bonus
+        u16::try_from(bonus.clamp(0, i32::from(u16::MAX))).unwrap_or(u16::MAX)
     }
 
-    pub fn military_output_bp(&self) -> u16 {
-        let mut bonus = 0_u16;
-        bonus += self.completed_focuses.military_industry * 200;
-        bonus += self.completed_research.production * 250;
+    pub fn military_output_bp(&self, ideas: &[IdeaDefinition]) -> u16 {
+        let mut bonus = self.idea_modifiers(ideas).factory_output_bp;
+        bonus += i32::from(self.completed_research.production) * 250;
 
         if self.advisors.military_industry {
             bonus += 100;
         }
 
-        bonus
+        u16::try_from(bonus.clamp(0, i32::from(u16::MAX))).unwrap_or(u16::MAX)
     }
 
-    pub fn political_power_daily_bonus_centi(&self) -> u16 {
-        let mut bonus = 0_u16;
+    pub fn political_power_daily_bonus_centi(&self, ideas: &[IdeaDefinition]) -> u16 {
+        let mut bonus = self.idea_modifiers(ideas).political_power_daily_centi;
 
         if self.advisors.research {
             bonus += 25;
         }
 
-        bonus
+        u16::try_from(bonus.clamp(0, i32::from(u16::MAX))).unwrap_or(u16::MAX)
     }
 
-    pub fn apply_focus_completion(&mut self, branch: FocusBranch) {
-        match branch {
-            FocusBranch::Economy => self.completed_focuses.economy += 1,
-            FocusBranch::Industry => self.completed_focuses.industry += 1,
-            FocusBranch::MilitaryIndustry => self.completed_focuses.military_industry += 1,
-            FocusBranch::Politics | FocusBranch::Diplomacy => {}
+    pub fn idea_modifiers(&self, ideas: &[IdeaDefinition]) -> IdeaModifiers {
+        self.active_ideas
+            .iter()
+            .filter_map(|active| ideas.iter().find(|idea| idea.id == active.id))
+            .fold(IdeaModifiers::default(), |total, idea| {
+                total.plus(idea.modifiers)
+            })
+    }
+
+    pub fn current_stability_bp(&self, ideas: &[IdeaDefinition]) -> u16 {
+        let value = i32::from(self.country.stability_bp) + self.idea_modifiers(ideas).stability_bp;
+        u16::try_from(value.clamp(0, 10_000)).unwrap_or(10_000)
+    }
+
+    pub fn current_war_support_bp(&self, ideas: &[IdeaDefinition]) -> u16 {
+        let value =
+            i32::from(self.country.war_support_bp) + self.idea_modifiers(ideas).war_support_bp;
+        u16::try_from(value.clamp(0, 10_000)).unwrap_or(10_000)
+    }
+
+    pub fn available_manpower(&self, ideas: &[IdeaDefinition]) -> u64 {
+        let base = self.country.available_manpower();
+        let modifier_bp = 10_000 + self.idea_modifiers(ideas).manpower_bp;
+        let modifier_bp = u64::try_from(modifier_bp.clamp(0, i32::MAX)).unwrap_or_default();
+        base.saturating_mul(modifier_bp) / 10_000
+    }
+
+    pub fn add_idea(&mut self, id: impl Into<Box<str>>, duration_days: Option<u16>) {
+        let id = id.into();
+        if let Some(existing) = self.active_ideas.iter_mut().find(|idea| idea.id == id) {
+            existing.remaining_days = duration_days.or(existing.remaining_days);
+            return;
         }
+
+        self.active_ideas.push(ActiveIdea {
+            id,
+            remaining_days: duration_days,
+        });
+    }
+
+    pub fn remove_idea(&mut self, id: &str) {
+        self.active_ideas.retain(|idea| idea.id.as_ref() != id);
+    }
+
+    pub fn has_idea(&self, id: &str) -> bool {
+        self.active_ideas.iter().any(|idea| idea.id.as_ref() == id)
+    }
+
+    pub fn tick_active_ideas(&mut self) {
+        for idea in &mut self.active_ideas {
+            let Some(days) = idea.remaining_days else {
+                continue;
+            };
+            idea.remaining_days = Some(days.saturating_sub(1));
+        }
+        self.active_ideas
+            .retain(|idea| idea.remaining_days != Some(0));
+    }
+
+    pub fn record_focus_completion(&mut self, id: impl Into<Box<str>>) {
+        let id = id.into();
+        if self.completed_focuses.iter().any(|focus| focus.id == id) {
+            return;
+        }
+
+        self.completed_focuses.push(CompletedFocus {
+            id,
+            completed_on: self.country.date,
+        });
     }
 
     pub fn apply_research_completion(&mut self, branch: ResearchBranch) {
@@ -418,23 +532,26 @@ impl CountryRuntime {
         })
     }
 
-    pub fn domestic_resources(&self) -> ResourceLedger {
-        self.state_defs
+    pub fn domestic_resources(&self, ideas: &[IdeaDefinition]) -> ResourceLedger {
+        let base = self
+            .state_defs
             .iter()
             .fold(ResourceLedger::default(), |total, state| {
                 total.plus(state.resources)
-            })
+            });
+        let modifier_bp = 10_000 + self.idea_modifiers(ideas).resource_factor_bp;
+        let modifier_bp = u16::try_from(modifier_bp.clamp(0, i32::from(u16::MAX))).unwrap_or(0);
+        base.scale_bp(modifier_bp)
     }
 
-    pub fn ready_divisions(&self, demand: EquipmentDemand) -> u16 {
+    pub fn ready_divisions(&self, demand: EquipmentDemand, ideas: &[IdeaDefinition]) -> u16 {
         self.stockpile
-            .ready_divisions(demand, self.country.available_manpower())
+            .ready_divisions(demand, self.available_manpower(ideas))
     }
 
-    pub fn supported_divisions(&self, demand: EquipmentDemand) -> u16 {
+    pub fn supported_divisions(&self, demand: EquipmentDemand, ideas: &[IdeaDefinition]) -> u16 {
         let free_manpower = self
-            .country
-            .available_manpower()
+            .available_manpower(ideas)
             .saturating_sub(u64::from(self.fielded_demand.manpower));
 
         self.fielded_divisions
@@ -446,6 +563,54 @@ impl CountryRuntime {
             .iter()
             .filter(|project| project.state == state && project.kind == kind)
             .count() as u8
+    }
+
+    pub fn has_completed_focus(&self, id: &str) -> bool {
+        self.completed_focuses
+            .iter()
+            .any(|focus| focus.id.as_ref() == id)
+    }
+
+    pub fn completed_focus_by(&self, id: &str, deadline: GameDate) -> bool {
+        self.completed_focuses
+            .iter()
+            .any(|focus| focus.id.as_ref() == id && focus.completed_on <= deadline)
+    }
+
+    pub fn has_country_flag(&self, flag: &str) -> bool {
+        self.country_flags
+            .iter()
+            .any(|value| value.as_ref() == flag)
+    }
+
+    pub fn set_country_flag(&mut self, flag: impl Into<Box<str>>) {
+        let flag = flag.into();
+        if self.country_flags.iter().any(|current| current == &flag) {
+            return;
+        }
+        self.country_flags.push(flag);
+    }
+
+    pub fn has_state_flag_by_index(&self, index: usize, flag: &str) -> bool {
+        self.state_flags[index]
+            .iter()
+            .any(|value| value.as_ref() == flag)
+    }
+
+    pub fn set_state_flag_by_index(&mut self, index: usize, flag: impl Into<Box<str>>) {
+        let flag = flag.into();
+        if self.state_flags[index]
+            .iter()
+            .any(|current| current == &flag)
+        {
+            return;
+        }
+        self.state_flags[index].push(flag);
+    }
+
+    pub fn research_speed_bp(&self, ideas: &[IdeaDefinition]) -> u16 {
+        let bonus = self.idea_modifiers(ideas).research_speed_bp;
+        u16::try_from(bonus.clamp(0, i32::from(u16::MAX))).unwrap_or(u16::MAX)
     }
 }
 
@@ -493,6 +658,7 @@ mod tests {
                     building_slots: 12,
                     economic_weight: 10,
                     infrastructure_target: 8,
+                    is_core_of_root: true,
                     frontier: None,
                     resources: ResourceLedger::default(),
                 },
@@ -503,6 +669,7 @@ mod tests {
                     building_slots: 8,
                     economic_weight: 7,
                     infrastructure_target: 7,
+                    is_core_of_root: true,
                     frontier: Some(Frontier::Germany),
                     resources: ResourceLedger {
                         steel: 12,
@@ -565,11 +732,12 @@ mod tests {
     #[test]
     fn country_runtime_counts_consumer_goods_from_total_factories() {
         let runtime = test_runtime();
+        let ideas = &[];
 
         assert_eq!(runtime.total_civilian_factories(), 14);
         assert_eq!(runtime.total_military_factories(), 6);
-        assert_eq!(runtime.consumer_goods_factories(), 6);
-        assert_eq!(runtime.available_civilian_factories(), 8);
+        assert_eq!(runtime.consumer_goods_factories(ideas), 6);
+        assert_eq!(runtime.available_civilian_factories(ideas), 8);
     }
 
     #[test]
@@ -616,9 +784,10 @@ mod tests {
     #[test]
     fn runtime_aggregates_static_domestic_resources() {
         let runtime = test_runtime();
+        let ideas = &[];
 
         assert_eq!(
-            runtime.domestic_resources(),
+            runtime.domestic_resources(ideas),
             ResourceLedger {
                 steel: 12,
                 tungsten: 4,
@@ -642,7 +811,7 @@ mod tests {
             unmodeled_equipment: 0,
         };
 
-        assert_eq!(stocked_runtime.supported_divisions(demand), 26);
+        assert_eq!(stocked_runtime.supported_divisions(demand, &[]), 26);
     }
 
     #[test]

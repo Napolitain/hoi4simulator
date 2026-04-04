@@ -27,10 +27,10 @@ pub enum FocusBranch {
     Diplomacy,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FocusAction {
     pub date: GameDate,
-    pub branch: FocusBranch,
+    pub focus_id: Box<str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,7 +136,7 @@ pub struct ProductionAction {
     pub factories: u8,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     Construction(ConstructionAction),
     Production(ProductionAction),
@@ -147,7 +147,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub fn date(self) -> GameDate {
+    pub fn date(&self) -> GameDate {
         match self {
             Self::Construction(action) => action.date,
             Self::Production(action) => action.date,

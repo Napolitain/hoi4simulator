@@ -1,8 +1,8 @@
 use std::env;
 use std::process::ExitCode;
 
-use hoi4simulator::data::{DataProfilePaths, load_france_1936_dataset};
-use hoi4simulator::scenario::France1936Scenario;
+use hoi4simulator::data::{DataProfilePaths, load_france_1936_dataset, load_france_1936_scenario};
+use hoi4simulator::domain::{GameDate, HardFocusGoal};
 use hoi4simulator::sim::{SimulationConfig, SimulationEngine};
 use hoi4simulator::solver::{BeamSearchConfig, FranceBeamPlanner, PlannerWeights};
 
@@ -19,6 +19,7 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     let mut args = env::args().skip(1);
     let mut profile = "vanilla".to_string();
+    let mut hard_focus_goals = Vec::new();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -26,6 +27,12 @@ fn run() -> Result<(), String> {
                 profile = args
                     .next()
                     .ok_or_else(|| "missing value for --profile".to_string())?;
+            }
+            "--hard-focus" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "missing value for --hard-focus".to_string())?;
+                hard_focus_goals.push(parse_hard_focus_goal(&value)?);
             }
             "--help" | "-h" => {
                 print_usage();
@@ -44,7 +51,9 @@ fn run() -> Result<(), String> {
         )
     })?;
     let warnings = dataset.warnings.clone();
-    let scenario = France1936Scenario::from_dataset(dataset).map_err(|error| error.to_string())?;
+    let scenario = load_france_1936_scenario(&paths)
+        .map_err(|error| error.to_string())?
+        .with_hard_focus_goals(hard_focus_goals);
     let planner = FranceBeamPlanner::new(
         scenario.clone(),
         SimulationEngine::new(SimulationConfig::default()),
@@ -81,7 +90,8 @@ fn run() -> Result<(), String> {
     );
     println!(
         "supported divisions: {}",
-        plan.final_state.supported_divisions(per_division_demand)
+        plan.final_state
+            .supported_divisions(per_division_demand, &scenario.ideas)
     );
     println!(
         "frontier forts complete: {}",
@@ -114,5 +124,35 @@ fn print_usage() {
 }
 
 fn usage_text() -> &'static str {
-    "Usage: cargo run --bin france_1936 -- [--profile <NAME>]\n\nRuns the France 1936 scenario from the Apache Fory dataset in data/structured/<profile>/."
+    "Usage: cargo run --bin france_1936 -- [--profile <NAME>] [--hard-focus <FOCUS_ID[@YYYY-MM-DD]>]\n\nRuns the France 1936 scenario from the Apache Fory dataset in data/structured/<profile>/ and exact mirrored focus data in data/raw/<profile>/."
+}
+
+fn parse_hard_focus_goal(value: &str) -> Result<HardFocusGoal, String> {
+    let (id, deadline) = match value.split_once('@') {
+        Some((id, deadline)) => (id, parse_game_date(deadline)?),
+        None => (value, GameDate::new(1940, 5, 10)),
+    };
+    if id.is_empty() {
+        return Err("hard focus goal id must not be empty".to_string());
+    }
+
+    Ok(HardFocusGoal {
+        id: id.into(),
+        deadline,
+    })
+}
+
+fn parse_game_date(value: &str) -> Result<GameDate, String> {
+    let mut parts = value.split('-');
+    let Some(year) = parts.next().and_then(|part| part.parse::<u16>().ok()) else {
+        return Err(format!("invalid date: {value}"));
+    };
+    let Some(month) = parts.next().and_then(|part| part.parse::<u8>().ok()) else {
+        return Err(format!("invalid date: {value}"));
+    };
+    let Some(day) = parts.next().and_then(|part| part.parse::<u8>().ok()) else {
+        return Err(format!("invalid date: {value}"));
+    };
+
+    Ok(GameDate::new(year, month, day))
 }

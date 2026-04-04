@@ -19,7 +19,9 @@ fn main() {
 
     let plan = planner.plan().expect("France 1936 planning should succeed");
     let per_division_demand = scenario.force_plan.template.per_division_demand();
-    let ready_divisions = plan.final_state.supported_divisions(per_division_demand);
+    let ready_divisions = plan
+        .final_state
+        .supported_divisions(per_division_demand, &scenario.ideas);
 
     println!("scenario: {} 1936", scenario.reference_tag);
     println!("template: {:?}", plan.template);
