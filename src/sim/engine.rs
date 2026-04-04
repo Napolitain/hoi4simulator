@@ -1,4 +1,4 @@
-use crate::domain::{EquipmentKind, GameDate};
+use crate::domain::GameDate;
 use crate::scenario::France1936Scenario;
 
 use super::actions::{
@@ -58,6 +58,7 @@ pub enum SimulationError {
     LawAlreadySet(LawTarget),
     HeuristicViolation(RuleViolation),
     DuplicateAdvisor(AdvisorKind),
+    HardRequirementsUnsatisfied,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -238,14 +239,17 @@ impl SimulationEngine {
         let state_index = self
             .state_index(country, action.state)
             .ok_or(SimulationError::InvalidState(action.state))?;
-        let definition = country.state_defs[state_index];
+        let definition = &country.state_defs[state_index];
         let runtime = country.states[state_index];
 
         let phase = self.phase_for(country.country.date, pivot_date);
         let context = ConstructionDecisionContext {
             phase,
             military_factory_target_met: country.total_military_factories()
-                >= scenario.military_factory_target,
+                >= scenario.force_plan.required_military_factories,
+            minimum_force_target_met: country
+                .supported_divisions(scenario.force_plan.template.per_division_demand())
+                >= scenario.force_goal.division_band().min,
             frontier_forts_met: country.frontier_forts_complete(&scenario.frontier_forts),
             civilian_exception: false,
             infrastructure_is_justified: runtime.infrastructure < definition.infrastructure_target,
@@ -405,7 +409,8 @@ impl SimulationEngine {
             line.equipment != action.equipment || line.factories != action.factories;
         let demand_justified = country.stockpile.get(action.equipment)
             < scenario
-                .readiness_demand_for(scenario.readiness_band.min)
+                .force_plan
+                .stockpile_target_demand
                 .get(action.equipment);
 
         FranceHeuristicRules::validate_production_retune(super::rules::ProductionDecisionContext {
@@ -520,9 +525,8 @@ impl SimulationEngine {
 
             line.accumulated_ic_centi += u32::try_from(daily_ic_centi).unwrap_or(u32::MAX);
 
-            let equipment_cost = self.equipment_cost(line.equipment);
-            let produced_units = line.accumulated_ic_centi / equipment_cost;
-            line.accumulated_ic_centi %= equipment_cost;
+            let produced_units = line.accumulated_ic_centi / line.unit_cost_centi;
+            line.accumulated_ic_centi %= line.unit_cost_centi;
 
             country.stockpile.add(line.equipment, produced_units);
 
@@ -540,16 +544,6 @@ impl SimulationEngine {
             super::actions::ResearchBranch::Construction => 120,
             super::actions::ResearchBranch::Electronics => 150,
             super::actions::ResearchBranch::Production => 130,
-        }
-    }
-
-    fn equipment_cost(&self, equipment: EquipmentKind) -> u32 {
-        match equipment {
-            EquipmentKind::InfantryEquipment => 50,
-            EquipmentKind::SupportEquipment => 400,
-            EquipmentKind::Artillery => 350,
-            EquipmentKind::AntiTank => 400,
-            EquipmentKind::AntiAir => 350,
         }
     }
 

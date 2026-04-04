@@ -45,6 +45,21 @@ impl GameDate {
         Self::new(self.year + 1, 1, 1)
     }
 
+    pub fn previous_day(self) -> Self {
+        assert!(self.year > 0 || self.month > 1 || self.day > 1);
+
+        if self.day > 1 {
+            return Self::new(self.year, self.month, self.day - 1);
+        }
+
+        if self.month > 1 {
+            let month = self.month - 1;
+            return Self::new(self.year, month, Self::days_in_month(self.year, month));
+        }
+
+        Self::new(self.year - 1, 12, 31)
+    }
+
     pub fn is_leap_year(year: u16) -> bool {
         (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
     }
@@ -133,6 +148,13 @@ mod tests {
         let end = start.add_days(3);
 
         assert_eq!(end, GameDate::new(1936, 3, 1));
+    }
+
+    #[test]
+    fn game_date_moves_back_across_month_boundaries() {
+        let date = GameDate::new(1936, 3, 1);
+
+        assert_eq!(date.previous_day(), GameDate::new(1936, 2, 29));
     }
 
     #[test]

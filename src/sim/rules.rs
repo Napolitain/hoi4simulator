@@ -7,6 +7,7 @@ use super::{
 pub struct ConstructionDecisionContext {
     pub phase: StrategicPhase,
     pub military_factory_target_met: bool,
+    pub minimum_force_target_met: bool,
     pub frontier_forts_met: bool,
     pub civilian_exception: bool,
     pub infrastructure_is_justified: bool,
@@ -17,6 +18,7 @@ impl ConstructionDecisionContext {
         Self {
             phase: StrategicPhase::PrePivot,
             military_factory_target_met: false,
+            minimum_force_target_met: false,
             frontier_forts_met: false,
             civilian_exception: false,
             infrastructure_is_justified,
@@ -138,6 +140,18 @@ impl FranceHeuristicRules {
         context: ConstructionDecisionContext,
         kind: ConstructionKind,
     ) -> Result<(), RuleViolation> {
+        if context.minimum_force_target_met && !context.frontier_forts_met {
+            if kind == ConstructionKind::LandFort {
+                return Ok(());
+            }
+
+            if context.civilian_exception && kind == ConstructionKind::CivilianFactory {
+                return Ok(());
+            }
+
+            return Err(RuleViolation::MustPrioritizeFrontierForts);
+        }
+
         if !context.military_factory_target_met {
             if kind == ConstructionKind::MilitaryFactory {
                 return Ok(());
@@ -215,6 +229,7 @@ mod tests {
         let context = ConstructionDecisionContext {
             phase: StrategicPhase::PostPivot,
             military_factory_target_met: false,
+            minimum_force_target_met: false,
             frontier_forts_met: false,
             civilian_exception: false,
             infrastructure_is_justified: false,
@@ -230,6 +245,7 @@ mod tests {
         let context = ConstructionDecisionContext {
             phase: StrategicPhase::PostPivot,
             military_factory_target_met: true,
+            minimum_force_target_met: true,
             frontier_forts_met: false,
             civilian_exception: false,
             infrastructure_is_justified: false,
@@ -238,6 +254,22 @@ mod tests {
             FranceHeuristicRules::validate_construction(context, ConstructionKind::MilitaryFactory);
 
         assert_eq!(result, Err(RuleViolation::MustPrioritizeFrontierForts));
+    }
+
+    #[test]
+    fn post_pivot_allows_forts_before_extra_military_once_minimum_force_is_met() {
+        let context = ConstructionDecisionContext {
+            phase: StrategicPhase::PostPivot,
+            military_factory_target_met: false,
+            minimum_force_target_met: true,
+            frontier_forts_met: false,
+            civilian_exception: false,
+            infrastructure_is_justified: false,
+        };
+        let result =
+            FranceHeuristicRules::validate_construction(context, ConstructionKind::LandFort);
+
+        assert_eq!(result, Ok(()));
     }
 
     #[test]

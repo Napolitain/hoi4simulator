@@ -16,6 +16,7 @@ Rust foundations for a country-extensible Hearts of Iron IV simulator and solver
 
 - `domain/`: dates, laws, planning milestones, strategic goal weights, and division-template demand and fitness
 - `scenario/`: zero-cost country-scenario interface plus France 1936 defaults and readiness targets
+- `data/`: Clausewitz parsing, exact-data mirroring, structured dataset generation, and exact France 1936 loading
 - `sim/`: dense-ID action types, contiguous runtime state, daily simulation engine, and France-specific heuristic rule validation
 - `solver/`: rolling beam-search configuration plus a France planner that evaluates strategy templates, pivot dates, and strategic-goal weights
 
@@ -45,19 +46,31 @@ This is the first implementation slice, not the full simulator. The repository c
 - France 1936 scenario defaults, pivot window, curated state set, fort targets, and readiness targets
 - country-scenario trait seams so future countries can reuse the same simulator and solver boundaries
 - canonical France division-template demand modeling plus template fitness and constraint checks for future template search
+- exact-data pipeline support for local-only `data/raw/<profile>/` mirrors and normalized Apache Fory datasets under `data/structured/<profile>/`
 - daily construction, production, focus, research, and political-power simulation
 - heuristic rule validation for pre-pivot and post-pivot planning behavior
 - rolling-horizon beam search that scores France strategy templates, pivot dates, and broader strategic goals
 
 ## Trying the simulator
 
-Run the France 1936 reference planner end-to-end:
+Run the curated reference planner end-to-end:
 
 ```bash
 cargo run --example france_1936_plan
 ```
 
 That example drives the solver on top of the daily simulator and prints the chosen strategy template, pivot date, first dated actions, and final factory/readiness summary.
+
+To use exact local HOI4 data instead of the curated bootstrap:
+
+```bash
+cargo run --bin ingest_data -- --game-dir "/path/to/Hearts of Iron IV" --profile vanilla
+cargo run --bin france_1936 -- --profile vanilla
+```
+
+The ingest step mirrors selected exact game files into `data/raw/<profile>/` and writes a normalized Apache Fory dataset to `data/structured/<profile>/`. The France scenario runner then loads that binary structured dataset and fails loudly if the required exact data is missing.
+
+Because this repository is public, those `data/raw/` and `data/structured/` trees are intentionally gitignored.
 
 ## Linting, tests, and coverage
 

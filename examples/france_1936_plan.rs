@@ -18,11 +18,12 @@ fn main() {
     );
 
     let plan = planner.plan().expect("France 1936 planning should succeed");
-    let per_division_demand = scenario.canonical_template.per_division_demand();
-    let ready_divisions = plan.final_state.ready_divisions(per_division_demand);
+    let per_division_demand = scenario.force_plan.template.per_division_demand();
+    let ready_divisions = plan.final_state.supported_divisions(per_division_demand);
 
     println!("scenario: {} 1936", scenario.reference_tag);
     println!("template: {:?}", plan.template);
+    println!("force template: {}", scenario.force_plan.template.name);
     println!("pivot date: {}", plan.pivot_date);
     println!("score: {}", plan.score);
     println!("actions: {}", plan.actions.len());
@@ -32,7 +33,13 @@ fn main() {
         plan.final_state.total_civilian_factories(),
         plan.final_state.total_military_factories()
     );
-    println!("ready divisions: {}", ready_divisions);
+    println!(
+        "derived force plan: {} divisions, {} required mils, {} resource utilization bp",
+        scenario.force_plan.frontline_divisions,
+        scenario.force_plan.required_military_factories,
+        scenario.force_plan.resource_utilization_bp
+    );
+    println!("supported divisions: {}", ready_divisions);
     println!(
         "frontier forts complete: {}",
         plan.final_state

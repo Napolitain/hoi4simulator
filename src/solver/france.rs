@@ -63,8 +63,21 @@ impl FranceBeamPlanner {
     }
 
     pub fn plan(&self) -> Result<PlannedSolution, SimulationError> {
+        let balanced = self.search(self.config)?;
+        if self.hard_requirements_met(&balanced.final_state) {
+            return Ok(balanced);
+        }
+
+        if let Some(repaired) = self.repair_hard_requirements(&balanced)? {
+            return Ok(repaired);
+        }
+
+        Err(SimulationError::HardRequirementsUnsatisfied)
+    }
+
+    fn search(&self, config: BeamSearchConfig) -> Result<PlannedSolution, SimulationError> {
         let end_date = self.scenario.milestones[3].date;
-        let mut frontier = self.seed_nodes();
+        let mut frontier = self.seed_nodes(config);
 
         while frontier
             .iter()
@@ -80,7 +93,7 @@ impl FranceBeamPlanner {
 
                 let window_actions = self.generate_window_actions(&node);
                 let window_end = min_date(
-                    node.runtime.country.date.add_days(self.config.replan_days),
+                    node.runtime.country.date.add_days(config.replan_days),
                     end_date,
                 );
 
@@ -111,7 +124,7 @@ impl FranceBeamPlanner {
                     .then_with(|| left.template.cmp(&right.template))
                     .then_with(|| left.pivot_date.cmp(&right.pivot_date))
             });
-            next_frontier.truncate(self.config.beam_width);
+            next_frontier.truncate(config.beam_width);
             frontier = next_frontier;
         }
 
@@ -129,8 +142,8 @@ impl FranceBeamPlanner {
         })
     }
 
-    fn seed_nodes(&self) -> Vec<PlannerNode> {
-        let pivot_dates = self.pivot_dates();
+    fn seed_nodes(&self, config: BeamSearchConfig) -> Vec<PlannerNode> {
+        let pivot_dates = self.pivot_dates(config);
         let mut nodes = Vec::with_capacity(pivot_dates.len() * 3);
 
         for template in [
@@ -153,7 +166,7 @@ impl FranceBeamPlanner {
         nodes
     }
 
-    fn pivot_dates(&self) -> Vec<GameDate> {
+    fn pivot_dates(&self, config: BeamSearchConfig) -> Vec<GameDate> {
         let mut dates = Vec::new();
         let mut date = self.scenario.pivot_window.start;
 
@@ -163,7 +176,7 @@ impl FranceBeamPlanner {
                 break;
             }
 
-            let next = date.add_days(self.config.replan_days);
+            let next = date.add_days(config.replan_days);
             if next > self.scenario.pivot_window.end {
                 dates.push(self.scenario.pivot_window.end);
                 break;
@@ -245,6 +258,16 @@ impl FranceBeamPlanner {
         reserved: &[bool; ResearchBranch::COUNT],
     ) -> Option<ResearchBranch> {
         let research = node.runtime.completed_research;
+        let force_plan = self.scenario.force_plan;
+        let military_gap = force_plan
+            .required_military_factories
+            .saturating_sub(node.runtime.total_military_factories());
+        let support_intensity = force_plan
+            .factory_allocation
+            .support_equipment
+            .saturating_add(force_plan.factory_allocation.artillery)
+            .saturating_add(force_plan.factory_allocation.anti_tank)
+            .saturating_add(force_plan.factory_allocation.anti_air);
         let mut priorities = [
             (
                 ResearchBranch::Construction,
@@ -266,7 +289,13 @@ impl FranceBeamPlanner {
                 ResearchBranch::Electronics,
                 research.electronics,
                 match phase {
-                    StrategicPhase::PrePivot => 2_u8,
+                    StrategicPhase::PrePivot => {
+                        if support_intensity >= 10 {
+                            2_u8
+                        } else {
+                            3_u8
+                        }
+                    }
                     StrategicPhase::PostPivot => 3_u8,
                 },
             ),
@@ -274,7 +303,13 @@ impl FranceBeamPlanner {
                 ResearchBranch::Production,
                 research.production,
                 match phase {
-                    StrategicPhase::PrePivot => 3_u8,
+                    StrategicPhase::PrePivot => {
+                        if military_gap >= 12 {
+                            0_u8
+                        } else {
+                            2_u8
+                        }
+                    }
                     StrategicPhase::PostPivot => 0_u8,
                 },
             ),
@@ -413,9 +448,8 @@ impl FranceBeamPlanner {
             return None;
         }
 
-        let demand = self
-            .scenario
-            .readiness_demand_for(self.scenario.readiness_band.min);
+        let demand = self.scenario.force_plan.stockpile_target_demand;
+        let desired_allocation = self.scenario.force_plan.factory_allocation;
         let equipment = [
             EquipmentKind::InfantryEquipment,
             EquipmentKind::SupportEquipment,
@@ -425,9 +459,22 @@ impl FranceBeamPlanner {
         ]
         .into_iter()
         .max_by_key(|equipment| {
-            let demand_amount = demand.get(*equipment);
-            let stockpile_amount = node.runtime.stockpile.get(*equipment);
-            demand_amount.saturating_sub(stockpile_amount)
+            let target_factories = desired_allocation.get(*equipment);
+            let assigned_factories = node
+                .runtime
+                .production_lines
+                .iter()
+                .find(|line| line.equipment == *equipment)
+                .map(|line| u16::from(line.factories))
+                .unwrap_or(0);
+            let stockpile_gap = demand
+                .get(*equipment)
+                .saturating_sub(node.runtime.stockpile.get(*equipment));
+
+            (
+                target_factories.saturating_sub(assigned_factories),
+                stockpile_gap,
+            )
         })?;
 
         let slot = node
@@ -435,9 +482,16 @@ impl FranceBeamPlanner {
             .production_lines
             .iter()
             .position(|line| line.equipment == equipment)?;
-        let factories = node.runtime.production_lines[slot]
-            .factories
-            .saturating_add(u8::try_from(unassigned.min(2)).unwrap_or(2));
+        let current_factories = node.runtime.production_lines[slot].factories;
+        let target_factories = desired_allocation
+            .get(equipment)
+            .max(u16::from(current_factories) + 1);
+        let factories = u8::try_from(
+            u16::from(current_factories)
+                .saturating_add(unassigned.min(2))
+                .min(target_factories),
+        )
+        .unwrap_or(u8::MAX);
 
         Some(crate::sim::ProductionAction {
             date,
@@ -464,7 +518,19 @@ impl FranceBeamPlanner {
                 }
             },
             StrategicPhase::PostPivot => {
-                if node.runtime.total_military_factories() < self.scenario.military_factory_target {
+                let minimum_force_target_met = node
+                    .runtime
+                    .supported_divisions(self.scenario.force_plan.template.per_division_demand())
+                    >= self.scenario.force_goal.division_band().min;
+                if minimum_force_target_met
+                    && !node
+                        .runtime
+                        .frontier_forts_complete(&self.scenario.frontier_forts)
+                {
+                    self.next_fort_action(node, date, pending_actions)
+                } else if node.runtime.total_military_factories()
+                    < self.scenario.force_plan.required_military_factories
+                {
                     self.next_military_action(node, date, pending_actions)
                 } else {
                     self.next_fort_action(node, date, pending_actions)
@@ -551,7 +617,7 @@ impl FranceBeamPlanner {
         state: crate::sim::StateId,
         pending_actions: &[Action],
     ) -> bool {
-        let definition = node.runtime.state_defs[usize::from(state.0)];
+        let definition = &node.runtime.state_defs[usize::from(state.0)];
         let runtime = node.runtime.state(state);
         let pending_for_state = node.runtime.queued_factory_projects(state)
             + pending_actions
@@ -577,7 +643,7 @@ impl FranceBeamPlanner {
         state: crate::sim::StateId,
         pending_actions: &[Action],
     ) -> bool {
-        let definition = node.runtime.state_defs[usize::from(state.0)];
+        let definition = &node.runtime.state_defs[usize::from(state.0)];
         let runtime = node.runtime.state(state);
         let queued = node
             .runtime
@@ -635,11 +701,11 @@ impl FranceBeamPlanner {
     }
 
     fn score(&self, runtime: &CountryRuntime) -> i64 {
+        let force_plan = self.scenario.force_plan;
         let civilian = i64::from(runtime.total_civilian_factories());
         let military = i64::from(runtime.total_military_factories());
-        let ready_divisions = i64::from(
-            runtime.ready_divisions(self.scenario.canonical_template.per_division_demand()),
-        );
+        let ready_divisions =
+            i64::from(runtime.supported_divisions(force_plan.template.per_division_demand()));
         let completed_focuses = i64::from(
             runtime.completed_focuses.economy
                 + runtime.completed_focuses.industry
@@ -651,6 +717,60 @@ impl FranceBeamPlanner {
                 + runtime.completed_research.electronics
                 + runtime.completed_research.production,
         );
+        let stockpile_gap = [
+            EquipmentKind::InfantryEquipment,
+            EquipmentKind::SupportEquipment,
+            EquipmentKind::Artillery,
+            EquipmentKind::AntiTank,
+            EquipmentKind::AntiAir,
+        ]
+        .into_iter()
+        .map(|equipment| {
+            i64::from(
+                force_plan
+                    .stockpile_target_demand
+                    .get(equipment)
+                    .saturating_sub(runtime.stockpile.get(equipment)),
+            )
+        })
+        .sum::<i64>();
+        let factory_gap = i64::from(
+            force_plan
+                .required_military_factories
+                .saturating_sub(runtime.total_military_factories()),
+        );
+        let current_resource_use = [
+            EquipmentKind::InfantryEquipment,
+            EquipmentKind::SupportEquipment,
+            EquipmentKind::Artillery,
+            EquipmentKind::AntiTank,
+            EquipmentKind::AntiAir,
+        ]
+        .into_iter()
+        .fold(
+            crate::domain::ResourceLedger::default(),
+            |total, equipment| {
+                let assigned = runtime
+                    .production_lines
+                    .iter()
+                    .find(|line| line.equipment == equipment)
+                    .map(|line| u16::from(line.factories))
+                    .unwrap_or(0);
+                total.plus(
+                    self.scenario
+                        .equipment_profiles
+                        .profile(equipment)
+                        .resources
+                        .scale(assigned),
+                )
+            },
+        );
+        let resource_utilization =
+            i64::from(current_resource_use.utilization_bp(self.scenario.domestic_resources));
+        let manpower_headroom = runtime
+            .country
+            .available_manpower()
+            .saturating_sub(u64::from(force_plan.frontline_demand.manpower));
 
         let mut score = 0_i64;
         score += civilian * i64::from(self.weights.civilian_growth) * 100;
@@ -660,6 +780,8 @@ impl FranceBeamPlanner {
         score += ready_divisions * i64::from(self.strategic_goals.readiness) * 60;
         score += completed_focuses * i64::from(self.strategic_goals.politics) * 120;
         score += completed_research * i64::from(self.strategic_goals.research) * 100;
+        score += resource_utilization * 6;
+        score += i64::try_from(manpower_headroom / 1_000).unwrap_or(i64::MAX) * 2;
 
         if runtime.country.date >= self.scenario.milestones[0].date {
             score += civilian * 50;
@@ -668,13 +790,8 @@ impl FranceBeamPlanner {
             score += civilian * 75;
         }
         if runtime.country.date >= self.scenario.milestones[2].date {
-            let military_gap =
-                i64::from(self.scenario.military_factory_target).saturating_sub(military);
-            let readiness_gap =
-                i64::from(self.scenario.readiness_band.min).saturating_sub(ready_divisions);
-
-            score -= military_gap.max(0) * 800;
-            score -= readiness_gap.max(0) * 1_200;
+            score -= factory_gap.max(0) * 800;
+            score -= stockpile_gap * 4;
         }
         if runtime.country.date >= self.scenario.milestones[3].date {
             if runtime.frontier_forts_complete(&self.scenario.frontier_forts) {
@@ -686,6 +803,137 @@ impl FranceBeamPlanner {
 
         score
     }
+
+    fn hard_requirements_met(&self, runtime: &CountryRuntime) -> bool {
+        runtime.frontier_forts_complete(&self.scenario.frontier_forts)
+            && runtime.supported_divisions(self.scenario.force_plan.template.per_division_demand())
+                >= self.scenario.force_goal.division_band().min
+    }
+
+    fn repair_hard_requirements(
+        &self,
+        plan: &PlannedSolution,
+    ) -> Result<Option<PlannedSolution>, SimulationError> {
+        let mut repaired_actions = plan.actions.clone();
+        let candidate_indices = repaired_actions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, action)| match *action {
+                Action::Construction(ConstructionAction { date, kind, .. })
+                    if kind != ConstructionKind::LandFort && date >= plan.pivot_date =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        for index in candidate_indices.into_iter().rev() {
+            let Action::Construction(action) = repaired_actions[index] else {
+                continue;
+            };
+            let Some(replacement) =
+                self.repair_fort_action(&repaired_actions, index, plan.pivot_date)?
+            else {
+                continue;
+            };
+            if replacement == action {
+                continue;
+            }
+
+            repaired_actions[index] = Action::Construction(replacement);
+            let Ok(repaired_plan) =
+                self.evaluate_actions(plan.template, plan.pivot_date, repaired_actions.clone())
+            else {
+                continue;
+            };
+            if self.hard_requirements_met(&repaired_plan.final_state) {
+                return Ok(Some(repaired_plan));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn repair_fort_action(
+        &self,
+        actions: &[Action],
+        replace_index: usize,
+        pivot_date: GameDate,
+    ) -> Result<Option<ConstructionAction>, SimulationError> {
+        let Action::Construction(candidate) = actions[replace_index] else {
+            return Ok(None);
+        };
+        if candidate.kind == ConstructionKind::LandFort || candidate.date < pivot_date {
+            return Ok(None);
+        }
+
+        let runtime = self.runtime_before_date(actions, candidate.date, pivot_date)?;
+        let same_day_actions = actions
+            .iter()
+            .enumerate()
+            .filter(|(index, action)| *index != replace_index && action.date() == candidate.date)
+            .map(|(_, action)| *action)
+            .collect::<Vec<_>>();
+        let node = PlannerNode {
+            template: StrategyTemplateKind::EarlyMilitaryPivot,
+            pivot_date,
+            actions: Vec::new(),
+            runtime,
+            score: 0,
+        };
+
+        Ok(self.next_fort_action(&node, candidate.date, &same_day_actions))
+    }
+
+    fn runtime_before_date(
+        &self,
+        actions: &[Action],
+        date: GameDate,
+        pivot_date: GameDate,
+    ) -> Result<CountryRuntime, SimulationError> {
+        if date == self.scenario.start_date {
+            return Ok(self.scenario.bootstrap_runtime());
+        }
+
+        let prefix = actions
+            .iter()
+            .copied()
+            .filter(|action| action.date() < date)
+            .collect::<Vec<_>>();
+        let outcome = self.simulator.simulate(
+            &self.scenario,
+            self.scenario.bootstrap_runtime(),
+            &prefix,
+            date.previous_day(),
+            pivot_date,
+        )?;
+
+        Ok(outcome.country)
+    }
+
+    fn evaluate_actions(
+        &self,
+        template: StrategyTemplateKind,
+        pivot_date: GameDate,
+        actions: Vec<Action>,
+    ) -> Result<PlannedSolution, SimulationError> {
+        let outcome = self.simulator.simulate(
+            &self.scenario,
+            self.scenario.bootstrap_runtime(),
+            &actions,
+            self.scenario.milestones[3].date,
+            pivot_date,
+        )?;
+
+        Ok(PlannedSolution {
+            template,
+            pivot_date,
+            score: self.score(&outcome.country),
+            actions,
+            final_state: outcome.country,
+        })
+    }
 }
 
 fn min_date(left: GameDate, right: GameDate) -> GameDate {
@@ -696,7 +944,7 @@ fn min_date(left: GameDate, right: GameDate) -> GameDate {
 mod tests {
     use crate::domain::StrategicGoalWeights;
     use crate::scenario::France1936Scenario;
-    use crate::sim::{Action, ResearchBranch, SimulationConfig, SimulationEngine};
+    use crate::sim::{Action, ResearchBranch, SimulationConfig, SimulationEngine, SimulationError};
 
     use super::{FranceBeamPlanner, StrategyTemplateKind};
 
@@ -770,7 +1018,7 @@ mod tests {
             crate::solver::PlannerWeights::default(),
         );
         let node = planner
-            .seed_nodes()
+            .seed_nodes(planner.config)
             .into_iter()
             .next()
             .expect("planner seeds nodes");
@@ -786,5 +1034,52 @@ mod tests {
         assert_eq!(research_actions.len(), 2);
         assert_ne!(research_actions[0], research_actions[1]);
         assert!(research_actions.contains(&ResearchBranch::Construction));
+    }
+
+    #[test]
+    fn france_beam_planner_returns_hard_requirement_compliant_plan_when_feasible() {
+        let scenario = France1936Scenario::standard();
+        let planner = FranceBeamPlanner::new(
+            scenario.clone(),
+            SimulationEngine::new(SimulationConfig {
+                civilian_factory_cost_centi: 200_000,
+                military_factory_cost_centi: 180_000,
+                infrastructure_cost_centi: 90_000,
+                land_fort_cost_centi: 20_000,
+                ..SimulationConfig::default()
+            }),
+            crate::solver::BeamSearchConfig::new(16, 35),
+            crate::solver::PlannerWeights::default(),
+        );
+
+        let plan = planner.plan().unwrap();
+
+        assert!(
+            plan.final_state
+                .frontier_forts_complete(&scenario.frontier_forts)
+        );
+        assert!(
+            plan.final_state
+                .supported_divisions(scenario.force_plan.template.per_division_demand())
+                >= scenario.force_goal.division_band().min
+        );
+    }
+
+    #[test]
+    fn france_beam_planner_fails_when_hard_requirements_are_impossible() {
+        let scenario = France1936Scenario::standard();
+        let planner = FranceBeamPlanner::new(
+            scenario,
+            SimulationEngine::new(SimulationConfig {
+                land_fort_cost_centi: 4_000_000_000,
+                ..SimulationConfig::default()
+            }),
+            crate::solver::BeamSearchConfig::new(8, 35),
+            crate::solver::PlannerWeights::default(),
+        );
+
+        let result = planner.plan();
+
+        assert_eq!(result, Err(SimulationError::HardRequirementsUnsatisfied));
     }
 }

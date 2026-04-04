@@ -1,4 +1,4 @@
-use crate::domain::{CountryLaws, EquipmentDemand, EquipmentKind, GameDate};
+use crate::domain::{CountryLaws, EquipmentDemand, EquipmentKind, GameDate, ResourceLedger};
 use crate::scenario::{Frontier, FrontierFortRequirement};
 
 use super::actions::{ConstructionKind, FocusBranch, ResearchBranch, StateId};
@@ -57,14 +57,16 @@ impl CountryState {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StateDefinition {
     pub id: StateId,
-    pub name: &'static str,
+    pub raw_state_id: u32,
+    pub name: Box<str>,
     pub building_slots: u8,
     pub economic_weight: u16,
     pub infrastructure_target: u8,
     pub frontier: Option<Frontier>,
+    pub resources: ResourceLedger,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,7 +82,7 @@ impl StateRuntime {
         self.civilian_factories + self.military_factories
     }
 
-    pub fn free_slots(self, definition: StateDefinition) -> u8 {
+    pub fn free_slots(self, definition: &StateDefinition) -> u8 {
         definition.building_slots.saturating_sub(self.used_slots())
     }
 }
@@ -92,6 +94,7 @@ pub struct Stockpile {
     pub artillery: u32,
     pub anti_tank: u32,
     pub anti_air: u32,
+    pub unmodeled_equipment: u32,
 }
 
 impl Stockpile {
@@ -102,6 +105,7 @@ impl Stockpile {
             EquipmentKind::Artillery => self.artillery += amount,
             EquipmentKind::AntiTank => self.anti_tank += amount,
             EquipmentKind::AntiAir => self.anti_air += amount,
+            EquipmentKind::Unmodeled => self.unmodeled_equipment += amount,
         }
     }
 
@@ -112,24 +116,28 @@ impl Stockpile {
             EquipmentKind::Artillery => self.artillery,
             EquipmentKind::AntiTank => self.anti_tank,
             EquipmentKind::AntiAir => self.anti_air,
+            EquipmentKind::Unmodeled => self.unmodeled_equipment,
         }
     }
 
     pub fn ready_divisions(self, demand: EquipmentDemand, manpower_available: u64) -> u16 {
         assert!(demand.infantry_equipment > 0);
-        assert!(demand.support_equipment > 0);
-        assert!(demand.artillery > 0);
-        assert!(demand.anti_tank > 0);
-        assert!(demand.anti_air > 0);
         assert!(demand.manpower > 0);
 
         let manpower_limit = manpower_available / u64::from(demand.manpower);
+        let limit_for = |stockpile: u32, required: u32| {
+            if required == 0 {
+                u32::MAX
+            } else {
+                stockpile / required
+            }
+        };
         let equipment_limits = [
-            self.infantry_equipment / demand.infantry_equipment,
-            self.support_equipment / demand.support_equipment,
-            self.artillery / demand.artillery,
-            self.anti_tank / demand.anti_tank,
-            self.anti_air / demand.anti_air,
+            limit_for(self.infantry_equipment, demand.infantry_equipment),
+            limit_for(self.support_equipment, demand.support_equipment),
+            limit_for(self.artillery, demand.artillery),
+            limit_for(self.anti_tank, demand.anti_tank),
+            limit_for(self.anti_air, demand.anti_air),
         ];
 
         let equipment_limit = equipment_limits.into_iter().min().unwrap_or(0);
@@ -151,15 +159,21 @@ pub struct ConstructionProject {
 pub struct ProductionLine {
     pub equipment: EquipmentKind,
     pub factories: u8,
+    pub unit_cost_centi: u32,
     pub efficiency_permille: u16,
     pub accumulated_ic_centi: u32,
 }
 
 impl ProductionLine {
     pub fn new(equipment: EquipmentKind, factories: u8) -> Self {
+        Self::new_with_cost(equipment, factories, equipment.default_unit_cost_centi())
+    }
+
+    pub fn new_with_cost(equipment: EquipmentKind, factories: u8, unit_cost_centi: u32) -> Self {
         Self {
             equipment,
             factories,
+            unit_cost_centi,
             efficiency_permille: 100,
             accumulated_ic_centi: 0,
         }
@@ -169,6 +183,7 @@ impl ProductionLine {
         if self.equipment != equipment {
             self.efficiency_permille = 100;
             self.accumulated_ic_centi = 0;
+            self.unit_cost_centi = equipment.default_unit_cost_centi();
         }
 
         self.equipment = equipment;
@@ -216,6 +231,8 @@ pub struct CountryRuntime {
     pub state_defs: Box<[StateDefinition]>,
     pub states: Box<[StateRuntime]>,
     pub stockpile: Stockpile,
+    pub fielded_divisions: u16,
+    pub fielded_demand: EquipmentDemand,
     pub production_lines: Box<[ProductionLine]>,
     pub construction_queue: Vec<ConstructionProject>,
     pub focus: Option<FocusProgress>,
@@ -239,6 +256,8 @@ impl CountryRuntime {
             state_defs,
             states,
             stockpile: Stockpile::default(),
+            fielded_divisions: 0,
+            fielded_demand: EquipmentDemand::default(),
             production_lines,
             construction_queue: Vec::with_capacity(64),
             focus: None,
@@ -247,6 +266,16 @@ impl CountryRuntime {
             completed_research: ResearchSummary::default(),
             advisors: AdvisorRoster::default(),
         }
+    }
+
+    pub fn with_fielded_force(
+        mut self,
+        divisions: u16,
+        per_division_demand: EquipmentDemand,
+    ) -> Self {
+        self.fielded_divisions = divisions;
+        self.fielded_demand = per_division_demand.scale(divisions);
+        self
     }
 
     pub fn state_index(&self, state: StateId) -> usize {
@@ -389,9 +418,27 @@ impl CountryRuntime {
         })
     }
 
+    pub fn domestic_resources(&self) -> ResourceLedger {
+        self.state_defs
+            .iter()
+            .fold(ResourceLedger::default(), |total, state| {
+                total.plus(state.resources)
+            })
+    }
+
     pub fn ready_divisions(&self, demand: EquipmentDemand) -> u16 {
         self.stockpile
             .ready_divisions(demand, self.country.available_manpower())
+    }
+
+    pub fn supported_divisions(&self, demand: EquipmentDemand) -> u16 {
+        let free_manpower = self
+            .country
+            .available_manpower()
+            .saturating_sub(u64::from(self.fielded_demand.manpower));
+
+        self.fielded_divisions
+            .saturating_add(self.stockpile.ready_divisions(demand, free_manpower))
     }
 
     pub fn queued_kind_projects(&self, state: StateId, kind: ConstructionKind) -> u8 {
@@ -422,7 +469,7 @@ impl FrancePlanningState {
 
 #[cfg(test)]
 mod tests {
-    use crate::domain::{CountryLaws, DivisionTemplate, EquipmentKind, GameDate};
+    use crate::domain::{CountryLaws, DivisionTemplate, EquipmentKind, GameDate, ResourceLedger};
     use crate::scenario::{France1936Scenario, Frontier};
     use crate::sim::actions::{ConstructionKind, StateId};
 
@@ -441,19 +488,27 @@ mod tests {
             vec![
                 StateDefinition {
                     id: StateId(0),
-                    name: "paris",
+                    raw_state_id: 16,
+                    name: "paris".into(),
                     building_slots: 12,
                     economic_weight: 10,
                     infrastructure_target: 8,
                     frontier: None,
+                    resources: ResourceLedger::default(),
                 },
                 StateDefinition {
                     id: StateId(1),
-                    name: "lorraine",
+                    raw_state_id: 17,
+                    name: "lorraine".into(),
                     building_slots: 8,
                     economic_weight: 7,
                     infrastructure_target: 7,
                     frontier: Some(Frontier::Germany),
+                    resources: ResourceLedger {
+                        steel: 12,
+                        tungsten: 4,
+                        ..ResourceLedger::default()
+                    },
                 },
             ]
             .into_boxed_slice(),
@@ -527,6 +582,7 @@ mod tests {
             artillery: demand.artillery * 3,
             anti_tank: demand.anti_tank * 3,
             anti_air: demand.anti_air * 3,
+            unmodeled_equipment: 0,
         };
 
         assert_eq!(stockpile.ready_divisions(demand, 500_000), 3);
@@ -555,6 +611,38 @@ mod tests {
         let runtime = scenario.bootstrap_runtime();
 
         assert!(!runtime.frontier_forts_complete(&scenario.frontier_forts));
+    }
+
+    #[test]
+    fn runtime_aggregates_static_domestic_resources() {
+        let runtime = test_runtime();
+
+        assert_eq!(
+            runtime.domestic_resources(),
+            ResourceLedger {
+                steel: 12,
+                tungsten: 4,
+                ..ResourceLedger::default()
+            }
+        );
+    }
+
+    #[test]
+    fn supported_divisions_include_fielded_force_and_reserve_stockpile() {
+        let template = DivisionTemplate::canonical_france_line();
+        let demand = template.per_division_demand();
+        let runtime = test_runtime().with_fielded_force(24, demand);
+        let mut stocked_runtime = runtime.clone();
+        stocked_runtime.stockpile = Stockpile {
+            infantry_equipment: demand.infantry_equipment * 2,
+            support_equipment: demand.support_equipment * 2,
+            artillery: demand.artillery * 2,
+            anti_tank: demand.anti_tank * 2,
+            anti_air: demand.anti_air * 2,
+            unmodeled_equipment: 0,
+        };
+
+        assert_eq!(stocked_runtime.supported_divisions(demand), 26);
     }
 
     #[test]

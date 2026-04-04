@@ -1,4 +1,6 @@
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+use fory::ForyObject;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ForyObject)]
 pub enum EconomyLaw {
     CivilianEconomy,
     EarlyMobilization,
@@ -6,14 +8,14 @@ pub enum EconomyLaw {
     WarEconomy,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ForyObject)]
 pub enum TradeLaw {
     ExportFocus,
     LimitedExports,
     ClosedEconomy,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ForyObject)]
 pub enum MobilizationLaw {
     VolunteerOnly,
     LimitedConscription,
@@ -36,7 +38,7 @@ impl MobilizationLaw {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ForyObject)]
 pub struct CountryLaws {
     pub economy: EconomyLaw,
     pub trade: TradeLaw,
