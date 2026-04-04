@@ -1,5 +1,3 @@
-use arrayvec::ArrayVec;
-
 use crate::domain::{EquipmentKind, GameDate, NationalFocus, StrategicGoalWeights};
 use crate::scenario::France1936Scenario;
 use crate::sim::{
@@ -9,9 +7,6 @@ use crate::sim::{
 };
 
 use super::{BeamSearchConfig, PlannerWeights};
-
-const MAX_PLANNED_ACTIONS: usize = 256;
-const MAX_WINDOW_ACTIONS: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StrategyTemplateKind {
@@ -83,47 +78,39 @@ impl FranceBeamPlanner {
     fn search(&self, config: BeamSearchConfig) -> Result<PlannedSolution, SimulationError> {
         let end_date = self.scenario.milestones[3].date;
         let mut frontier = self.seed_nodes(config);
-        let mut next_frontier = Vec::with_capacity(frontier.len().max(config.beam_width));
 
         while frontier
             .iter()
             .any(|node| node.runtime.country.date < end_date)
         {
-            next_frontier.clear();
+            let mut next_frontier = Vec::with_capacity(frontier.len());
 
-            for node in frontier.drain(..) {
+            for node in frontier.into_iter() {
                 if node.runtime.country.date >= end_date {
                     next_frontier.push(node);
                     continue;
                 }
 
-                let mut window_actions = self.generate_window_actions(&node);
+                let window_actions = self.generate_window_actions(&node);
                 let window_end = min_date(
                     node.runtime.country.date.add_days(config.replan_days),
                     end_date,
                 );
-                let PlannerNode {
-                    template,
-                    pivot_date,
-                    actions,
-                    runtime,
-                    score: _,
-                } = node;
+
+                let mut child_actions = node.actions.clone();
+                child_actions.extend(window_actions.iter().cloned());
 
                 let outcome = self.simulator.simulate(
                     &self.scenario,
-                    runtime,
-                    window_actions.as_slice(),
+                    node.runtime.clone(),
+                    &window_actions,
                     window_end,
-                    pivot_date,
+                    node.pivot_date,
                 )?;
-                let mut child_actions = actions;
-                assert!(child_actions.len() + window_actions.len() <= MAX_PLANNED_ACTIONS);
-                child_actions.extend(window_actions.drain(..));
 
                 next_frontier.push(PlannerNode {
-                    template,
-                    pivot_date,
+                    template: node.template,
+                    pivot_date: node.pivot_date,
                     actions: child_actions,
                     score: self.score(&outcome.country),
                     runtime: outcome.country,
@@ -138,7 +125,7 @@ impl FranceBeamPlanner {
                     .then_with(|| left.pivot_date.cmp(&right.pivot_date))
             });
             next_frontier.truncate(config.beam_width);
-            std::mem::swap(&mut frontier, &mut next_frontier);
+            frontier = next_frontier;
         }
 
         let best = frontier
@@ -169,7 +156,7 @@ impl FranceBeamPlanner {
                 nodes.push(PlannerNode {
                     template,
                     pivot_date,
-                    actions: Vec::with_capacity(MAX_PLANNED_ACTIONS),
+                    actions: Vec::with_capacity(256),
                     score: 0,
                     runtime,
                 });
@@ -203,8 +190,8 @@ impl FranceBeamPlanner {
         dates
     }
 
-    fn generate_window_actions(&self, node: &PlannerNode) -> ArrayVec<Action, MAX_WINDOW_ACTIONS> {
-        let mut actions = ArrayVec::<Action, MAX_WINDOW_ACTIONS>::new();
+    fn generate_window_actions(&self, node: &PlannerNode) -> Vec<Action> {
+        let mut actions = Vec::with_capacity(16);
         let date = node.runtime.country.date;
         let phase = self.phase(node, date);
         let mut reserved_research = self.reserved_research_branches(&node.runtime);
@@ -1133,13 +1120,12 @@ impl FranceBeamPlanner {
         }
 
         let runtime = self.runtime_before_date(actions, candidate.date, pivot_date)?;
-        let mut same_day_actions = ArrayVec::<Action, MAX_WINDOW_ACTIONS>::new();
-        for (index, action) in actions.iter().enumerate() {
-            if index == replace_index || action.date() != candidate.date {
-                continue;
-            }
-            same_day_actions.push(action.clone());
-        }
+        let same_day_actions = actions
+            .iter()
+            .enumerate()
+            .filter(|(index, action)| *index != replace_index && action.date() == candidate.date)
+            .map(|(_, action)| action.clone())
+            .collect::<Vec<_>>();
         let node = PlannerNode {
             template: StrategyTemplateKind::EarlyMilitaryPivot,
             pivot_date,
@@ -1148,7 +1134,7 @@ impl FranceBeamPlanner {
             score: 0,
         };
 
-        Ok(self.next_fort_action(&node, candidate.date, same_day_actions.as_slice()))
+        Ok(self.next_fort_action(&node, candidate.date, &same_day_actions))
     }
 
     fn runtime_before_date(
