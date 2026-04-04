@@ -275,7 +275,7 @@ impl SimulationEngine {
             }
         }
 
-        country.construction_queue.push(ConstructionProject {
+        country.queue_construction_project(ConstructionProject {
             state: action.state,
             kind: action.kind,
             total_cost_centi: self.construction_cost(action.kind),
@@ -516,17 +516,21 @@ impl SimulationEngine {
                 u32::try_from(daily_progress).unwrap_or(u32::MAX);
         }
 
-        let mut index = 0_usize;
-        while index < country.construction_queue.len() {
-            if country.construction_queue[index].progress_centi
-                >= country.construction_queue[index].total_cost_centi
-            {
-                let project = country.construction_queue.remove(index);
+        let mut write_index = 0_usize;
+        let queue_len = country.construction_queue.len();
+        for read_index in 0..queue_len {
+            let project = country.construction_queue[read_index];
+            if project.progress_centi >= project.total_cost_centi {
                 self.finish_construction(country, project);
-            } else {
-                index += 1;
+                continue;
             }
+
+            if write_index != read_index {
+                country.construction_queue[write_index] = project;
+            }
+            write_index += 1;
         }
+        country.construction_queue.truncate(write_index);
     }
 
     fn finish_construction(&self, country: &mut CountryRuntime, project: ConstructionProject) {
@@ -763,9 +767,7 @@ impl SimulationEngine {
             }
             FocusEffect::AddResearchSlot(amount) => {
                 for _ in 0..*amount {
-                    country
-                        .research_slots
-                        .push(super::state::ResearchSlotState::default());
+                    country.add_research_slot();
                 }
             }
             FocusEffect::SetCountryFlag(flag) => {
@@ -775,17 +777,7 @@ impl SimulationEngine {
                 country.stockpile.add(*equipment, *amount);
             }
             FocusEffect::StateScoped(scope_effects) => {
-                let indices = self.select_focus_state_indices(
-                    country,
-                    scope_effects.scope,
-                    &scope_effects.limit,
-                    anchor_state,
-                )?;
-                for index in indices {
-                    for operation in &scope_effects.operations {
-                        self.apply_focus_state_operation(country, index, operation)?;
-                    }
-                }
+                self.apply_state_scoped_effects(country, scope_effects, anchor_state)?;
             }
             FocusEffect::Unsupported(name) => {
                 return Err(SimulationError::UnsupportedFocusEffect(name.clone()));
@@ -795,39 +787,74 @@ impl SimulationEngine {
         Ok(())
     }
 
-    fn select_focus_state_indices(
+    fn apply_state_scoped_effects(
         &self,
-        country: &CountryRuntime,
-        scope: FocusStateScope,
-        limit: &StateCondition,
+        country: &mut CountryRuntime,
+        scope_effects: &crate::domain::StateScopedEffects,
         anchor_state: Option<usize>,
-    ) -> Result<Vec<usize>, SimulationError> {
-        let mut eligible = Vec::new();
-        for index in 0..country.states.len() {
-            if self.evaluate_state_condition(country, index, limit)? {
-                eligible.push(index);
+    ) -> Result<(), SimulationError> {
+        match scope_effects.scope {
+            FocusStateScope::AnyState | FocusStateScope::EveryOwnedState => {
+                let mut eligible = [0_u8; 256];
+                let mut eligible_count = 0_usize;
+                for ordered_index in country.focus_state_order().iter().copied() {
+                    let state_index = usize::from(ordered_index);
+                    if self.evaluate_state_condition(country, state_index, &scope_effects.limit)? {
+                        eligible[eligible_count] = ordered_index;
+                        eligible_count += 1;
+                    }
+                }
+
+                for ordered_index in eligible.into_iter().take(eligible_count) {
+                    for operation in &scope_effects.operations {
+                        self.apply_focus_state_operation(
+                            country,
+                            usize::from(ordered_index),
+                            operation,
+                        )?;
+                    }
+                }
+            }
+            FocusStateScope::RandomControlledState | FocusStateScope::RandomOwnedState => {
+                if let Some(state_index) =
+                    self.first_matching_focus_state(country, &scope_effects.limit, None)?
+                {
+                    for operation in &scope_effects.operations {
+                        self.apply_focus_state_operation(country, state_index, operation)?;
+                    }
+                }
+            }
+            FocusStateScope::RandomNeighborState => {
+                if let Some(state_index) =
+                    self.first_matching_focus_state(country, &scope_effects.limit, anchor_state)?
+                {
+                    for operation in &scope_effects.operations {
+                        self.apply_focus_state_operation(country, state_index, operation)?;
+                    }
+                }
             }
         }
-        eligible.sort_by_key(|index| {
-            (
-                country.state_defs[*index].frontier.is_some(),
-                std::cmp::Reverse(country.state_defs[*index].economic_weight),
-                country.state_defs[*index].raw_state_id,
-            )
-        });
 
-        Ok(match scope {
-            FocusStateScope::AnyState | FocusStateScope::EveryOwnedState => eligible,
-            FocusStateScope::RandomControlledState | FocusStateScope::RandomOwnedState => {
-                eligible.into_iter().take(1).collect()
+        Ok(())
+    }
+
+    fn first_matching_focus_state(
+        &self,
+        country: &CountryRuntime,
+        limit: &StateCondition,
+        excluded_state: Option<usize>,
+    ) -> Result<Option<usize>, SimulationError> {
+        for ordered_index in country.focus_state_order().iter().copied() {
+            let state_index = usize::from(ordered_index);
+            if Some(state_index) == excluded_state {
+                continue;
             }
-            FocusStateScope::RandomNeighborState => eligible
-                .iter()
-                .copied()
-                .find(|index| Some(*index) != anchor_state)
-                .into_iter()
-                .collect(),
-        })
+            if self.evaluate_state_condition(country, state_index, limit)? {
+                return Ok(Some(state_index));
+            }
+        }
+
+        Ok(None)
     }
 
     fn apply_focus_state_operation(
@@ -846,17 +873,7 @@ impl SimulationEngine {
                 country.set_state_flag_by_index(state_index, flag.clone());
             }
             StateOperation::NestedScope(scope) => {
-                let indices = self.select_focus_state_indices(
-                    country,
-                    scope.scope,
-                    &scope.limit,
-                    Some(state_index),
-                )?;
-                for nested_index in indices {
-                    for operation in &scope.operations {
-                        self.apply_focus_state_operation(country, nested_index, operation)?;
-                    }
-                }
+                self.apply_state_scoped_effects(country, scope, Some(state_index))?;
             }
             StateOperation::AddBuildingConstruction {
                 kind,

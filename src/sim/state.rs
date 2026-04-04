@@ -1,3 +1,5 @@
+use std::cmp::Reverse;
+
 use crate::domain::{
     CountryLaws, EquipmentDemand, EquipmentKind, FocusBuildingKind, GameDate, IdeaDefinition,
     IdeaModifiers, ResourceLedger,
@@ -7,6 +9,20 @@ use crate::scenario::{Frontier, FrontierFortRequirement};
 use super::actions::{ConstructionKind, ResearchBranch, StateId};
 
 pub const POLITICAL_POWER_UNIT: u32 = 100;
+pub const MAX_CONSTRUCTION_QUEUE: usize = 64;
+pub const MAX_COMPLETED_FOCUSES: usize = 128;
+pub const MAX_ACTIVE_IDEAS: usize = 64;
+pub const MAX_COUNTRY_FLAGS: usize = 128;
+pub const MAX_STATE_FLAGS_PER_STATE: usize = 16;
+pub const MAX_RESEARCH_SLOTS: usize = 16;
+
+const _: () = assert!(MAX_CONSTRUCTION_QUEUE > 0);
+const _: () = assert!(MAX_COMPLETED_FOCUSES > 0);
+const _: () = assert!(MAX_ACTIVE_IDEAS > 0);
+const _: () = assert!(MAX_COUNTRY_FLAGS > 0);
+const _: () = assert!(MAX_STATE_FLAGS_PER_STATE > 0);
+const _: () = assert!(MAX_RESEARCH_SLOTS > 0);
+const _: () = assert!(MAX_RESEARCH_SLOTS <= 256);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StrategicPhase {
@@ -268,6 +284,7 @@ pub struct CountryRuntime {
     pub research_slots: Vec<ResearchSlotState>,
     pub completed_research: ResearchSummary,
     pub advisors: AdvisorRoster,
+    focus_state_order: Box<[u8]>,
 }
 
 impl CountryRuntime {
@@ -279,6 +296,9 @@ impl CountryRuntime {
     ) -> Self {
         assert_eq!(state_defs.len(), states.len());
         let state_count = states.len();
+        let focus_state_order = sorted_focus_state_order(&state_defs);
+        let mut research_slots = Vec::with_capacity(MAX_RESEARCH_SLOTS);
+        research_slots.resize(2, ResearchSlotState::default());
 
         Self {
             country,
@@ -288,21 +308,28 @@ impl CountryRuntime {
             fielded_divisions: 0,
             fielded_demand: EquipmentDemand::default(),
             production_lines,
-            construction_queue: Vec::with_capacity(64),
+            construction_queue: Vec::with_capacity(MAX_CONSTRUCTION_QUEUE),
             focus: None,
-            completed_focuses: Vec::with_capacity(64),
-            active_ideas: Vec::with_capacity(32),
-            country_flags: Vec::with_capacity(32),
-            state_flags: vec![Vec::new(); state_count].into_boxed_slice(),
-            research_slots: vec![ResearchSlotState::default(), ResearchSlotState::default()],
+            completed_focuses: Vec::with_capacity(MAX_COMPLETED_FOCUSES),
+            active_ideas: Vec::with_capacity(MAX_ACTIVE_IDEAS),
+            country_flags: Vec::with_capacity(MAX_COUNTRY_FLAGS),
+            state_flags: std::iter::repeat_with(|| Vec::with_capacity(MAX_STATE_FLAGS_PER_STATE))
+                .take(state_count)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            research_slots,
             completed_research: ResearchSummary::default(),
             advisors: AdvisorRoster::default(),
+            focus_state_order,
         }
     }
 
     pub fn with_research_slots(mut self, count: u8) -> Self {
         assert!(count > 0);
-        self.research_slots = vec![ResearchSlotState::default(); usize::from(count)];
+        assert!(usize::from(count) <= MAX_RESEARCH_SLOTS);
+        self.research_slots.clear();
+        self.research_slots
+            .resize(usize::from(count), ResearchSlotState::default());
         self
     }
 
@@ -476,10 +503,37 @@ impl CountryRuntime {
             return;
         }
 
-        self.active_ideas.push(ActiveIdea {
-            id,
-            remaining_days: duration_days,
-        });
+        push_bounded(
+            &mut self.active_ideas,
+            ActiveIdea {
+                id,
+                remaining_days: duration_days,
+            },
+            MAX_ACTIVE_IDEAS,
+            "active ideas",
+        );
+    }
+
+    pub fn add_research_slot(&mut self) {
+        push_bounded(
+            &mut self.research_slots,
+            ResearchSlotState::default(),
+            MAX_RESEARCH_SLOTS,
+            "research slots",
+        );
+    }
+
+    pub fn queue_construction_project(&mut self, project: ConstructionProject) {
+        push_bounded(
+            &mut self.construction_queue,
+            project,
+            MAX_CONSTRUCTION_QUEUE,
+            "construction queue",
+        );
+    }
+
+    pub fn focus_state_order(&self) -> &[u8] {
+        &self.focus_state_order
     }
 
     pub fn remove_idea(&mut self, id: &str) {
@@ -507,10 +561,15 @@ impl CountryRuntime {
             return;
         }
 
-        self.completed_focuses.push(CompletedFocus {
-            id,
-            completed_on: self.country.date,
-        });
+        push_bounded(
+            &mut self.completed_focuses,
+            CompletedFocus {
+                id,
+                completed_on: self.country.date,
+            },
+            MAX_COMPLETED_FOCUSES,
+            "completed focuses",
+        );
     }
 
     pub fn apply_research_completion(&mut self, branch: ResearchBranch) {
@@ -588,7 +647,12 @@ impl CountryRuntime {
         if self.country_flags.iter().any(|current| current == &flag) {
             return;
         }
-        self.country_flags.push(flag);
+        push_bounded(
+            &mut self.country_flags,
+            flag,
+            MAX_COUNTRY_FLAGS,
+            "country flags",
+        );
     }
 
     pub fn has_state_flag_by_index(&self, index: usize, flag: &str) -> bool {
@@ -605,13 +669,40 @@ impl CountryRuntime {
         {
             return;
         }
-        self.state_flags[index].push(flag);
+        push_bounded(
+            &mut self.state_flags[index],
+            flag,
+            MAX_STATE_FLAGS_PER_STATE,
+            "state flags",
+        );
     }
 
     pub fn research_speed_bp(&self, ideas: &[IdeaDefinition]) -> u16 {
         let bonus = self.idea_modifiers(ideas).research_speed_bp;
         u16::try_from(bonus.clamp(0, i32::from(u16::MAX))).unwrap_or(u16::MAX)
     }
+}
+
+fn sorted_focus_state_order(state_defs: &[StateDefinition]) -> Box<[u8]> {
+    assert!(state_defs.len() <= 256);
+
+    let mut order = (0..state_defs.len())
+        .map(|index| u8::try_from(index).unwrap_or(u8::MAX))
+        .collect::<Vec<_>>();
+    order.sort_by_key(|index| {
+        let definition = &state_defs[usize::from(*index)];
+        (
+            definition.frontier.is_some(),
+            Reverse(definition.economic_weight),
+            definition.raw_state_id,
+        )
+    });
+    order.into_boxed_slice()
+}
+
+fn push_bounded<T>(items: &mut Vec<T>, item: T, max_len: usize, label: &str) {
+    assert!(items.len() < max_len, "{label} exceeded its fixed capacity");
+    items.push(item);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -639,8 +730,10 @@ mod tests {
     use crate::sim::actions::{ConstructionKind, StateId};
 
     use super::{
-        CountryRuntime, CountryState, FrancePlanningState, POLITICAL_POWER_UNIT, ProductionLine,
-        StateDefinition, StateRuntime, Stockpile, StrategicPhase,
+        CountryRuntime, CountryState, FrancePlanningState, MAX_ACTIVE_IDEAS, MAX_COMPLETED_FOCUSES,
+        MAX_CONSTRUCTION_QUEUE, MAX_COUNTRY_FLAGS, MAX_RESEARCH_SLOTS, MAX_STATE_FLAGS_PER_STATE,
+        POLITICAL_POWER_UNIT, ProductionLine, StateDefinition, StateRuntime, Stockpile,
+        StrategicPhase,
     };
 
     fn test_runtime() -> CountryRuntime {
@@ -817,13 +910,13 @@ mod tests {
     #[test]
     fn queued_factory_project_count_ignores_non_slot_buildings() {
         let mut runtime = test_runtime();
-        runtime.construction_queue.push(super::ConstructionProject {
+        runtime.queue_construction_project(super::ConstructionProject {
             state: StateId(0),
             kind: ConstructionKind::CivilianFactory,
             total_cost_centi: 1,
             progress_centi: 0,
         });
-        runtime.construction_queue.push(super::ConstructionProject {
+        runtime.queue_construction_project(super::ConstructionProject {
             state: StateId(0),
             kind: ConstructionKind::Infrastructure,
             total_cost_centi: 1,
@@ -831,5 +924,37 @@ mod tests {
         });
 
         assert_eq!(runtime.queued_factory_projects(StateId(0)), 1);
+    }
+
+    #[test]
+    fn runtime_preallocates_fixed_capacity_buffers() {
+        let runtime = test_runtime();
+
+        assert_eq!(
+            runtime.construction_queue.capacity(),
+            MAX_CONSTRUCTION_QUEUE
+        );
+        assert_eq!(runtime.completed_focuses.capacity(), MAX_COMPLETED_FOCUSES);
+        assert_eq!(runtime.active_ideas.capacity(), MAX_ACTIVE_IDEAS);
+        assert_eq!(runtime.country_flags.capacity(), MAX_COUNTRY_FLAGS);
+        assert_eq!(runtime.research_slots.capacity(), MAX_RESEARCH_SLOTS);
+        assert!(
+            runtime
+                .state_flags
+                .iter()
+                .all(|flags| flags.capacity() == MAX_STATE_FLAGS_PER_STATE)
+        );
+    }
+
+    #[test]
+    fn adding_research_slots_reuses_preallocated_capacity() {
+        let mut runtime = test_runtime().with_research_slots(3);
+        let baseline_capacity = runtime.research_slots.capacity();
+
+        runtime.add_research_slot();
+        runtime.add_research_slot();
+
+        assert_eq!(runtime.research_slots.capacity(), baseline_capacity);
+        assert_eq!(runtime.research_slots.len(), 5);
     }
 }
