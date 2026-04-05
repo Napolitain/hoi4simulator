@@ -195,5 +195,23 @@ mod tests {
             prop_assert_eq!(start.days_until(end), i32::from(days));
             prop_assert_eq!(end.days_until(start), -i32::from(days));
         }
+
+        #[test]
+        fn add_days_is_associative(
+            year in 1930u16..1940,
+            month in 1u8..13,
+            day_seed in 0u16..31,
+            a in 0u16..183,
+            b in 0u16..183,
+        ) {
+            let max_day = GameDate::days_in_month(year, month);
+            let day = u8::try_from(day_seed % u16::from(max_day) + 1).unwrap_or(max_day);
+            let start = GameDate::new(year, month, day);
+
+            let via_two_steps = start.add_days(a).add_days(b);
+            let via_one_step = start.add_days(a + b);
+
+            prop_assert_eq!(via_two_steps, via_one_step);
+        }
     }
 }

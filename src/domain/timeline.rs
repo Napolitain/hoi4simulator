@@ -24,7 +24,7 @@ impl WarState {
         }
     }
 
-    pub fn matches(self, left: &str, right: &str) -> bool {
+    pub fn matches(&self, left: &str, right: &str) -> bool {
         let (left, right) = if left <= right {
             (left, right)
         } else {
@@ -49,9 +49,7 @@ impl WorldState {
     }
 
     pub fn countries_at_war(&self, left: &str, right: &str) -> bool {
-        self.active_wars
-            .iter()
-            .any(|war| war.clone().matches(left, right))
+        self.active_wars.iter().any(|war| war.matches(left, right))
     }
 
     pub fn dissolve_country(&mut self, tag: impl Into<Box<str>>) {
@@ -162,7 +160,7 @@ mod tests {
     fn war_state_matches_symmetrically() {
         let war = WarState::new("GER", "POL");
 
-        assert!(war.clone().matches("GER", "POL"));
+        assert!(war.matches("GER", "POL"));
         assert!(war.matches("POL", "GER"));
     }
 

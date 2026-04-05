@@ -814,162 +814,195 @@ fn parse_focus_condition_block(block: &ClausewitzBlock) -> FocusCondition {
         let ClausewitzItem::Assignment(assignment) = item else {
             continue;
         };
-        match assignment.key.as_ref() {
-            "AND" => {
-                if let Some(child) = assignment.value.as_block() {
-                    conditions.push(FocusCondition::All(parse_focus_condition_list(child)));
-                }
-            }
-            "OR" => {
-                if let Some(child) = assignment.value.as_block() {
-                    conditions.push(FocusCondition::Any(parse_focus_condition_list(child)));
-                }
-            }
-            "NOT" | "not" => {
-                if let Some(child) = assignment.value.as_block() {
-                    conditions.push(FocusCondition::Not(Box::new(parse_focus_condition_block(
-                        child,
-                    ))));
-                }
-            }
-            "if" | "IF" => {
-                if let Some(child) = assignment.value.as_block()
-                    && let Some(limit) = child
-                        .first_assignment("limit")
-                        .or_else(|| child.first_assignment("LIMIT"))
-                        .and_then(ClausewitzValue::as_block)
-                {
-                    let limit_condition = parse_focus_condition_block(limit);
-                    let mut body = child.clone();
-                    body.items.retain(|item| {
-                        !matches!(
-                            item,
-                            ClausewitzItem::Assignment(inner)
-                                if matches!(inner.key.as_ref(), "limit" | "LIMIT" | "else" | "ELSE")
-                        )
-                    });
-                    conditions.push(FocusCondition::Any(vec![
-                        FocusCondition::Not(Box::new(limit_condition)),
-                        parse_focus_condition_block(&body),
-                    ]));
-                }
-            }
-            "has_completed_focus" => {
-                if let Some(id) = assignment.value.as_str() {
-                    conditions.push(FocusCondition::HasCompletedFocus(id.into()));
-                }
-            }
-            "has_country_flag" => {
-                if let Some(flag) = assignment.value.as_str() {
-                    conditions.push(FocusCondition::HasCountryFlag(flag.into()));
-                }
-            }
-            "has_dlc" => {
-                if let Some(dlc) = assignment.value.as_str() {
-                    conditions.push(FocusCondition::HasDlc(dlc.into()));
-                }
-            }
-            "has_game_rule" => {
-                if let Some(child) = assignment.value.as_block()
-                    && let Some(rule) = child
-                        .first_assignment("rule")
-                        .and_then(ClausewitzValue::as_str)
-                    && let Some(option) = child
-                        .first_assignment("option")
-                        .and_then(ClausewitzValue::as_str)
-                {
-                    conditions.push(FocusCondition::HasGameRule {
-                        rule: rule.into(),
-                        option: option.into(),
-                    });
-                }
-            }
-            "has_idea" => {
-                if let Some(id) = assignment.value.as_str() {
-                    conditions.push(FocusCondition::HasIdea(id.into()));
-                }
-            }
-            "date" => {
-                if let Some(condition) =
-                    parse_timeline_date_condition(assignment.operator, &assignment.value)
-                {
-                    conditions.push(FocusCondition::Timeline(Box::new(condition)));
-                }
-            }
-            "country_exists" => {
-                if let Some(tag) = assignment.value.as_str() {
-                    conditions.push(FocusCondition::Timeline(Box::new(
-                        TimelineCondition::CountryExists(tag.into()),
-                    )));
-                }
-            }
-            "has_war_with" => {
-                if let Some(tag) = assignment.value.as_str() {
-                    conditions.push(FocusCondition::Timeline(Box::new(
-                        TimelineCondition::HasWarWith(tag.into()),
-                    )));
-                }
-            }
-            "has_war_support" => {
-                if let Some(condition) = parse_focus_percent_condition(
-                    assignment.operator,
-                    &assignment.value,
-                    FocusCondition::HasWarSupportAtLeast,
-                ) {
-                    conditions.push(condition);
-                }
-            }
-            "num_of_factories" => {
-                if let Some(condition) = parse_focus_count_condition(
-                    assignment.operator,
-                    &assignment.value,
-                    FocusCondition::NumOfFactoriesAtLeast,
-                ) {
-                    conditions.push(condition);
-                }
-            }
-            "num_of_military_factories" => {
-                if let Some(condition) = parse_focus_count_condition(
-                    assignment.operator,
-                    &assignment.value,
-                    FocusCondition::NumOfMilitaryFactoriesAtLeast,
-                ) {
-                    conditions.push(condition);
-                }
-            }
-            "amount_research_slots" => {
-                if let Some(condition) =
-                    parse_research_slot_condition(assignment.operator, &assignment.value)
-                {
-                    conditions.push(condition);
-                }
-            }
-            "any_owned_state" => {
-                if let Some(child) = assignment.value.as_block() {
-                    conditions.push(FocusCondition::AnyOwnedState(Box::new(
-                        parse_state_condition_block(child),
-                    )));
-                }
-            }
-            "any_controlled_state" => {
-                if let Some(child) = assignment.value.as_block() {
-                    conditions.push(FocusCondition::AnyControlledState(Box::new(
-                        parse_state_condition_block(child),
-                    )));
-                }
-            }
-            "any_state" => {
-                if let Some(child) = assignment.value.as_block() {
-                    conditions.push(FocusCondition::AnyState(Box::new(
-                        parse_state_condition_block(child),
-                    )));
-                }
-            }
-            key => conditions.push(FocusCondition::Unsupported(key.to_string().into())),
-        }
+        parse_focus_condition_assignment(assignment, &mut conditions);
     }
 
     combine_focus_conditions(conditions)
+}
+
+fn parse_focus_condition_assignment(
+    assignment: &ClausewitzAssignment,
+    conditions: &mut Vec<FocusCondition>,
+) {
+    match assignment.key.as_ref() {
+        "AND" | "OR" | "NOT" | "not" | "if" | "IF" => {
+            parse_focus_condition_logic(assignment, conditions);
+        }
+        "date" | "country_exists" | "has_war_with" => {
+            parse_focus_condition_timeline(assignment, conditions);
+        }
+        "has_completed_focus" => {
+            if let Some(id) = assignment.value.as_str() {
+                conditions.push(FocusCondition::HasCompletedFocus(id.into()));
+            }
+        }
+        "has_country_flag" => {
+            if let Some(flag) = assignment.value.as_str() {
+                conditions.push(FocusCondition::HasCountryFlag(flag.into()));
+            }
+        }
+        "has_dlc" => {
+            if let Some(dlc) = assignment.value.as_str() {
+                conditions.push(FocusCondition::HasDlc(dlc.into()));
+            }
+        }
+        "has_game_rule" => {
+            if let Some(child) = assignment.value.as_block()
+                && let Some(rule) = child
+                    .first_assignment("rule")
+                    .and_then(ClausewitzValue::as_str)
+                && let Some(option) = child
+                    .first_assignment("option")
+                    .and_then(ClausewitzValue::as_str)
+            {
+                conditions.push(FocusCondition::HasGameRule {
+                    rule: rule.into(),
+                    option: option.into(),
+                });
+            }
+        }
+        "has_idea" => {
+            if let Some(id) = assignment.value.as_str() {
+                conditions.push(FocusCondition::HasIdea(id.into()));
+            }
+        }
+        "has_war_support" => {
+            if let Some(condition) = parse_focus_percent_condition(
+                assignment.operator,
+                &assignment.value,
+                FocusCondition::HasWarSupportAtLeast,
+            ) {
+                conditions.push(condition);
+            }
+        }
+        "num_of_factories" => {
+            if let Some(condition) = parse_focus_count_condition(
+                assignment.operator,
+                &assignment.value,
+                FocusCondition::NumOfFactoriesAtLeast,
+            ) {
+                conditions.push(condition);
+            }
+        }
+        "num_of_military_factories" => {
+            if let Some(condition) = parse_focus_count_condition(
+                assignment.operator,
+                &assignment.value,
+                FocusCondition::NumOfMilitaryFactoriesAtLeast,
+            ) {
+                conditions.push(condition);
+            }
+        }
+        "amount_research_slots" => {
+            if let Some(condition) =
+                parse_research_slot_condition(assignment.operator, &assignment.value)
+            {
+                conditions.push(condition);
+            }
+        }
+        "any_owned_state" => {
+            if let Some(child) = assignment.value.as_block() {
+                conditions.push(FocusCondition::AnyOwnedState(Box::new(
+                    parse_state_condition_block(child),
+                )));
+            }
+        }
+        "any_controlled_state" => {
+            if let Some(child) = assignment.value.as_block() {
+                conditions.push(FocusCondition::AnyControlledState(Box::new(
+                    parse_state_condition_block(child),
+                )));
+            }
+        }
+        "any_state" => {
+            if let Some(child) = assignment.value.as_block() {
+                conditions.push(FocusCondition::AnyState(Box::new(
+                    parse_state_condition_block(child),
+                )));
+            }
+        }
+        key => conditions.push(FocusCondition::Unsupported(key.to_string().into())),
+    }
+}
+
+/// Handles AND / OR / NOT / IF — the logical connective arms.
+fn parse_focus_condition_logic(
+    assignment: &ClausewitzAssignment,
+    conditions: &mut Vec<FocusCondition>,
+) {
+    match assignment.key.as_ref() {
+        "AND" => {
+            if let Some(child) = assignment.value.as_block() {
+                conditions.push(FocusCondition::All(parse_focus_condition_list(child)));
+            }
+        }
+        "OR" => {
+            if let Some(child) = assignment.value.as_block() {
+                conditions.push(FocusCondition::Any(parse_focus_condition_list(child)));
+            }
+        }
+        "NOT" | "not" => {
+            if let Some(child) = assignment.value.as_block() {
+                conditions.push(FocusCondition::Not(Box::new(parse_focus_condition_block(
+                    child,
+                ))));
+            }
+        }
+        "if" | "IF" => {
+            if let Some(child) = assignment.value.as_block()
+                && let Some(limit) = child
+                    .first_assignment("limit")
+                    .or_else(|| child.first_assignment("LIMIT"))
+                    .and_then(ClausewitzValue::as_block)
+            {
+                let limit_condition = parse_focus_condition_block(limit);
+                let mut body = child.clone();
+                body.items.retain(|item| {
+                    !matches!(
+                        item,
+                        ClausewitzItem::Assignment(inner)
+                            if matches!(inner.key.as_ref(), "limit" | "LIMIT" | "else" | "ELSE")
+                    )
+                });
+                conditions.push(FocusCondition::Any(vec![
+                    FocusCondition::Not(Box::new(limit_condition)),
+                    parse_focus_condition_block(&body),
+                ]));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Handles date / country_exists / has_war_with — the timeline condition arms.
+fn parse_focus_condition_timeline(
+    assignment: &ClausewitzAssignment,
+    conditions: &mut Vec<FocusCondition>,
+) {
+    match assignment.key.as_ref() {
+        "date" => {
+            if let Some(condition) =
+                parse_timeline_date_condition(assignment.operator, &assignment.value)
+            {
+                conditions.push(FocusCondition::Timeline(Box::new(condition)));
+            }
+        }
+        "country_exists" => {
+            if let Some(tag) = assignment.value.as_str() {
+                conditions.push(FocusCondition::Timeline(Box::new(
+                    TimelineCondition::CountryExists(tag.into()),
+                )));
+            }
+        }
+        "has_war_with" => {
+            if let Some(tag) = assignment.value.as_str() {
+                conditions.push(FocusCondition::Timeline(Box::new(
+                    TimelineCondition::HasWarWith(tag.into()),
+                )));
+            }
+        }
+        _ => {}
+    }
 }
 
 fn parse_focus_condition_list(block: &ClausewitzBlock) -> Vec<FocusCondition> {
@@ -1040,11 +1073,20 @@ fn parse_timeline_date_condition(
     }
 }
 
-fn parse_dot_game_date(value: &str) -> Option<GameDate> {
+pub fn parse_dot_game_date(value: &str) -> Option<GameDate> {
     let mut parts = value.split('.');
     let year = parts.next()?.parse::<u16>().ok()?;
     let month = parts.next()?.parse::<u8>().ok()?;
     let day = parts.next()?.parse::<u8>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    if !(1..=GameDate::days_in_month(year, month)).contains(&day) {
+        return None;
+    }
 
     Some(GameDate::new(year, month, day))
 }
@@ -1238,6 +1280,90 @@ fn parse_focus_effect_assignment(
     effects: &mut Vec<FocusEffect>,
 ) {
     match assignment.key.as_ref() {
+        "add_ideas" | "remove_ideas" | "remove_idea" | "add_timed_idea" | "swap_ideas" => {
+            parse_focus_effect_idea(assignment, effects);
+        }
+        "add_political_power"
+        | "add_stability"
+        | "add_war_support"
+        | "add_manpower"
+        | "army_experience"
+        | "add_research_slot" => {
+            parse_focus_effect_stat(assignment, effects);
+        }
+        "every_owned_state" | "random_owned_state" | "random_controlled_state" => {
+            parse_focus_effect_state_scoped(assignment, effects);
+        }
+        "add_doctrine_cost_reduction" => {
+            if let Some(child) = assignment.value.as_block()
+                && let Some(reduction) = parse_doctrine_cost_reduction(child)
+            {
+                effects.push(FocusEffect::AddDoctrineCostReduction(reduction));
+            }
+        }
+        "add_country_leader_trait" => {
+            if let Some(trait_id) = assignment.value.as_str() {
+                effects.push(FocusEffect::AddCountryLeaderTrait(trait_id.into()));
+            }
+        }
+        "add_equipment_to_stockpile" => {
+            if let Some(child) = assignment.value.as_block()
+                && let Some(token) = child
+                    .first_assignment("type")
+                    .and_then(ClausewitzValue::as_str)
+                && let Some(amount) = child
+                    .first_assignment("amount")
+                    .and_then(ClausewitzValue::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+            {
+                effects.push(FocusEffect::AddEquipmentToStockpile {
+                    equipment: map_equipment_token(token),
+                    amount,
+                });
+            }
+        }
+        "set_country_flag" => {
+            if let Some(flag) = assignment.value.as_str() {
+                effects.push(FocusEffect::SetCountryFlag {
+                    flag: flag.into(),
+                    days: None,
+                });
+            } else if let Some(child) = assignment.value.as_block()
+                && let Some(flag) = child
+                    .first_assignment("flag")
+                    .and_then(ClausewitzValue::as_str)
+            {
+                let days = child
+                    .first_assignment("days")
+                    .and_then(ClausewitzValue::as_u64)
+                    .and_then(|value| u16::try_from(value).ok());
+                effects.push(FocusEffect::SetCountryFlag {
+                    flag: flag.into(),
+                    days,
+                });
+            }
+        }
+        "if" | "IF" => {
+            if let Some(child) = assignment.value.as_block() {
+                effects.extend(parse_default_conditional_effect_block(child));
+            }
+        }
+        "hidden_effect" => {
+            if let Some(child) = assignment.value.as_block() {
+                effects.extend(parse_focus_effects_block(child));
+            }
+        }
+        "custom_effect_tooltip"
+        | "complete_tooltip"
+        | "mark_focus_tree_layout_dirty"
+        | "show_ideas_tooltip" => {}
+        key => effects.push(FocusEffect::Unsupported(key.to_string().into())),
+    }
+}
+
+/// Idea-related effect arms: add / remove / timed / swap.
+fn parse_focus_effect_idea(assignment: &ClausewitzAssignment, effects: &mut Vec<FocusEffect>) {
+    match assignment.key.as_ref() {
         "add_ideas" => {
             for id in clausewitz_value_strings(&assignment.value) {
                 effects.push(FocusEffect::AddIdea(id));
@@ -1279,6 +1405,13 @@ fn parse_focus_effect_assignment(
                 });
             }
         }
+        _ => {}
+    }
+}
+
+/// Numeric stat effect arms: PP, stability, war support, manpower, XP, research slots.
+fn parse_focus_effect_stat(assignment: &ClausewitzAssignment, effects: &mut Vec<FocusEffect>) {
+    match assignment.key.as_ref() {
         "army_experience" => {
             if let Some(value) = assignment
                 .value
@@ -1286,18 +1419,6 @@ fn parse_focus_effect_assignment(
                 .and_then(|value| u16::try_from(value).ok())
             {
                 effects.push(FocusEffect::AddArmyExperience(value));
-            }
-        }
-        "add_doctrine_cost_reduction" => {
-            if let Some(child) = assignment.value.as_block()
-                && let Some(reduction) = parse_doctrine_cost_reduction(child)
-            {
-                effects.push(FocusEffect::AddDoctrineCostReduction(reduction));
-            }
-        }
-        "add_country_leader_trait" => {
-            if let Some(trait_id) = assignment.value.as_str() {
-                effects.push(FocusEffect::AddCountryLeaderTrait(trait_id.into()));
             }
         }
         "add_political_power" => {
@@ -1329,82 +1450,25 @@ fn parse_focus_effect_assignment(
                 effects.push(FocusEffect::AddResearchSlot(value));
             }
         }
-        "add_equipment_to_stockpile" => {
-            if let Some(child) = assignment.value.as_block()
-                && let Some(token) = child
-                    .first_assignment("type")
-                    .and_then(ClausewitzValue::as_str)
-                && let Some(amount) = child
-                    .first_assignment("amount")
-                    .and_then(ClausewitzValue::as_u64)
-                    .and_then(|value| u32::try_from(value).ok())
-            {
-                effects.push(FocusEffect::AddEquipmentToStockpile {
-                    equipment: map_equipment_token(token),
-                    amount,
-                });
-            }
-        }
-        "set_country_flag" => {
-            if let Some(flag) = assignment.value.as_str() {
-                effects.push(FocusEffect::SetCountryFlag {
-                    flag: flag.into(),
-                    days: None,
-                });
-            } else if let Some(child) = assignment.value.as_block()
-                && let Some(flag) = child
-                    .first_assignment("flag")
-                    .and_then(ClausewitzValue::as_str)
-            {
-                let days = child
-                    .first_assignment("days")
-                    .and_then(ClausewitzValue::as_u64)
-                    .and_then(|value| u16::try_from(value).ok());
-                effects.push(FocusEffect::SetCountryFlag {
-                    flag: flag.into(),
-                    days,
-                });
-            }
-        }
-        "every_owned_state" => {
-            if let Some(child) = assignment.value.as_block() {
-                effects.push(FocusEffect::StateScoped(parse_state_scope_effect(
-                    FocusStateScope::EveryOwnedState,
-                    child,
-                )));
-            }
-        }
-        "random_owned_state" => {
-            if let Some(child) = assignment.value.as_block() {
-                effects.push(FocusEffect::StateScoped(parse_state_scope_effect(
-                    FocusStateScope::RandomOwnedState,
-                    child,
-                )));
-            }
-        }
-        "random_controlled_state" => {
-            if let Some(child) = assignment.value.as_block() {
-                effects.push(FocusEffect::StateScoped(parse_state_scope_effect(
-                    FocusStateScope::RandomControlledState,
-                    child,
-                )));
-            }
-        }
-        "if" | "IF" => {
-            if let Some(child) = assignment.value.as_block() {
-                effects.extend(parse_default_conditional_effect_block(child));
-            }
-        }
-        "hidden_effect" => {
-            if let Some(child) = assignment.value.as_block() {
-                effects.extend(parse_focus_effects_block(child));
-            }
-        }
-        "custom_effect_tooltip"
-        | "complete_tooltip"
-        | "mark_focus_tree_layout_dirty"
-        | "show_ideas_tooltip" => {}
-        key => effects.push(FocusEffect::Unsupported(key.to_string().into())),
+        _ => {}
+    }
+}
+
+/// State-scoped effect arms: every_owned_state, random_owned_state, random_controlled_state.
+fn parse_focus_effect_state_scoped(
+    assignment: &ClausewitzAssignment,
+    effects: &mut Vec<FocusEffect>,
+) {
+    let scope = match assignment.key.as_ref() {
+        "every_owned_state" => FocusStateScope::EveryOwnedState,
+        "random_owned_state" => FocusStateScope::RandomOwnedState,
+        "random_controlled_state" => FocusStateScope::RandomControlledState,
+        _ => return,
+    };
+    if let Some(child) = assignment.value.as_block() {
+        effects.push(FocusEffect::StateScoped(parse_state_scope_effect(
+            scope, child,
+        )));
     }
 }
 
@@ -2963,9 +3027,9 @@ mod tests {
 
     use super::{
         DataProfilePaths, extract_exact_country_setup, extract_exact_fielded_force, ingest_profile,
-        load_france_1936_dataset, load_france_1936_scenario, parse_equipment_definitions,
-        parse_focus_condition_block, parse_focus_effects_block, parse_idea_modifiers,
-        parse_technology_tree, resolve_equipment_catalog,
+        load_france_1936_dataset, load_france_1936_scenario, parse_dot_game_date,
+        parse_equipment_definitions, parse_focus_condition_block, parse_focus_effects_block,
+        parse_idea_modifiers, parse_technology_tree, resolve_equipment_catalog,
     };
 
     #[test]
@@ -3081,6 +3145,15 @@ mod tests {
                 )))),
             ])
         );
+    }
+
+    #[test]
+    fn parse_dot_game_date_rejects_out_of_range_components_without_panicking() {
+        assert_eq!(parse_dot_game_date("1939.13.1"), None);
+        assert_eq!(parse_dot_game_date("1939.0.1"), None);
+        assert_eq!(parse_dot_game_date("1939.2.30"), None);
+        assert_eq!(parse_dot_game_date("1939.9.0"), None);
+        assert_eq!(parse_dot_game_date("1939.9.1.extra"), None);
     }
 
     #[test]

@@ -27,5 +27,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "date_parser"
+path = "fuzz_targets/date_parser.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

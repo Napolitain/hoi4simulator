@@ -712,6 +712,9 @@ impl CountryRuntime {
         self.active_ideas.iter().any(|idea| idea.id.as_ref() == id)
     }
 
+    /// Decrement remaining_days for timed ideas and remove those that reach zero.
+    /// Called after advance_day, so a 1-day idea survives through its creation day
+    /// and is removed at the start of the next day.
     pub fn tick_active_ideas(&mut self) {
         for idea in &mut self.active_ideas {
             let Some(days) = idea.remaining_days else {
@@ -723,6 +726,9 @@ impl CountryRuntime {
             .retain(|idea| idea.remaining_days != Some(0));
     }
 
+    /// Remove country flags whose absolute expiry date has been reached.
+    /// A flag with `expires_on = D` is removed when `date >= D`, which matches
+    /// the timed-idea semantics: both expire at the start of their deadline day.
     pub fn prune_expired_country_flags(&mut self) {
         self.country_flags.retain(|flag| match flag.expires_on {
             Some(expires_on) => self.country.date < expires_on,
@@ -1539,6 +1545,27 @@ mod tests {
         runtime.country.date = GameDate::new(1937, 6, 10);
         runtime.prune_expired_country_flags();
         assert!(!runtime.has_country_flag("FRA_popular_front_cooldown"));
+    }
+
+    #[test]
+    fn timed_flag_and_timed_idea_expire_on_same_tick() {
+        // Both mechanisms must agree: a 1-day timed idea and a flag with
+        // expires_on = start + 1 day should both vanish on the same tick.
+        let mut runtime = test_runtime();
+        let start = GameDate::new(1937, 1, 1);
+        runtime.country.date = start;
+
+        runtime.add_idea("FRA_test_timed", Some(1));
+        runtime.set_country_flag("FRA_test_flag", Some(start.add_days(1)));
+
+        // Simulate one advance_day + tick cycle (matches engine loop order).
+        runtime.country.advance_day(0, 0);
+        runtime.tick_active_ideas();
+        runtime.prune_expired_country_flags();
+
+        // Both should be gone after the first day transition.
+        assert!(!runtime.has_idea("FRA_test_timed"));
+        assert!(!runtime.has_country_flag("FRA_test_flag"));
     }
 
     #[test]

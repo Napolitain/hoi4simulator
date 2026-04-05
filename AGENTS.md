@@ -23,3 +23,17 @@ cargo llvm-cov --workspace --all-features --all-targets --summary-only
 ## CI expectations
 
 The GitHub Actions workflow is expected to enforce formatting, clippy, tests, and coverage. Fuzzing remains a required engineering practice for risky surfaces even when it is run manually or on a dedicated cadence instead of every PR.
+
+## Benchmarking
+
+Criterion benchmarks live in `benches/`. Run them with:
+
+```bash
+cargo bench
+```
+
+For end-to-end binary benchmarking with hyperfine:
+
+```bash
+cargo build --release --bin france_1936 && hyperfine --warmup 1 --runs 5 './target/release/france_1936 --profile vanilla'
+```

@@ -92,267 +92,9 @@ impl France1936Scenario {
         let force_goal = ForceGoalSpec::france_1939_default();
         let starting_fielded_divisions = force_goal.division_band().min;
         let initial_country = CountryState::new(start_date, 41_000_000, CountryLaws::default());
-        let initial_state_defs = vec![
-            StateDefinition {
-                id: Self::ILE_DE_FRANCE,
-                raw_state_id: 0,
-                name: "ile_de_france".into(),
-                building_slots: 12,
-                economic_weight: 12,
-                infrastructure_target: 8,
-                is_core_of_root: true,
-                frontier: None,
-                resources: ResourceLedger {
-                    steel: 4,
-                    aluminium: 2,
-                    ..ResourceLedger::default()
-                },
-            },
-            StateDefinition {
-                id: Self::NORD,
-                raw_state_id: 1,
-                name: "nord".into(),
-                building_slots: 9,
-                economic_weight: 10,
-                infrastructure_target: 7,
-                is_core_of_root: true,
-                frontier: Some(Frontier::Belgium),
-                resources: ResourceLedger {
-                    steel: 8,
-                    ..ResourceLedger::default()
-                },
-            },
-            StateDefinition {
-                id: Self::NORMANDY,
-                raw_state_id: 2,
-                name: "normandy".into(),
-                building_slots: 8,
-                economic_weight: 9,
-                infrastructure_target: 7,
-                is_core_of_root: true,
-                frontier: None,
-                resources: ResourceLedger {
-                    steel: 2,
-                    ..ResourceLedger::default()
-                },
-            },
-            StateDefinition {
-                id: Self::BRITTANY,
-                raw_state_id: 3,
-                name: "brittany".into(),
-                building_slots: 7,
-                economic_weight: 7,
-                infrastructure_target: 6,
-                is_core_of_root: true,
-                frontier: None,
-                resources: ResourceLedger {
-                    steel: 1,
-                    tungsten: 1,
-                    ..ResourceLedger::default()
-                },
-            },
-            StateDefinition {
-                id: Self::AQUITAINE,
-                raw_state_id: 4,
-                name: "aquitaine".into(),
-                building_slots: 8,
-                economic_weight: 8,
-                infrastructure_target: 6,
-                is_core_of_root: true,
-                frontier: None,
-                resources: ResourceLedger {
-                    steel: 3,
-                    oil: 1,
-                    ..ResourceLedger::default()
-                },
-            },
-            StateDefinition {
-                id: Self::OCCITANIA,
-                raw_state_id: 5,
-                name: "occitania".into(),
-                building_slots: 8,
-                economic_weight: 7,
-                infrastructure_target: 6,
-                is_core_of_root: true,
-                frontier: None,
-                resources: ResourceLedger {
-                    tungsten: 3,
-                    steel: 2,
-                    ..ResourceLedger::default()
-                },
-            },
-            StateDefinition {
-                id: Self::PROVENCE,
-                raw_state_id: 6,
-                name: "provence".into(),
-                building_slots: 8,
-                economic_weight: 9,
-                infrastructure_target: 7,
-                is_core_of_root: true,
-                frontier: None,
-                resources: ResourceLedger {
-                    aluminium: 5,
-                    steel: 3,
-                    ..ResourceLedger::default()
-                },
-            },
-            StateDefinition {
-                id: Self::ALPS,
-                raw_state_id: 7,
-                name: "alps".into(),
-                building_slots: 6,
-                economic_weight: 6,
-                infrastructure_target: 6,
-                is_core_of_root: true,
-                frontier: None,
-                resources: ResourceLedger {
-                    tungsten: 4,
-                    steel: 1,
-                    ..ResourceLedger::default()
-                },
-            },
-            StateDefinition {
-                id: Self::LORRAINE,
-                raw_state_id: 8,
-                name: "lorraine".into(),
-                building_slots: 9,
-                economic_weight: 9,
-                infrastructure_target: 7,
-                is_core_of_root: true,
-                frontier: Some(Frontier::Germany),
-                resources: ResourceLedger {
-                    steel: 16,
-                    tungsten: 2,
-                    ..ResourceLedger::default()
-                },
-            },
-            StateDefinition {
-                id: Self::ALSACE,
-                raw_state_id: 9,
-                name: "alsace".into(),
-                building_slots: 8,
-                economic_weight: 8,
-                infrastructure_target: 7,
-                is_core_of_root: true,
-                frontier: Some(Frontier::Germany),
-                resources: ResourceLedger {
-                    steel: 10,
-                    ..ResourceLedger::default()
-                },
-            },
-            StateDefinition {
-                id: Self::CHAMPAGNE,
-                raw_state_id: 10,
-                name: "champagne".into(),
-                building_slots: 8,
-                economic_weight: 8,
-                infrastructure_target: 6,
-                is_core_of_root: true,
-                frontier: None,
-                resources: ResourceLedger {
-                    steel: 4,
-                    ..ResourceLedger::default()
-                },
-            },
-            StateDefinition {
-                id: Self::PICARDY,
-                raw_state_id: 11,
-                name: "picardy".into(),
-                building_slots: 8,
-                economic_weight: 8,
-                infrastructure_target: 6,
-                is_core_of_root: true,
-                frontier: Some(Frontier::Belgium),
-                resources: ResourceLedger {
-                    steel: 4,
-                    ..ResourceLedger::default()
-                },
-            },
-        ]
-        .into_boxed_slice();
-        let initial_states = vec![
-            StateRuntime {
-                civilian_factories: 8,
-                military_factories: 2,
-                infrastructure: 8,
-                land_fort_level: 0,
-            },
-            StateRuntime {
-                civilian_factories: 4,
-                military_factories: 2,
-                infrastructure: 7,
-                land_fort_level: 0,
-            },
-            StateRuntime {
-                civilian_factories: 4,
-                military_factories: 1,
-                infrastructure: 6,
-                land_fort_level: 0,
-            },
-            StateRuntime {
-                civilian_factories: 3,
-                military_factories: 1,
-                infrastructure: 5,
-                land_fort_level: 0,
-            },
-            StateRuntime {
-                civilian_factories: 3,
-                military_factories: 1,
-                infrastructure: 5,
-                land_fort_level: 0,
-            },
-            StateRuntime {
-                civilian_factories: 3,
-                military_factories: 1,
-                infrastructure: 5,
-                land_fort_level: 0,
-            },
-            StateRuntime {
-                civilian_factories: 4,
-                military_factories: 2,
-                infrastructure: 6,
-                land_fort_level: 0,
-            },
-            StateRuntime {
-                civilian_factories: 2,
-                military_factories: 1,
-                infrastructure: 5,
-                land_fort_level: 0,
-            },
-            StateRuntime {
-                civilian_factories: 3,
-                military_factories: 2,
-                infrastructure: 7,
-                land_fort_level: 0,
-            },
-            StateRuntime {
-                civilian_factories: 2,
-                military_factories: 1,
-                infrastructure: 7,
-                land_fort_level: 0,
-            },
-            StateRuntime {
-                civilian_factories: 3,
-                military_factories: 1,
-                infrastructure: 6,
-                land_fort_level: 0,
-            },
-            StateRuntime {
-                civilian_factories: 3,
-                military_factories: 1,
-                infrastructure: 6,
-                land_fort_level: 0,
-            },
-        ]
-        .into_boxed_slice();
-        let initial_production_lines = vec![
-            ProductionLine::new(crate::domain::EquipmentKind::InfantryEquipment, 8),
-            ProductionLine::new(crate::domain::EquipmentKind::SupportEquipment, 2),
-            ProductionLine::new(crate::domain::EquipmentKind::Artillery, 2),
-            ProductionLine::new(crate::domain::EquipmentKind::AntiTank, 1),
-            ProductionLine::new(crate::domain::EquipmentKind::AntiAir, 1),
-        ]
-        .into_boxed_slice();
+        let initial_state_defs = Self::default_state_definitions();
+        let initial_states = Self::default_state_runtimes();
+        let initial_production_lines = Self::default_production_lines();
         let initial_world_state = Self::default_world_state();
         let timeline_events = Self::default_timeline_events();
         let domestic_resources = aggregate_domestic_resources(&initial_state_defs)
@@ -368,7 +110,7 @@ impl France1936Scenario {
             exact_starting_fielded_equipped_demand: None,
         });
 
-        Self {
+        let scenario = Self {
             reference_tag: "FRA",
             start_date,
             pivot_window: PivotWindow::new(GameDate::new(1937, 1, 1), GameDate::new(1939, 1, 1)),
@@ -435,7 +177,9 @@ impl France1936Scenario {
             initial_state_defs,
             initial_states,
             initial_production_lines,
-        }
+        };
+        Self::assert_focus_tree_acyclic(&scenario.focuses);
+        scenario
     }
 
     pub fn from_dataset(dataset: StructuredFrance1936Dataset) -> Result<Self, DataError> {
@@ -588,7 +332,7 @@ impl France1936Scenario {
             ));
         }
 
-        Ok(Self {
+        let scenario = Self {
             reference_tag: "FRA",
             start_date,
             pivot_window: PivotWindow::new(GameDate::new(1937, 1, 1), GameDate::new(1939, 1, 1)),
@@ -620,7 +364,9 @@ impl France1936Scenario {
             initial_state_defs,
             initial_states,
             initial_production_lines,
-        })
+        };
+        Self::assert_focus_tree_acyclic(&scenario.focuses);
+        Ok(scenario)
     }
 
     pub fn bootstrap_runtime(&self) -> CountryRuntime {
@@ -839,6 +585,276 @@ impl France1936Scenario {
         ]
     }
 
+    fn default_state_definitions() -> Box<[StateDefinition]> {
+        vec![
+            StateDefinition {
+                id: Self::ILE_DE_FRANCE,
+                raw_state_id: 0,
+                name: "ile_de_france".into(),
+                building_slots: 12,
+                economic_weight: 12,
+                infrastructure_target: 8,
+                is_core_of_root: true,
+                frontier: None,
+                resources: ResourceLedger {
+                    steel: 4,
+                    aluminium: 2,
+                    ..ResourceLedger::default()
+                },
+            },
+            StateDefinition {
+                id: Self::NORD,
+                raw_state_id: 1,
+                name: "nord".into(),
+                building_slots: 9,
+                economic_weight: 10,
+                infrastructure_target: 7,
+                is_core_of_root: true,
+                frontier: Some(Frontier::Belgium),
+                resources: ResourceLedger {
+                    steel: 8,
+                    ..ResourceLedger::default()
+                },
+            },
+            StateDefinition {
+                id: Self::NORMANDY,
+                raw_state_id: 2,
+                name: "normandy".into(),
+                building_slots: 8,
+                economic_weight: 9,
+                infrastructure_target: 7,
+                is_core_of_root: true,
+                frontier: None,
+                resources: ResourceLedger {
+                    steel: 2,
+                    ..ResourceLedger::default()
+                },
+            },
+            StateDefinition {
+                id: Self::BRITTANY,
+                raw_state_id: 3,
+                name: "brittany".into(),
+                building_slots: 7,
+                economic_weight: 7,
+                infrastructure_target: 6,
+                is_core_of_root: true,
+                frontier: None,
+                resources: ResourceLedger {
+                    steel: 1,
+                    tungsten: 1,
+                    ..ResourceLedger::default()
+                },
+            },
+            StateDefinition {
+                id: Self::AQUITAINE,
+                raw_state_id: 4,
+                name: "aquitaine".into(),
+                building_slots: 8,
+                economic_weight: 8,
+                infrastructure_target: 6,
+                is_core_of_root: true,
+                frontier: None,
+                resources: ResourceLedger {
+                    steel: 3,
+                    oil: 1,
+                    ..ResourceLedger::default()
+                },
+            },
+            StateDefinition {
+                id: Self::OCCITANIA,
+                raw_state_id: 5,
+                name: "occitania".into(),
+                building_slots: 8,
+                economic_weight: 7,
+                infrastructure_target: 6,
+                is_core_of_root: true,
+                frontier: None,
+                resources: ResourceLedger {
+                    tungsten: 3,
+                    steel: 2,
+                    ..ResourceLedger::default()
+                },
+            },
+            StateDefinition {
+                id: Self::PROVENCE,
+                raw_state_id: 6,
+                name: "provence".into(),
+                building_slots: 8,
+                economic_weight: 9,
+                infrastructure_target: 7,
+                is_core_of_root: true,
+                frontier: None,
+                resources: ResourceLedger {
+                    aluminium: 5,
+                    steel: 3,
+                    ..ResourceLedger::default()
+                },
+            },
+            StateDefinition {
+                id: Self::ALPS,
+                raw_state_id: 7,
+                name: "alps".into(),
+                building_slots: 6,
+                economic_weight: 6,
+                infrastructure_target: 6,
+                is_core_of_root: true,
+                frontier: None,
+                resources: ResourceLedger {
+                    tungsten: 4,
+                    steel: 1,
+                    ..ResourceLedger::default()
+                },
+            },
+            StateDefinition {
+                id: Self::LORRAINE,
+                raw_state_id: 8,
+                name: "lorraine".into(),
+                building_slots: 9,
+                economic_weight: 9,
+                infrastructure_target: 7,
+                is_core_of_root: true,
+                frontier: Some(Frontier::Germany),
+                resources: ResourceLedger {
+                    steel: 16,
+                    tungsten: 2,
+                    ..ResourceLedger::default()
+                },
+            },
+            StateDefinition {
+                id: Self::ALSACE,
+                raw_state_id: 9,
+                name: "alsace".into(),
+                building_slots: 8,
+                economic_weight: 8,
+                infrastructure_target: 7,
+                is_core_of_root: true,
+                frontier: Some(Frontier::Germany),
+                resources: ResourceLedger {
+                    steel: 10,
+                    ..ResourceLedger::default()
+                },
+            },
+            StateDefinition {
+                id: Self::CHAMPAGNE,
+                raw_state_id: 10,
+                name: "champagne".into(),
+                building_slots: 8,
+                economic_weight: 8,
+                infrastructure_target: 6,
+                is_core_of_root: true,
+                frontier: None,
+                resources: ResourceLedger {
+                    steel: 4,
+                    ..ResourceLedger::default()
+                },
+            },
+            StateDefinition {
+                id: Self::PICARDY,
+                raw_state_id: 11,
+                name: "picardy".into(),
+                building_slots: 8,
+                economic_weight: 8,
+                infrastructure_target: 6,
+                is_core_of_root: true,
+                frontier: Some(Frontier::Belgium),
+                resources: ResourceLedger {
+                    steel: 4,
+                    ..ResourceLedger::default()
+                },
+            },
+        ]
+        .into_boxed_slice()
+    }
+
+    fn default_state_runtimes() -> Box<[StateRuntime]> {
+        vec![
+            StateRuntime {
+                civilian_factories: 8,
+                military_factories: 2,
+                infrastructure: 8,
+                land_fort_level: 0,
+            },
+            StateRuntime {
+                civilian_factories: 4,
+                military_factories: 2,
+                infrastructure: 7,
+                land_fort_level: 0,
+            },
+            StateRuntime {
+                civilian_factories: 4,
+                military_factories: 1,
+                infrastructure: 6,
+                land_fort_level: 0,
+            },
+            StateRuntime {
+                civilian_factories: 3,
+                military_factories: 1,
+                infrastructure: 5,
+                land_fort_level: 0,
+            },
+            StateRuntime {
+                civilian_factories: 3,
+                military_factories: 1,
+                infrastructure: 5,
+                land_fort_level: 0,
+            },
+            StateRuntime {
+                civilian_factories: 3,
+                military_factories: 1,
+                infrastructure: 5,
+                land_fort_level: 0,
+            },
+            StateRuntime {
+                civilian_factories: 4,
+                military_factories: 2,
+                infrastructure: 6,
+                land_fort_level: 0,
+            },
+            StateRuntime {
+                civilian_factories: 2,
+                military_factories: 1,
+                infrastructure: 5,
+                land_fort_level: 0,
+            },
+            StateRuntime {
+                civilian_factories: 3,
+                military_factories: 2,
+                infrastructure: 7,
+                land_fort_level: 0,
+            },
+            StateRuntime {
+                civilian_factories: 2,
+                military_factories: 1,
+                infrastructure: 7,
+                land_fort_level: 0,
+            },
+            StateRuntime {
+                civilian_factories: 3,
+                military_factories: 1,
+                infrastructure: 6,
+                land_fort_level: 0,
+            },
+            StateRuntime {
+                civilian_factories: 3,
+                military_factories: 1,
+                infrastructure: 6,
+                land_fort_level: 0,
+            },
+        ]
+        .into_boxed_slice()
+    }
+
+    fn default_production_lines() -> Box<[ProductionLine]> {
+        vec![
+            ProductionLine::new(crate::domain::EquipmentKind::InfantryEquipment, 8),
+            ProductionLine::new(crate::domain::EquipmentKind::SupportEquipment, 2),
+            ProductionLine::new(crate::domain::EquipmentKind::Artillery, 2),
+            ProductionLine::new(crate::domain::EquipmentKind::AntiTank, 1),
+            ProductionLine::new(crate::domain::EquipmentKind::AntiAir, 1),
+        ]
+        .into_boxed_slice()
+    }
+
     fn starting_idea_modifiers(&self) -> crate::domain::IdeaModifiers {
         self.starting_ideas
             .iter()
@@ -846,6 +862,38 @@ impl France1936Scenario {
             .fold(crate::domain::IdeaModifiers::default(), |total, idea| {
                 total.plus(idea.modifiers)
             })
+    }
+
+    /// Panic if the focus prerequisite graph contains a cycle.
+    fn assert_focus_tree_acyclic(focuses: &[NationalFocus]) {
+        for focus in focuses {
+            for prereq_id in &focus.prerequisites {
+                let has_cycle = Self::focus_reachable(focuses, prereq_id, &focus.id, 0);
+                assert!(
+                    !has_cycle,
+                    "focus DAG cycle detected: {} <-> {}",
+                    focus.id, prereq_id
+                );
+            }
+        }
+    }
+
+    fn focus_reachable(focuses: &[NationalFocus], from: &str, target: &str, depth: u8) -> bool {
+        if from == target {
+            return true;
+        }
+        if depth >= 32 {
+            return false;
+        }
+        focuses
+            .iter()
+            .find(|f| f.id.as_ref() == from)
+            .map(|f| {
+                f.prerequisites
+                    .iter()
+                    .any(|p| Self::focus_reachable(focuses, p, target, depth + 1))
+            })
+            .unwrap_or(false)
     }
 
     fn starting_technology_modifiers(&self) -> TechnologyModifiers {
@@ -1193,10 +1241,12 @@ fn frontier_order_priority(frontier: Option<Frontier>) -> u8 {
 mod tests {
     use crate::data::{StructuredFrance1936Dataset, StructuredProductionLine, StructuredState};
     use crate::domain::{
-        CountryLaws, EquipmentDemand, EquipmentKind, FieldedDivision, IdeaDefinition,
-        IdeaModifiers, MilestoneKind, ModeledEquipmentProfiles, ResourceLedger, TargetBand,
+        CountryLaws, EquipmentDemand, EquipmentKind, FieldedDivision, FocusCondition,
+        IdeaDefinition, IdeaModifiers, MilestoneKind, ModeledEquipmentProfiles, NationalFocus,
+        ResourceLedger, TargetBand,
     };
     use crate::scenario::CountryScenario;
+    use proptest::prelude::*;
 
     use super::{France1936Scenario, Frontier};
 
@@ -1457,5 +1507,42 @@ mod tests {
         assert_eq!(exact.starting_fielded_divisions, 74);
         assert_eq!(exact.force_plan.frontline_divisions, 74);
         assert_eq!(exact.force_plan.frontline_demand, demand.scale(74));
+    }
+
+    fn make_focus(id: &str, prerequisites: Vec<String>) -> NationalFocus {
+        NationalFocus {
+            id: id.into(),
+            days: 70,
+            prerequisites: prerequisites
+                .into_iter()
+                .map(|s| s.into_boxed_str())
+                .collect(),
+            mutually_exclusive: Vec::new(),
+            available: FocusCondition::Always,
+            bypass: FocusCondition::Not(Box::new(FocusCondition::Always)),
+            search_filters: Vec::new(),
+            effects: Vec::new(),
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn random_dag_passes_acyclic_check(
+            n in 2usize..8,
+            edges in proptest::collection::vec((0usize..8, 0usize..8), 0..12),
+        ) {
+            // Build a focus tree where edges only go from higher index to lower
+            // index, guaranteeing a DAG.
+            let focuses: Vec<NationalFocus> = (0..n).map(|i| {
+                let prereqs: Vec<String> = edges.iter()
+                    .filter(|(from, to)| *from == i && *to < i && *to < n)
+                    .map(|(_, to)| format!("f{to}"))
+                    .collect();
+                make_focus(&format!("f{i}"), prereqs)
+            }).collect();
+
+            // Must not panic.
+            France1936Scenario::assert_focus_tree_acyclic(&focuses);
+        }
     }
 }

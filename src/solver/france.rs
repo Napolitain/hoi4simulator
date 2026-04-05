@@ -86,11 +86,19 @@ impl FranceBeamPlanner {
         let end_date = self.scenario.milestones[3].date;
         let mut frontier = self.seed_nodes(config);
         let seed_count = frontier.len();
+        debug_assert!(
+            !frontier.is_empty(),
+            "beam search must have at least one seed node"
+        );
 
         while frontier
             .iter()
             .any(|node| node.runtime.country.date < end_date)
         {
+            debug_assert!(
+                !frontier.is_empty(),
+                "frontier must not be empty during search"
+            );
             let mut next_frontier = Vec::with_capacity(frontier.len());
             let mut last_error = None;
 
@@ -132,6 +140,8 @@ impl FranceBeamPlanner {
                         stability_drift_bp,
                     );
                     next_runtime.tick_active_ideas();
+                    next_runtime.apply_timeline_events(&self.scenario.timeline_events);
+                    next_runtime.prune_expired_country_flags();
                 }
 
                 next_frontier.push(PlannerNode {
@@ -221,7 +231,7 @@ impl FranceBeamPlanner {
             date = next;
         }
 
-        dates.sort();
+        dates.sort_unstable();
         dates.dedup();
         dates
     }
@@ -834,12 +844,22 @@ impl FranceBeamPlanner {
         node: &PlannerNode,
         date: GameDate,
     ) -> Option<crate::sim::ProductionAction> {
+        let (demand_gap, desired_allocation) = self.compute_production_demand_and_allocation(node);
+        let equipment =
+            self.select_production_equipment(&node.runtime, &demand_gap, &desired_allocation)?;
+        self.resolve_production_slot(node, date, equipment, &demand_gap, &desired_allocation)
+    }
+
+    fn compute_production_demand_and_allocation(
+        &self,
+        node: &PlannerNode,
+    ) -> (EquipmentDemand, EquipmentFactoryAllocation) {
         let minimum_supported = self.scenario.force_goal.division_band().min;
         let current_supported = node.runtime.supported_divisions(
             self.scenario.force_plan.template.per_division_demand(),
             &self.scenario.ideas,
         );
-        let (demand_gap, desired_allocation) = if current_supported < minimum_supported {
+        if current_supported < minimum_supported {
             let shortfall = self.readiness_shortfall_demand(&node.runtime);
             let days_remaining = u16::try_from(
                 node.runtime
@@ -872,8 +892,16 @@ impl FranceBeamPlanner {
                     }),
                 self.scenario.force_plan.factory_allocation,
             )
-        };
-        let equipment = [
+        }
+    }
+
+    fn select_production_equipment(
+        &self,
+        runtime: &CountryRuntime,
+        demand_gap: &EquipmentDemand,
+        desired_allocation: &EquipmentFactoryAllocation,
+    ) -> Option<EquipmentKind> {
+        [
             EquipmentKind::InfantryEquipment,
             EquipmentKind::SupportEquipment,
             EquipmentKind::Artillery,
@@ -884,15 +912,23 @@ impl FranceBeamPlanner {
         .filter(|equipment| demand_gap.get(*equipment) > 0)
         .max_by_key(|equipment| {
             let target_factories = desired_allocation.get(*equipment);
-            let assigned_factories =
-                self.assigned_factories_for_equipment(&node.runtime, *equipment);
+            let assigned_factories = self.assigned_factories_for_equipment(runtime, *equipment);
             let stockpile_gap = demand_gap.get(*equipment);
-
             (
                 target_factories.saturating_sub(assigned_factories),
                 stockpile_gap,
             )
-        })?;
+        })
+    }
+
+    fn resolve_production_slot(
+        &self,
+        node: &PlannerNode,
+        date: GameDate,
+        equipment: EquipmentKind,
+        demand_gap: &EquipmentDemand,
+        desired_allocation: &EquipmentFactoryAllocation,
+    ) -> Option<crate::sim::ProductionAction> {
         let current_assigned = self.assigned_factories_for_equipment(&node.runtime, equipment);
         let target_factories = desired_allocation
             .get(equipment)
@@ -923,7 +959,7 @@ impl FranceBeamPlanner {
         }
 
         let donor_slot =
-            self.production_donor_slot(node, equipment, desired_allocation, demand_gap)?;
+            self.production_donor_slot(node, equipment, *desired_allocation, *demand_gap)?;
         let donor_line = node.runtime.production_lines[donor_slot];
         let needed_factories = target_factories
             .saturating_sub(current_assigned)
@@ -1449,15 +1485,19 @@ impl FranceBeamPlanner {
                 continue;
             }
 
+            let original = repaired_actions[index].clone();
             repaired_actions[index] = Action::Construction(replacement);
             let Ok(repaired_plan) =
                 self.evaluate_actions(plan.template, plan.pivot_date, repaired_actions.clone())
             else {
+                repaired_actions[index] = original;
                 continue;
             };
             if self.hard_requirements_met(&repaired_plan.final_state) {
                 return Ok(Some(repaired_plan));
             }
+            // Keep the replacement even if hard requirements aren't met yet —
+            // subsequent iterations may fix remaining gaps.
         }
 
         Ok(None)
@@ -1481,7 +1521,8 @@ impl FranceBeamPlanner {
             .iter()
             .enumerate()
             .filter(|(index, action)| *index != replace_index && action.date() == candidate.date)
-            .map(|(_, action)| action.clone())
+            .map(|(_, action)| action)
+            .cloned()
             .collect::<Vec<_>>();
         let node = PlannerNode {
             template: StrategyTemplateKind::EarlyMilitaryPivot,
@@ -1841,5 +1882,68 @@ mod tests {
         let result = planner.plan();
 
         assert_eq!(result, Err(SimulationError::HardRequirementsUnsatisfied));
+    }
+
+    #[test]
+    fn france_best_effort_plan_produces_a_valid_plan() {
+        let scenario = France1936Scenario::standard();
+        let planner = FranceBeamPlanner::new(
+            scenario.clone(),
+            SimulationEngine::default(),
+            crate::solver::BeamSearchConfig::new(4, 35),
+            crate::solver::PlannerWeights::default(),
+        );
+
+        let plan = planner.best_effort_plan().unwrap();
+
+        assert!(!plan.actions.is_empty());
+        assert_eq!(plan.final_state.country.date, scenario.milestones[3].date);
+        assert!(scenario.pivot_window.contains(plan.pivot_date));
+    }
+
+    #[test]
+    fn france_plan_includes_production_actions_post_pivot() {
+        let scenario = France1936Scenario::standard();
+        let planner = FranceBeamPlanner::new(
+            scenario.clone(),
+            SimulationEngine::default(),
+            crate::solver::BeamSearchConfig::new(4, 35),
+            crate::solver::PlannerWeights::default(),
+        );
+
+        let plan = planner.plan().unwrap();
+
+        let has_production = plan
+            .actions
+            .iter()
+            .any(|a| matches!(a, Action::Production(_)));
+        assert!(
+            has_production,
+            "plan should include production actions for equipment"
+        );
+    }
+
+    #[test]
+    fn france_plan_includes_research_actions() {
+        let scenario = France1936Scenario::standard();
+        let planner = FranceBeamPlanner::new(
+            scenario,
+            SimulationEngine::default(),
+            crate::solver::BeamSearchConfig::new(4, 35),
+            crate::solver::PlannerWeights::default(),
+        );
+
+        let plan = planner.plan().unwrap();
+
+        let research_actions: Vec<_> = plan
+            .actions
+            .iter()
+            .filter(|a| matches!(a, Action::Research(_)))
+            .collect();
+        assert!(
+            research_actions.len() >= 2,
+            "plan should include at least 2 research actions, got {}",
+            research_actions.len()
+        );
     }
 }
