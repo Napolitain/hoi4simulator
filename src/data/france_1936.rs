@@ -11,9 +11,10 @@ use fory_core::StructSerializer;
 use crate::domain::{
     CountryLaws, DoctrineCostReduction, EconomyLaw, EquipmentDemand, EquipmentKind,
     EquipmentProfile, FieldedDivision, FocusBuildingKind, FocusCondition, FocusEffect,
-    FocusStateScope, IdeaDefinition, IdeaModifiers, MobilizationLaw, ModeledEquipmentProfiles,
-    NationalFocus, ResearchBranch, ResourceLedger, StateCondition, StateOperation,
-    StateScopedEffects, TechId, TechnologyModifiers, TechnologyNode, TechnologyTree, TradeLaw,
+    FocusStateScope, GameDate, IdeaDefinition, IdeaModifiers, MobilizationLaw,
+    ModeledEquipmentProfiles, NationalFocus, ResearchBranch, ResourceLedger, StateCondition,
+    StateOperation, StateScopedEffects, TechId, TechnologyModifiers, TechnologyNode,
+    TechnologyTree, TimelineCondition, TradeLaw,
 };
 use crate::scenario::{France1936Scenario, Frontier};
 
@@ -888,6 +889,27 @@ fn parse_focus_condition_block(block: &ClausewitzBlock) -> FocusCondition {
                     conditions.push(FocusCondition::HasIdea(id.into()));
                 }
             }
+            "date" => {
+                if let Some(condition) =
+                    parse_timeline_date_condition(assignment.operator, &assignment.value)
+                {
+                    conditions.push(FocusCondition::Timeline(Box::new(condition)));
+                }
+            }
+            "country_exists" => {
+                if let Some(tag) = assignment.value.as_str() {
+                    conditions.push(FocusCondition::Timeline(Box::new(
+                        TimelineCondition::CountryExists(tag.into()),
+                    )));
+                }
+            }
+            "has_war_with" => {
+                if let Some(tag) = assignment.value.as_str() {
+                    conditions.push(FocusCondition::Timeline(Box::new(
+                        TimelineCondition::HasWarWith(tag.into()),
+                    )));
+                }
+            }
             "has_war_support" => {
                 if let Some(condition) = parse_focus_percent_condition(
                     assignment.operator,
@@ -1001,6 +1023,30 @@ fn parse_focus_count_condition(
             Some(FocusCondition::Not(Box::new(ctor(count.saturating_add(1)))))
         }
     }
+}
+
+fn parse_timeline_date_condition(
+    operator: ClausewitzOperator,
+    value: &ClausewitzValue,
+) -> Option<TimelineCondition> {
+    let date = parse_dot_game_date(value.as_str()?)?;
+
+    match operator {
+        ClausewitzOperator::Assign | ClausewitzOperator::GreaterOrEqual => {
+            Some(TimelineCondition::DateAtLeast(date))
+        }
+        ClausewitzOperator::LessThan => Some(TimelineCondition::DateBefore(date)),
+        _ => None,
+    }
+}
+
+fn parse_dot_game_date(value: &str) -> Option<GameDate> {
+    let mut parts = value.split('.');
+    let year = parts.next()?.parse::<u16>().ok()?;
+    let month = parts.next()?.parse::<u8>().ok()?;
+    let day = parts.next()?.parse::<u8>().ok()?;
+
+    Some(GameDate::new(year, month, day))
 }
 
 fn parse_research_slot_condition(
@@ -1301,7 +1347,23 @@ fn parse_focus_effect_assignment(
         }
         "set_country_flag" => {
             if let Some(flag) = assignment.value.as_str() {
-                effects.push(FocusEffect::SetCountryFlag(flag.into()));
+                effects.push(FocusEffect::SetCountryFlag {
+                    flag: flag.into(),
+                    days: None,
+                });
+            } else if let Some(child) = assignment.value.as_block()
+                && let Some(flag) = child
+                    .first_assignment("flag")
+                    .and_then(ClausewitzValue::as_str)
+            {
+                let days = child
+                    .first_assignment("days")
+                    .and_then(ClausewitzValue::as_u64)
+                    .and_then(|value| u16::try_from(value).ok());
+                effects.push(FocusEffect::SetCountryFlag {
+                    flag: flag.into(),
+                    days,
+                });
             }
         }
         "every_owned_state" => {
@@ -1485,7 +1547,7 @@ fn collect_focus_effect_idea_ids(effects: &[FocusEffect], ids: &mut Vec<Box<str>
         match effect {
             FocusEffect::AddIdea(id) => push_unique_boxed(ids, id),
             FocusEffect::RemoveIdea(id) => push_unique_boxed(ids, id),
-            FocusEffect::SetCountryFlag(_) | FocusEffect::Unsupported(_) => {}
+            FocusEffect::SetCountryFlag { .. } | FocusEffect::Unsupported(_) => {}
             FocusEffect::AddTimedIdea { id, .. } => push_unique_boxed(ids, id),
             FocusEffect::SwapIdea { remove, add } => {
                 push_unique_boxed(ids, remove);
@@ -2896,7 +2958,7 @@ mod tests {
     use crate::data::clausewitz::parse_clausewitz;
     use crate::domain::{
         CountryLaws, DoctrineCostReduction, EconomyLaw, EquipmentDemand, EquipmentKind,
-        FocusCondition, FocusEffect, IdeaModifiers, MobilizationLaw, TradeLaw,
+        FocusCondition, FocusEffect, IdeaModifiers, MobilizationLaw, TimelineCondition, TradeLaw,
     };
 
     use super::{
@@ -2981,6 +3043,69 @@ mod tests {
                     option: "HIDE".into(),
                 },
             ])
+        );
+    }
+
+    #[test]
+    fn focus_condition_parser_supports_date_country_and_war_timeline_gates() {
+        let root = parse_clausewitz(
+            r#"
+            available = {
+                date >= 1939.9.1
+                date < 1940.6.22
+                country_exists = CZE
+                NOT = { has_war_with = GER }
+            }
+            "#,
+        )
+        .unwrap();
+        let block = root
+            .first_assignment("available")
+            .and_then(|value| value.as_block())
+            .unwrap();
+
+        let condition = parse_focus_condition_block(block);
+
+        assert_eq!(
+            condition,
+            FocusCondition::All(vec![
+                FocusCondition::Timeline(Box::new(TimelineCondition::DateAtLeast(
+                    crate::domain::GameDate::new(1939, 9, 1),
+                ))),
+                FocusCondition::Timeline(Box::new(TimelineCondition::DateBefore(
+                    crate::domain::GameDate::new(1940, 6, 22),
+                ))),
+                FocusCondition::Timeline(Box::new(TimelineCondition::CountryExists("CZE".into(),))),
+                FocusCondition::Not(Box::new(FocusCondition::Timeline(Box::new(
+                    TimelineCondition::HasWarWith("GER".into()),
+                )))),
+            ])
+        );
+    }
+
+    #[test]
+    fn focus_effect_parser_captures_timed_country_flags() {
+        let root = parse_clausewitz(
+            r#"
+            completion_reward = {
+                set_country_flag = { flag = FRA_popular_front_cooldown value = 1 days = 360 }
+            }
+            "#,
+        )
+        .unwrap();
+        let block = root
+            .first_assignment("completion_reward")
+            .and_then(|value| value.as_block())
+            .unwrap();
+
+        let effects = parse_focus_effects_block(block);
+
+        assert_eq!(
+            effects,
+            vec![FocusEffect::SetCountryFlag {
+                flag: "FRA_popular_front_cooldown".into(),
+                days: Some(360),
+            }]
         );
     }
 

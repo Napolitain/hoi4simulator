@@ -1,4 +1,4 @@
-use super::{EquipmentKind, GameDate};
+use super::{EquipmentKind, GameDate, TimelineCondition};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FocusBuildingKind {
@@ -45,6 +45,7 @@ pub enum FocusCondition {
     HasDlc(Box<str>),
     HasGameRule { rule: Box<str>, option: Box<str> },
     HasIdea(Box<str>),
+    Timeline(Box<TimelineCondition>),
     HasWarSupportAtLeast(u16),
     NumOfFactoriesAtLeast(u16),
     NumOfMilitaryFactoriesAtLeast(u16),
@@ -163,7 +164,10 @@ pub enum FocusEffect {
         amount: u32,
     },
     RemoveIdea(Box<str>),
-    SetCountryFlag(Box<str>),
+    SetCountryFlag {
+        flag: Box<str>,
+        days: Option<u16>,
+    },
     StateScoped(StateScopedEffects),
     SwapIdea {
         remove: Box<str>,

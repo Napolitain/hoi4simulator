@@ -1,7 +1,8 @@
 use crate::domain::{
     CountryLaws, DoctrineCostReduction, EquipmentDemand, EquipmentKind, FieldedDivision,
     FocusBuildingKind, GameDate, IdeaDefinition, IdeaModifiers, ModeledEquipmentProfiles,
-    ResourceLedger, TechId, TechnologyModifiers, TechnologyNode, TechnologyTree,
+    ResourceLedger, TechId, TechnologyModifiers, TechnologyNode, TechnologyTree, TimelineEvent,
+    WorldState,
 };
 use crate::scenario::{Frontier, FrontierFortRequirement};
 
@@ -287,6 +288,12 @@ pub struct ActiveIdea {
     pub remaining_days: Option<u16>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveCountryFlag {
+    pub id: Box<str>,
+    pub expires_on: Option<GameDate>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct ResearchSlotState {
     pub branch: Option<ResearchBranch>,
@@ -314,8 +321,9 @@ pub struct CountryRuntime {
     pub completed_focuses: Vec<CompletedFocus>,
     pub active_ideas: Vec<ActiveIdea>,
     pub doctrine_cost_reductions: Vec<DoctrineCostReduction>,
-    pub country_flags: Vec<Box<str>>,
+    pub country_flags: Vec<ActiveCountryFlag>,
     pub country_leader_traits: Vec<Box<str>>,
+    pub world_state: WorldState,
     pub state_flags: Box<[Vec<Box<str>>]>,
     pub research_slots: Vec<ResearchSlotState>,
     pub completed_research: ResearchSummary,
@@ -353,6 +361,7 @@ impl CountryRuntime {
             doctrine_cost_reductions: Vec::with_capacity(8),
             country_flags: Vec::with_capacity(32),
             country_leader_traits: Vec::with_capacity(8),
+            world_state: WorldState::default(),
             state_flags: vec![Vec::new(); state_count].into_boxed_slice(),
             research_slots: vec![ResearchSlotState::default(), ResearchSlotState::default()],
             completed_research: ResearchSummary::default(),
@@ -429,7 +438,10 @@ impl CountryRuntime {
                 .filter_map(|slot| slot.technology),
             "active research technology",
         );
-        assert_unique_strs(self.country_flags.iter().map(Box::as_ref), "country flag");
+        assert_unique_strs(
+            self.country_flags.iter().map(|flag| flag.id.as_ref()),
+            "country flag",
+        );
         assert_unique_strs(
             self.country_leader_traits.iter().map(Box::as_ref),
             "country leader trait",
@@ -440,6 +452,7 @@ impl CountryRuntime {
                 .map(|reduction| (reduction.name.as_ref(), reduction.category.as_ref())),
             "doctrine cost reduction",
         );
+        self.world_state.assert_invariants();
 
         for (index, (definition, state)) in
             self.state_defs.iter().zip(self.states.iter()).enumerate()
@@ -710,6 +723,22 @@ impl CountryRuntime {
             .retain(|idea| idea.remaining_days != Some(0));
     }
 
+    pub fn prune_expired_country_flags(&mut self) {
+        self.country_flags.retain(|flag| match flag.expires_on {
+            Some(expires_on) => self.country.date < expires_on,
+            None => true,
+        });
+    }
+
+    pub fn apply_timeline_events(&mut self, events: &[TimelineEvent]) {
+        for event in events {
+            if event.date() != self.country.date {
+                continue;
+            }
+            self.world_state.apply_event(event);
+        }
+    }
+
     pub fn record_focus_completion(&mut self, id: impl Into<Box<str>>) {
         let id = id.into();
         if self.completed_focuses.iter().any(|focus| focus.id == id) {
@@ -869,15 +898,16 @@ impl CountryRuntime {
     pub fn has_country_flag(&self, flag: &str) -> bool {
         self.country_flags
             .iter()
-            .any(|value| value.as_ref() == flag)
+            .any(|value| value.id.as_ref() == flag)
     }
 
-    pub fn set_country_flag(&mut self, flag: impl Into<Box<str>>) {
+    pub fn set_country_flag(&mut self, flag: impl Into<Box<str>>, expires_on: Option<GameDate>) {
         let flag = flag.into();
-        if self.country_flags.iter().any(|current| current == &flag) {
-            return;
-        }
-        self.country_flags.push(flag);
+        self.country_flags.retain(|current| current.id != flag);
+        self.country_flags.push(ActiveCountryFlag {
+            id: flag,
+            expires_on,
+        });
     }
 
     pub fn add_country_leader_trait(&mut self, trait_id: impl Into<Box<str>>) {
@@ -1009,7 +1039,8 @@ mod tests {
 
     use crate::domain::{
         CountryLaws, DivisionTemplate, EquipmentDemand, EquipmentKind, FieldedDivision, GameDate,
-        IdeaDefinition, IdeaModifiers, ModeledEquipmentProfiles, ResourceLedger, TradeLaw,
+        IdeaDefinition, IdeaModifiers, ModeledEquipmentProfiles, ResourceLedger, TimelineEvent,
+        TradeLaw,
     };
     use crate::scenario::{France1936Scenario, Frontier};
     use crate::sim::actions::{ConstructionKind, StateId};
@@ -1491,6 +1522,48 @@ mod tests {
 
         assert_eq!(runtime.active_ideas.len(), 1);
         assert_eq!(runtime.active_ideas[0].remaining_days, Some(5));
+    }
+
+    #[test]
+    fn timed_country_flags_expire_on_their_deadline() {
+        let mut runtime = test_runtime();
+
+        runtime.set_country_flag(
+            "FRA_popular_front_cooldown",
+            Some(GameDate::new(1937, 6, 10)),
+        );
+        runtime.country.date = GameDate::new(1937, 6, 9);
+        runtime.prune_expired_country_flags();
+        assert!(runtime.has_country_flag("FRA_popular_front_cooldown"));
+
+        runtime.country.date = GameDate::new(1937, 6, 10);
+        runtime.prune_expired_country_flags();
+        assert!(!runtime.has_country_flag("FRA_popular_front_cooldown"));
+    }
+
+    #[test]
+    fn timeline_events_update_world_state_on_matching_date() {
+        let mut runtime = test_runtime();
+        let events = vec![
+            TimelineEvent::DissolveCountry {
+                date: GameDate::new(1938, 3, 12),
+                tag: "AUS".into(),
+            },
+            TimelineEvent::StartWar {
+                date: GameDate::new(1939, 9, 3),
+                left: "FRA".into(),
+                right: "GER".into(),
+            },
+        ];
+
+        runtime.country.date = GameDate::new(1938, 3, 12);
+        runtime.apply_timeline_events(&events);
+        assert!(!runtime.world_state.country_exists("AUS"));
+        assert!(!runtime.world_state.countries_at_war("FRA", "GER"));
+
+        runtime.country.date = GameDate::new(1939, 9, 3);
+        runtime.apply_timeline_events(&events);
+        assert!(runtime.world_state.countries_at_war("FRA", "GER"));
     }
 
     proptest! {

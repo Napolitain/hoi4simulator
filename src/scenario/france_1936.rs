@@ -5,7 +5,7 @@ use crate::domain::{
     CountryLaws, DivisionTemplate, EquipmentDemand, EquipmentFactoryAllocation, EquipmentKind,
     FieldedDivision, ForceGoalSpec, ForcePlan, GameDate, HardFocusGoal, IdeaDefinition, Milestone,
     MilestoneKind, ModeledEquipmentProfiles, NationalFocus, PivotWindow, ResourceLedger, TechId,
-    TechnologyModifiers, TechnologyNode, TechnologyTree,
+    TechnologyModifiers, TechnologyNode, TechnologyTree, TimelineEvent, WorldState,
 };
 use crate::sim::{
     CountryRuntime, CountryState, ProductionLine, SimulationConfig, StateDefinition, StateId,
@@ -54,6 +54,8 @@ pub struct France1936Scenario {
     pub military_construction_order: Box<[StateId]>,
     pub frontier_fort_order: Box<[StateId]>,
     pub initial_country: CountryState,
+    pub initial_world_state: WorldState,
+    pub timeline_events: Box<[TimelineEvent]>,
     pub initial_state_defs: Box<[StateDefinition]>,
     pub initial_states: Box<[StateRuntime]>,
     pub initial_production_lines: Box<[ProductionLine]>,
@@ -351,6 +353,8 @@ impl France1936Scenario {
             ProductionLine::new(crate::domain::EquipmentKind::AntiAir, 1),
         ]
         .into_boxed_slice();
+        let initial_world_state = Self::default_world_state();
+        let timeline_events = Self::default_timeline_events();
         let domestic_resources = aggregate_domestic_resources(&initial_state_defs)
             .scale_bp(initial_country.laws.trade.local_resource_retention_bp());
         let force_plan = Self::derive_force_plan(ForcePlanInputs {
@@ -426,6 +430,8 @@ impl France1936Scenario {
             frontier_fort_order: vec![Self::LORRAINE, Self::ALSACE, Self::NORD, Self::PICARDY]
                 .into_boxed_slice(),
             initial_country,
+            initial_world_state,
+            timeline_events,
             initial_state_defs,
             initial_states,
             initial_production_lines,
@@ -496,6 +502,8 @@ impl France1936Scenario {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let initial_country = CountryState::new(start_date, dataset.population, dataset.laws);
+        let initial_world_state = Self::default_world_state();
+        let timeline_events = Self::default_timeline_events();
         let domestic_resources = aggregate_domestic_resources(&initial_state_defs)
             .scale_bp(initial_country.laws.trade.local_resource_retention_bp());
         let force_goal = ForceGoalSpec::france_1939_default();
@@ -607,6 +615,8 @@ impl France1936Scenario {
             military_construction_order,
             frontier_fort_order,
             initial_country,
+            initial_world_state,
+            timeline_events,
             initial_state_defs,
             initial_states,
             initial_production_lines,
@@ -622,6 +632,7 @@ impl France1936Scenario {
         )
         .with_research_slots(self.starting_research_slots)
         .with_equipment_profiles(self.equipment_profiles);
+        runtime.world_state = self.initial_world_state.clone();
         runtime = if self.starting_fielded_force.is_empty() {
             runtime.with_fielded_force(
                 self.starting_fielded_divisions
@@ -636,7 +647,7 @@ impl France1936Scenario {
             runtime.add_idea(idea, None);
         }
         for flag in self.starting_country_flags.iter().cloned() {
-            runtime.set_country_flag(flag);
+            runtime.set_country_flag(flag, None);
         }
         if !self.technology_tree.is_empty() {
             runtime.initialize_completed_technologies(
@@ -785,6 +796,34 @@ impl France1936Scenario {
                 MilestoneKind::Readiness,
             ),
         ]
+    }
+
+    fn default_world_state() -> WorldState {
+        WorldState::default()
+    }
+
+    fn default_timeline_events() -> Box<[TimelineEvent]> {
+        vec![
+            TimelineEvent::DissolveCountry {
+                date: GameDate::new(1938, 3, 12),
+                tag: "AUS".into(),
+            },
+            TimelineEvent::DissolveCountry {
+                date: GameDate::new(1939, 3, 15),
+                tag: "CZE".into(),
+            },
+            TimelineEvent::StartWar {
+                date: GameDate::new(1939, 9, 3),
+                left: "FRA".into(),
+                right: "GER".into(),
+            },
+            TimelineEvent::StartWar {
+                date: GameDate::new(1940, 6, 10),
+                left: "FRA".into(),
+                right: "ITA".into(),
+            },
+        ]
+        .into_boxed_slice()
     }
 
     fn default_frontier_requirements() -> [FrontierFortRequirement; 2] {

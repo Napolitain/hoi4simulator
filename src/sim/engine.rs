@@ -135,6 +135,8 @@ impl SimulationEngine {
                 stability_drift_bp,
             );
             country.tick_active_ideas();
+            country.prune_expired_country_flags();
+            country.apply_timeline_events(&scenario.timeline_events);
             debug_assert_country_invariants(&country);
         }
 
@@ -332,10 +334,15 @@ impl SimulationEngine {
         let focus = scenario
             .focus_by_id(&action.focus_id)
             .ok_or_else(|| SimulationError::UnknownFocus(action.focus_id.clone()))?;
-        if !self.focus_is_available(country, &scenario.ideas, focus)? {
+        if !self.focus_is_available(country, scenario.reference_tag, &scenario.ideas, focus)? {
             return Err(SimulationError::FocusUnavailable(action.focus_id));
         }
-        if self.evaluate_focus_condition(country, &scenario.ideas, &focus.bypass)? {
+        if self.evaluate_focus_condition(
+            country,
+            scenario.reference_tag,
+            &scenario.ideas,
+            &focus.bypass,
+        )? {
             country.record_focus_completion(action.focus_id);
             return Ok(());
         }
@@ -671,6 +678,7 @@ impl SimulationEngine {
     pub(crate) fn focus_is_available(
         &self,
         country: &CountryRuntime,
+        root_tag: &str,
         ideas: &[crate::domain::IdeaDefinition],
         focus: &crate::domain::NationalFocus,
     ) -> Result<bool, SimulationError> {
@@ -689,12 +697,13 @@ impl SimulationEngine {
             return Ok(false);
         }
 
-        self.evaluate_focus_condition(country, ideas, &focus.available)
+        self.evaluate_focus_condition(country, root_tag, ideas, &focus.available)
     }
 
     fn evaluate_focus_condition(
         &self,
         country: &CountryRuntime,
+        root_tag: &str,
         ideas: &[crate::domain::IdeaDefinition],
         condition: &FocusCondition,
     ) -> Result<bool, SimulationError> {
@@ -702,7 +711,7 @@ impl SimulationEngine {
             FocusCondition::Always => Ok(true),
             FocusCondition::All(conditions) => {
                 for condition in conditions {
-                    if !self.evaluate_focus_condition(country, ideas, condition)? {
+                    if !self.evaluate_focus_condition(country, root_tag, ideas, condition)? {
                         return Ok(false);
                     }
                 }
@@ -710,20 +719,23 @@ impl SimulationEngine {
             }
             FocusCondition::Any(conditions) => {
                 for condition in conditions {
-                    if self.evaluate_focus_condition(country, ideas, condition)? {
+                    if self.evaluate_focus_condition(country, root_tag, ideas, condition)? {
                         return Ok(true);
                     }
                 }
                 Ok(false)
             }
             FocusCondition::Not(condition) => {
-                Ok(!self.evaluate_focus_condition(country, ideas, condition)?)
+                Ok(!self.evaluate_focus_condition(country, root_tag, ideas, condition)?)
             }
             FocusCondition::HasCompletedFocus(id) => Ok(country.has_completed_focus(id)),
             FocusCondition::HasCountryFlag(flag) => Ok(country.has_country_flag(flag)),
             FocusCondition::HasDlc(_) => Ok(false),
             FocusCondition::HasGameRule { .. } => Ok(false),
             FocusCondition::HasIdea(id) => Ok(country.has_idea(id)),
+            FocusCondition::Timeline(condition) => {
+                Ok(condition.evaluate(country.country.date, &country.world_state, root_tag))
+            }
             FocusCondition::HasWarSupportAtLeast(value) => {
                 Ok(country.current_war_support_bp(ideas) >= *value)
             }
@@ -885,8 +897,9 @@ impl SimulationEngine {
                         .push(super::state::ResearchSlotState::default());
                 }
             }
-            FocusEffect::SetCountryFlag(flag) => {
-                country.set_country_flag(flag.clone());
+            FocusEffect::SetCountryFlag { flag, days } => {
+                let expires_on = days.map(|days| country.country.date.add_days(days));
+                country.set_country_flag(flag.clone(), expires_on);
             }
             FocusEffect::AddEquipmentToStockpile { equipment, amount } => {
                 country.stockpile.add(*equipment, *amount);
@@ -1313,7 +1326,7 @@ mod tests {
         FocusBuildingKind, FocusCondition, FocusEffect, FocusStateScope, GameDate, IdeaDefinition,
         IdeaModifiers, MobilizationLaw, NationalFocus, ResourceLedger, StateCondition,
         StateOperation, StateScopedEffects, TechId, TechnologyModifiers, TechnologyNode,
-        TechnologyTree, TradeLaw,
+        TechnologyTree, TimelineCondition, TradeLaw,
     };
     use crate::scenario::France1936Scenario;
     use crate::sim::{
@@ -1919,6 +1932,72 @@ mod tests {
                 .any(|flag| flag.as_ref() == "FRA_rearmed")
         );
         assert!(result.country.has_completed_focus("FRA_begin_rearmament"));
+    }
+
+    #[test]
+    fn focus_availability_respects_timeline_date_and_war_conditions() {
+        let scenario = France1936Scenario::standard();
+        let mut runtime = scenario.bootstrap_runtime();
+        let engine = SimulationEngine::default();
+        let focus = NationalFocus {
+            id: "FRA_timeline_gate".into(),
+            days: 1,
+            prerequisites: Vec::new(),
+            mutually_exclusive: Vec::new(),
+            available: FocusCondition::All(vec![
+                FocusCondition::Timeline(Box::new(TimelineCondition::DateAtLeast(GameDate::new(
+                    1939, 9, 1,
+                )))),
+                FocusCondition::Not(Box::new(FocusCondition::Timeline(Box::new(
+                    TimelineCondition::HasWarWith("GER".into()),
+                )))),
+            ]),
+            bypass: FocusCondition::Not(Box::new(FocusCondition::Always)),
+            search_filters: Vec::new(),
+            effects: Vec::new(),
+        };
+
+        runtime.country.date = GameDate::new(1939, 8, 31);
+        assert!(
+            !engine
+                .focus_is_available(&runtime, scenario.reference_tag, &scenario.ideas, &focus)
+                .unwrap()
+        );
+
+        runtime.country.date = GameDate::new(1939, 9, 1);
+        assert!(
+            engine
+                .focus_is_available(&runtime, scenario.reference_tag, &scenario.ideas, &focus)
+                .unwrap()
+        );
+
+        runtime.country.date = GameDate::new(1939, 9, 3);
+        runtime.apply_timeline_events(&scenario.timeline_events);
+        assert!(
+            !engine
+                .focus_is_available(&runtime, scenario.reference_tag, &scenario.ideas, &focus)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn simulator_applies_timeline_events_during_daily_progression() {
+        let scenario = France1936Scenario::standard();
+        let mut runtime = scenario.bootstrap_runtime();
+        runtime.country.date = GameDate::new(1939, 9, 2);
+        let engine = SimulationEngine::default();
+
+        let outcome = engine
+            .simulate(
+                &scenario,
+                runtime,
+                &[],
+                GameDate::new(1939, 9, 3),
+                scenario.pivot_window.start,
+            )
+            .unwrap();
+
+        assert!(outcome.country.world_state.countries_at_war("FRA", "GER"));
     }
 
     #[test]

@@ -285,7 +285,12 @@ impl FranceBeamPlanner {
             .filter(|focus| self.focus_is_supported(focus))
             .filter(|focus| {
                 self.simulator
-                    .focus_is_available(&node.runtime, &self.scenario.ideas, focus)
+                    .focus_is_available(
+                        &node.runtime,
+                        self.scenario.reference_tag,
+                        &self.scenario.ideas,
+                        focus,
+                    )
                     .unwrap_or(false)
             })
             .max_by_key(|focus| self.focus_priority(node, phase, focus))
@@ -378,6 +383,7 @@ impl FranceBeamPlanner {
             | crate::domain::FocusCondition::HasDlc(_)
             | crate::domain::FocusCondition::HasGameRule { .. }
             | crate::domain::FocusCondition::HasIdea(_)
+            | crate::domain::FocusCondition::Timeline(_)
             | crate::domain::FocusCondition::HasWarSupportAtLeast(_)
             | crate::domain::FocusCondition::NumOfFactoriesAtLeast(_)
             | crate::domain::FocusCondition::NumOfMilitaryFactoriesAtLeast(_)
@@ -435,7 +441,7 @@ impl FranceBeamPlanner {
             | crate::domain::FocusEffect::AddStability(_)
             | crate::domain::FocusEffect::AddWarSupport(_)
             | crate::domain::FocusEffect::AddEquipmentToStockpile { .. }
-            | crate::domain::FocusEffect::SetCountryFlag(_) => true,
+            | crate::domain::FocusEffect::SetCountryFlag { .. } => true,
         }
     }
 
@@ -511,7 +517,7 @@ impl FranceBeamPlanner {
                     crate::domain::FocusEffect::AddEquipmentToStockpile { amount, .. } => {
                         i64::from(*amount / 10)
                     }
-                    crate::domain::FocusEffect::SetCountryFlag(_) => 500,
+                    crate::domain::FocusEffect::SetCountryFlag { .. } => 500,
                     crate::domain::FocusEffect::SwapIdea { remove, add } => {
                         self.idea_effect_score(add) - self.idea_effect_score(remove)
                     }

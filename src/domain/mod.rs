@@ -5,6 +5,7 @@ pub mod planning;
 pub mod research;
 pub mod resources;
 pub mod templates;
+pub mod timeline;
 
 pub use calendar::{GameDate, PivotWindow};
 pub use focus::{
@@ -26,3 +27,4 @@ pub use templates::{
     FieldedDivision, ModeledEquipmentProfiles, SupportCompanies, TemplateDesignConstraints,
     TemplateFitness,
 };
+pub use timeline::{TimelineCondition, TimelineEvent, WarState, WorldState};
