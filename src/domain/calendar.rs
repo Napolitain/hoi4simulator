@@ -168,6 +168,19 @@ mod tests {
 
     proptest! {
         #[test]
+        fn next_day_is_strictly_monotone(
+            year in 1930u16..1945,
+            month in 1u8..13,
+            day_seed in 0u16..31,
+        ) {
+            let max_day = GameDate::days_in_month(year, month);
+            let day = u8::try_from(day_seed % u16::from(max_day) + 1).unwrap_or(max_day);
+            let start = GameDate::new(year, month, day);
+
+            prop_assert!(start.next_day() > start);
+        }
+
+        #[test]
         fn add_days_round_trips_with_days_until(
             year in 1930u16..1945,
             month in 1u8..13,

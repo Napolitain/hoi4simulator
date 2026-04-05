@@ -7,6 +7,7 @@ use crate::scenario::{Frontier, FrontierFortRequirement};
 use super::actions::{ConstructionKind, ResearchBranch, StateId};
 
 pub const POLITICAL_POWER_UNIT: u32 = 100;
+pub const BASE_PRODUCTION_EFFICIENCY_PERMILLE: u16 = 100;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StrategicPhase {
@@ -196,14 +197,14 @@ impl ProductionLine {
             equipment,
             factories,
             unit_cost_centi,
-            efficiency_permille: 100,
+            efficiency_permille: BASE_PRODUCTION_EFFICIENCY_PERMILLE,
             accumulated_ic_centi: 0,
         }
     }
 
     pub fn reassign(&mut self, equipment: EquipmentKind, factories: u8) {
         if self.equipment != equipment {
-            self.efficiency_permille = 100;
+            self.efficiency_permille = BASE_PRODUCTION_EFFICIENCY_PERMILLE;
             self.accumulated_ic_centi = 0;
             self.unit_cost_centi = equipment.default_unit_cost_centi();
         }
@@ -346,6 +347,10 @@ impl CountryRuntime {
             self.active_ideas.iter().map(|idea| idea.id.as_ref()),
             "active idea",
         );
+        assert_unique_copy(
+            self.research_slots.iter().filter_map(|slot| slot.branch),
+            "active research branch",
+        );
         assert_unique_strs(self.country_flags.iter().map(Box::as_ref), "country flag");
         assert_unique_strs(
             self.country_leader_traits.iter().map(Box::as_ref),
@@ -372,7 +377,7 @@ impl CountryRuntime {
 
         for line in &self.production_lines {
             assert!(line.unit_cost_centi > 0);
-            assert!(line.efficiency_permille > 0);
+            assert!(line.efficiency_permille >= BASE_PRODUCTION_EFFICIENCY_PERMILLE);
         }
 
         for idea in &self.active_ideas {
@@ -547,7 +552,7 @@ impl CountryRuntime {
     pub fn add_idea(&mut self, id: impl Into<Box<str>>, duration_days: Option<u16>) {
         let id = id.into();
         if let Some(existing) = self.active_ideas.iter_mut().find(|idea| idea.id == id) {
-            existing.remaining_days = duration_days.or(existing.remaining_days);
+            existing.remaining_days = duration_days;
             return;
         }
 
@@ -736,6 +741,17 @@ fn assert_unique_pairs<'a>(values: impl IntoIterator<Item = (&'a str, &'a str)>,
     }
 }
 
+fn assert_unique_copy<T: Copy + Eq>(values: impl IntoIterator<Item = T>, label: &str) {
+    let mut seen: Vec<T> = Vec::new();
+    for value in values {
+        assert!(
+            seen.iter().all(|existing| existing != &value),
+            "duplicate {label}",
+        );
+        seen.push(value);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrancePlanningState {
     pub country: CountryState,
@@ -766,8 +782,9 @@ mod tests {
     use crate::sim::actions::{ConstructionKind, StateId};
 
     use super::{
-        CountryRuntime, CountryState, FrancePlanningState, POLITICAL_POWER_UNIT, ProductionLine,
-        StateDefinition, StateRuntime, Stockpile, StrategicPhase,
+        BASE_PRODUCTION_EFFICIENCY_PERMILLE, CountryRuntime, CountryState, FrancePlanningState,
+        POLITICAL_POWER_UNIT, ProductionLine, StateDefinition, StateRuntime, Stockpile,
+        StrategicPhase,
     };
 
     fn test_runtime() -> CountryRuntime {
@@ -891,6 +908,25 @@ mod tests {
     }
 
     #[test]
+    fn consumer_goods_floor_clamps_at_zero_under_large_negative_modifiers() {
+        let mut runtime = test_runtime();
+        let ideas = [IdeaDefinition {
+            id: "FRA_zero_consumer_goods".into(),
+            modifiers: IdeaModifiers {
+                consumer_goods_bp: -20_000,
+                ..IdeaModifiers::default()
+            },
+        }];
+        runtime.add_idea("FRA_zero_consumer_goods", None);
+
+        assert_eq!(runtime.consumer_goods_factories(&ideas), 0);
+        assert_eq!(
+            runtime.available_civilian_factories(&ideas),
+            runtime.total_civilian_factories(),
+        );
+    }
+
+    #[test]
     fn country_runtime_applies_flat_and_scaled_manpower_modifiers() {
         let runtime = test_runtime();
         let ideas = [IdeaDefinition {
@@ -905,6 +941,55 @@ mod tests {
         runtime.add_idea("FRA_service_reform", None);
 
         assert_eq!(runtime.available_manpower(&ideas), 2_750_000);
+    }
+
+    #[test]
+    fn country_runtime_clamps_support_levels_from_ideas_into_valid_ranges() {
+        let mut runtime = test_runtime();
+        runtime.country.stability_bp = 9_800;
+        runtime.country.war_support_bp = 200;
+        let ideas = [IdeaDefinition {
+            id: "FRA_support_clamps".into(),
+            modifiers: IdeaModifiers {
+                stability_bp: 700,
+                war_support_bp: -2_000,
+                ..IdeaModifiers::default()
+            },
+        }];
+        runtime.add_idea("FRA_support_clamps", None);
+
+        assert_eq!(runtime.current_stability_bp(&ideas), 10_000);
+        assert_eq!(runtime.current_war_support_bp(&ideas), 0);
+    }
+
+    #[test]
+    fn country_runtime_clamps_factory_output_floor_at_zero() {
+        let mut runtime = test_runtime();
+        let ideas = [IdeaDefinition {
+            id: "FRA_output_floor".into(),
+            modifiers: IdeaModifiers {
+                factory_output_bp: -20_000,
+                ..IdeaModifiers::default()
+            },
+        }];
+        runtime.add_idea("FRA_output_floor", None);
+
+        assert_eq!(runtime.military_output_bp(&ideas), 0);
+    }
+
+    #[test]
+    fn country_runtime_clamps_research_speed_floor_at_zero() {
+        let mut runtime = test_runtime();
+        let ideas = [IdeaDefinition {
+            id: "FRA_research_floor".into(),
+            modifiers: IdeaModifiers {
+                research_speed_bp: -20_000,
+                ..IdeaModifiers::default()
+            },
+        }];
+        runtime.add_idea("FRA_research_floor", None);
+
+        assert_eq!(runtime.research_speed_bp(&ideas), 0);
     }
 
     #[test]
@@ -1019,6 +1104,37 @@ mod tests {
         });
 
         assert_eq!(runtime.queued_factory_projects(StateId(0)), 1);
+    }
+
+    #[test]
+    fn production_line_reassignment_respects_base_efficiency_floor() {
+        let mut line = ProductionLine::new(EquipmentKind::InfantryEquipment, 5);
+        line.efficiency_permille = 640;
+        line.accumulated_ic_centi = 1_234;
+
+        line.reassign(EquipmentKind::Artillery, 4);
+
+        assert_eq!(
+            line.efficiency_permille,
+            BASE_PRODUCTION_EFFICIENCY_PERMILLE,
+        );
+        assert_eq!(line.accumulated_ic_centi, 0);
+        assert_eq!(line.factories, 4);
+        assert_eq!(line.equipment, EquipmentKind::Artillery);
+    }
+
+    #[test]
+    fn add_idea_replaces_existing_entry_instead_of_stacking() {
+        let mut runtime = test_runtime();
+
+        runtime.add_idea("FRA_repeatable_spirit", Some(14));
+        runtime.add_idea("FRA_repeatable_spirit", None);
+        assert_eq!(runtime.active_ideas.len(), 1);
+        assert_eq!(runtime.active_ideas[0].remaining_days, None);
+        runtime.add_idea("FRA_repeatable_spirit", Some(5));
+
+        assert_eq!(runtime.active_ideas.len(), 1);
+        assert_eq!(runtime.active_ideas[0].remaining_days, Some(5));
     }
 
     proptest! {

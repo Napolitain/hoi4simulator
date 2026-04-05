@@ -511,15 +511,20 @@ impl SimulationEngine {
                 self.focus_building_kind(country.construction_queue[index].kind),
                 &scenario.ideas,
             ));
-            let daily_progress = u64::try_from(assigned_civs).unwrap_or(u64::MAX)
-                * u64::from(self.config.construction_output_centi_per_factory)
-                * u64::from(infrastructure_multiplier_bp)
-                * u64::from(10_000 + construction_speed_bp)
-                / 10_000
-                / 10_000;
+            let remaining_cost = country.construction_queue[index]
+                .total_cost_centi
+                .saturating_sub(country.construction_queue[index].progress_centi);
+            let daily_progress = self
+                .construction_daily_progress_centi(
+                    assigned_civs,
+                    infrastructure_multiplier_bp,
+                    construction_speed_bp,
+                )
+                .min(remaining_cost);
 
-            country.construction_queue[index].progress_centi +=
-                u32::try_from(daily_progress).unwrap_or(u32::MAX);
+            country.construction_queue[index].progress_centi = country.construction_queue[index]
+                .progress_centi
+                .saturating_add(daily_progress);
         }
 
         let mut index = 0_usize;
@@ -554,14 +559,14 @@ impl SimulationEngine {
                 continue;
             }
 
-            let daily_ic_centi = u64::from(line.factories)
-                * u64::from(self.config.production_output_centi_per_factory)
-                * u64::from(line.efficiency_permille)
-                * u64::from(10_000 + output_bonus_bp)
-                / 1_000
-                / 10_000;
+            let prior_efficiency = line.efficiency_permille;
+            let daily_ic_centi = self.production_daily_ic_centi(
+                line.factories,
+                line.efficiency_permille,
+                output_bonus_bp,
+            );
 
-            line.accumulated_ic_centi += u32::try_from(daily_ic_centi).unwrap_or(u32::MAX);
+            line.accumulated_ic_centi = line.accumulated_ic_centi.saturating_add(daily_ic_centi);
 
             let produced_units = line.accumulated_ic_centi / line.unit_cost_centi;
             line.accumulated_ic_centi %= line.unit_cost_centi;
@@ -573,6 +578,11 @@ impl SimulationEngine {
                     + self.config.production_efficiency_gain_permille)
                     .min(self.config.production_efficiency_cap_permille);
             }
+
+            debug_assert!(line.efficiency_permille >= prior_efficiency);
+            debug_assert!(
+                line.efficiency_permille <= self.config.production_efficiency_cap_permille
+            );
         }
     }
 
@@ -772,11 +782,16 @@ impl SimulationEngine {
                     .saturating_add(*amount);
             }
             FocusEffect::AddStability(amount) => {
-                country.country.stability_bp = country.country.stability_bp.saturating_add(*amount);
+                let stability_bp =
+                    u32::from(country.country.stability_bp).saturating_add(u32::from(*amount));
+                country.country.stability_bp =
+                    u16::try_from(stability_bp.min(10_000)).unwrap_or(10_000);
             }
             FocusEffect::AddWarSupport(amount) => {
+                let war_support_bp =
+                    u32::from(country.country.war_support_bp).saturating_add(u32::from(*amount));
                 country.country.war_support_bp =
-                    country.country.war_support_bp.saturating_add(*amount);
+                    u16::try_from(war_support_bp.min(10_000)).unwrap_or(10_000);
             }
             FocusEffect::AddManpower(amount) => {
                 country.country.population = country.country.population.saturating_add(*amount);
@@ -932,7 +947,10 @@ impl SimulationEngine {
             super::actions::ResearchBranch::Production => 130_u16,
         };
         let speed_bp = u32::from(10_000_u16.saturating_add(research_speed_bp));
-        u16::try_from((u32::from(base_days) * 10_000).div_ceil(speed_bp)).unwrap_or(u16::MAX)
+        let days =
+            u16::try_from((u32::from(base_days) * 10_000).div_ceil(speed_bp)).unwrap_or(u16::MAX);
+        debug_assert!(days > 0);
+        days
     }
 
     fn construction_cost(&self, kind: ConstructionKind) -> u32 {
@@ -966,6 +984,38 @@ impl SimulationEngine {
             AdvisorKind::ResearchInstitute => country.advisors.research,
             AdvisorKind::MilitaryIndustrialist => country.advisors.military_industry,
         }
+    }
+
+    fn construction_daily_progress_centi(
+        &self,
+        assigned_civs: usize,
+        infrastructure_multiplier_bp: u32,
+        construction_speed_bp: u32,
+    ) -> u32 {
+        let daily_progress = u64::try_from(assigned_civs).unwrap_or(u64::MAX)
+            * u64::from(self.config.construction_output_centi_per_factory)
+            * u64::from(infrastructure_multiplier_bp)
+            * u64::from(10_000 + construction_speed_bp)
+            / 10_000
+            / 10_000;
+
+        u32::try_from(daily_progress).unwrap_or(u32::MAX)
+    }
+
+    fn production_daily_ic_centi(
+        &self,
+        factories: u8,
+        efficiency_permille: u16,
+        output_bonus_bp: u32,
+    ) -> u32 {
+        let daily_ic_centi = u64::from(factories)
+            * u64::from(self.config.production_output_centi_per_factory)
+            * u64::from(efficiency_permille)
+            * u64::from(10_000 + output_bonus_bp)
+            / 1_000
+            / 10_000;
+
+        u32::try_from(daily_ic_centi).unwrap_or(u32::MAX)
     }
 
     fn state_index(
@@ -1008,9 +1058,9 @@ mod tests {
     };
     use crate::scenario::France1936Scenario;
     use crate::sim::{
-        Action, AdvisorAction, AdvisorKind, ConstructionAction, ConstructionKind, FocusAction,
-        LawAction, LawCategory, LawTarget, ProductionAction, ResearchAction, ResearchBranch,
-        StateId,
+        Action, AdvisorAction, AdvisorKind, ConstructionAction, ConstructionKind,
+        ConstructionProject, FocusAction, LawAction, LawCategory, LawTarget, ProductionAction,
+        ProductionLine, ResearchAction, ResearchBranch, StateId, Stockpile,
     };
 
     use super::{SimulationConfig, SimulationEngine, SimulationError};
@@ -1307,6 +1357,40 @@ mod tests {
     }
 
     #[test]
+    fn simulator_rejects_duplicate_advisor_purchase_on_a_later_day() {
+        let scenario = France1936Scenario::standard();
+        let mut runtime = scenario.bootstrap_runtime();
+        runtime.country.political_power_centi = 400 * crate::sim::POLITICAL_POWER_UNIT;
+
+        let engine = SimulationEngine::default();
+        let actions = [
+            Action::Advisor(AdvisorAction {
+                date: GameDate::new(1936, 1, 1),
+                kind: AdvisorKind::IndustryConcern,
+            }),
+            Action::Advisor(AdvisorAction {
+                date: GameDate::new(1936, 1, 2),
+                kind: AdvisorKind::IndustryConcern,
+            }),
+        ];
+
+        let result = engine.simulate(
+            &scenario,
+            runtime,
+            &actions,
+            GameDate::new(1936, 1, 2),
+            scenario.pivot_window.start,
+        );
+
+        assert_eq!(
+            result,
+            Err(SimulationError::DuplicateAdvisor(
+                AdvisorKind::IndustryConcern
+            ))
+        );
+    }
+
+    #[test]
     fn simulator_applies_exact_focus_rewards_and_timed_ideas() {
         let scenario = France1936Scenario::standard().with_exact_focus_data(
             2,
@@ -1483,6 +1567,107 @@ mod tests {
         assert_eq!(
             result.country.country_leader_traits,
             vec![Box::<str>::from("tenacious_negotiator")]
+        );
+    }
+
+    #[test]
+    fn simulator_clamps_focus_support_rewards_to_the_valid_range() {
+        let scenario = France1936Scenario::standard().with_exact_focus_data(
+            2,
+            Vec::new(),
+            Vec::new(),
+            vec![NationalFocus {
+                id: "FRA_support_campaign".into(),
+                days: 1,
+                prerequisites: Vec::new(),
+                mutually_exclusive: Vec::new(),
+                available: FocusCondition::Always,
+                bypass: FocusCondition::Not(Box::new(FocusCondition::Always)),
+                search_filters: vec!["FOCUS_FILTER_POLITICAL".into()],
+                effects: vec![
+                    FocusEffect::AddStability(6_000),
+                    FocusEffect::AddWarSupport(8_000),
+                ],
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let runtime = scenario.bootstrap_runtime();
+        let engine = SimulationEngine::default();
+        let actions = [Action::Focus(FocusAction {
+            date: GameDate::new(1936, 1, 1),
+            focus_id: "FRA_support_campaign".into(),
+        })];
+
+        let result = engine
+            .simulate(
+                &scenario,
+                runtime,
+                &actions,
+                GameDate::new(1936, 1, 1),
+                scenario.pivot_window.start,
+            )
+            .unwrap();
+
+        assert_eq!(result.country.country.stability_bp, 10_000);
+        assert_eq!(result.country.country.war_support_bp, 10_000);
+    }
+
+    #[test]
+    fn simulator_blocks_mutually_exclusive_focuses_after_completion() {
+        let scenario = France1936Scenario::standard().with_exact_focus_data(
+            2,
+            Vec::new(),
+            Vec::new(),
+            vec![
+                NationalFocus {
+                    id: "FRA_focus_a".into(),
+                    days: 1,
+                    prerequisites: Vec::new(),
+                    mutually_exclusive: vec!["FRA_focus_b".into()],
+                    available: FocusCondition::Always,
+                    bypass: FocusCondition::Not(Box::new(FocusCondition::Always)),
+                    search_filters: vec!["FOCUS_FILTER_INDUSTRY".into()],
+                    effects: vec![FocusEffect::AddPoliticalPower(10)],
+                },
+                NationalFocus {
+                    id: "FRA_focus_b".into(),
+                    days: 1,
+                    prerequisites: Vec::new(),
+                    mutually_exclusive: vec!["FRA_focus_a".into()],
+                    available: FocusCondition::Always,
+                    bypass: FocusCondition::Not(Box::new(FocusCondition::Always)),
+                    search_filters: vec!["FOCUS_FILTER_INDUSTRY".into()],
+                    effects: vec![FocusEffect::AddPoliticalPower(10)],
+                },
+            ],
+            Vec::new(),
+            Vec::new(),
+        );
+        let runtime = scenario.bootstrap_runtime();
+        let engine = SimulationEngine::default();
+        let actions = [
+            Action::Focus(FocusAction {
+                date: GameDate::new(1936, 1, 1),
+                focus_id: "FRA_focus_a".into(),
+            }),
+            Action::Focus(FocusAction {
+                date: GameDate::new(1936, 1, 2),
+                focus_id: "FRA_focus_b".into(),
+            }),
+        ];
+
+        let result = engine.simulate(
+            &scenario,
+            runtime,
+            &actions,
+            GameDate::new(1936, 1, 2),
+            scenario.pivot_window.start,
+        );
+
+        assert_eq!(
+            result,
+            Err(SimulationError::FocusUnavailable("FRA_focus_b".into()))
         );
     }
 
@@ -1721,5 +1906,118 @@ mod tests {
                 outcome.country.assert_invariants();
             }
         }
+
+        #[test]
+        fn advance_production_conserves_ic_into_stockpile_units(
+            factories in 1u8..15,
+            unit_cost_centi in 1u32..20_000,
+            accumulated_ic_centi in 0u32..20_000,
+        ) {
+            let scenario = France1936Scenario::standard();
+            let mut runtime = scenario.bootstrap_runtime();
+            let mut line = ProductionLine::new_with_cost(
+                EquipmentKind::InfantryEquipment,
+                factories,
+                unit_cost_centi,
+            );
+            line.accumulated_ic_centi = accumulated_ic_centi % unit_cost_centi;
+            runtime.production_lines = vec![line].into_boxed_slice();
+            runtime.stockpile = Stockpile::default();
+            let engine = SimulationEngine::new(SimulationConfig {
+                production_efficiency_gain_permille: 0,
+                ..SimulationConfig::default()
+            });
+
+            let line_before = runtime.production_lines[0];
+            let daily_ic_centi = engine.production_daily_ic_centi(
+                line_before.factories,
+                line_before.efficiency_permille,
+                u32::from(runtime.military_output_bp(&scenario.ideas)),
+            );
+            let total_ic_centi = line_before.accumulated_ic_centi + daily_ic_centi;
+            let expected_units = total_ic_centi / line_before.unit_cost_centi;
+            let expected_remainder = total_ic_centi % line_before.unit_cost_centi;
+
+            engine.advance_production(&scenario, &mut runtime);
+
+            prop_assert_eq!(runtime.stockpile.infantry_equipment, expected_units);
+            prop_assert_eq!(runtime.production_lines[0].accumulated_ic_centi, expected_remainder);
+        }
+
+        #[test]
+        fn advance_production_static_lines_gain_efficiency_monotonically_up_to_cap(
+            factories in 1u8..15,
+            days in 1usize..365,
+        ) {
+            let scenario = France1936Scenario::standard();
+            let mut runtime = scenario.bootstrap_runtime();
+            runtime.production_lines = vec![ProductionLine::new(EquipmentKind::InfantryEquipment, factories)]
+                .into_boxed_slice();
+            let engine = SimulationEngine::default();
+            let mut previous_efficiency = runtime.production_lines[0].efficiency_permille;
+
+            for _ in 0..days {
+                engine.advance_production(&scenario, &mut runtime);
+                let current_efficiency = runtime.production_lines[0].efficiency_permille;
+                prop_assert!(current_efficiency >= previous_efficiency);
+                prop_assert!(current_efficiency <= engine.config.production_efficiency_cap_permille);
+                previous_efficiency = current_efficiency;
+            }
+        }
+
+        #[test]
+        fn research_days_stay_positive_under_large_speed_bonuses(
+            branch in prop_oneof![
+                Just(ResearchBranch::Industry),
+                Just(ResearchBranch::Construction),
+                Just(ResearchBranch::Electronics),
+                Just(ResearchBranch::Production),
+            ],
+            research_speed_bp in 0u16..u16::MAX,
+        ) {
+            let engine = SimulationEngine::default();
+            let days = engine.research_days(branch, research_speed_bp);
+
+            prop_assert!(days > 0);
+        }
+    }
+
+    #[test]
+    fn construction_speed_scales_with_infrastructure_level() {
+        let engine = SimulationEngine::default();
+        let assigned_civs = 10;
+        let base = engine.construction_daily_progress_centi(assigned_civs, 10_000, 0);
+        let infra_five = engine.construction_daily_progress_centi(assigned_civs, 15_000, 0);
+        let infra_ten = engine.construction_daily_progress_centi(assigned_civs, 20_000, 0);
+
+        assert_eq!(base, 5_000);
+        assert_eq!(infra_five, 7_500);
+        assert_eq!(infra_ten, 10_000);
+    }
+
+    #[test]
+    fn advance_construction_caps_daily_progress_to_remaining_cost() {
+        let scenario = France1936Scenario::standard();
+        let mut runtime = scenario.bootstrap_runtime();
+        let initial_civs = runtime
+            .state(France1936Scenario::ILE_DE_FRANCE)
+            .civilian_factories;
+        runtime.construction_queue = vec![ConstructionProject {
+            state: France1936Scenario::ILE_DE_FRANCE,
+            kind: ConstructionKind::CivilianFactory,
+            total_cost_centi: 1_000,
+            progress_centi: 950,
+        }];
+        let engine = SimulationEngine::default();
+
+        engine.advance_construction(&scenario, &mut runtime);
+
+        assert!(runtime.construction_queue.is_empty());
+        assert_eq!(
+            runtime
+                .state(France1936Scenario::ILE_DE_FRANCE)
+                .civilian_factories,
+            initial_civs + 1,
+        );
     }
 }
