@@ -1,6 +1,6 @@
 use crate::domain::{
-    CountryLaws, EquipmentDemand, EquipmentKind, FocusBuildingKind, GameDate, IdeaDefinition,
-    IdeaModifiers, ResourceLedger,
+    CountryLaws, DoctrineCostReduction, EquipmentDemand, EquipmentKind, FocusBuildingKind,
+    GameDate, IdeaDefinition, IdeaModifiers, ResourceLedger,
 };
 use crate::scenario::{Frontier, FrontierFortRequirement};
 
@@ -256,6 +256,7 @@ pub struct CountryRuntime {
     pub state_defs: Box<[StateDefinition]>,
     pub states: Box<[StateRuntime]>,
     pub stockpile: Stockpile,
+    pub army_experience: u16,
     pub fielded_divisions: u16,
     pub fielded_demand: EquipmentDemand,
     pub production_lines: Box<[ProductionLine]>,
@@ -263,7 +264,9 @@ pub struct CountryRuntime {
     pub focus: Option<FocusProgress>,
     pub completed_focuses: Vec<CompletedFocus>,
     pub active_ideas: Vec<ActiveIdea>,
+    pub doctrine_cost_reductions: Vec<DoctrineCostReduction>,
     pub country_flags: Vec<Box<str>>,
+    pub country_leader_traits: Vec<Box<str>>,
     pub state_flags: Box<[Vec<Box<str>>]>,
     pub research_slots: Vec<ResearchSlotState>,
     pub completed_research: ResearchSummary,
@@ -280,11 +283,12 @@ impl CountryRuntime {
         assert_eq!(state_defs.len(), states.len());
         let state_count = states.len();
 
-        Self {
+        let runtime = Self {
             country,
             state_defs,
             states,
             stockpile: Stockpile::default(),
+            army_experience: 0,
             fielded_divisions: 0,
             fielded_demand: EquipmentDemand::default(),
             production_lines,
@@ -292,17 +296,22 @@ impl CountryRuntime {
             focus: None,
             completed_focuses: Vec::with_capacity(64),
             active_ideas: Vec::with_capacity(32),
+            doctrine_cost_reductions: Vec::with_capacity(8),
             country_flags: Vec::with_capacity(32),
+            country_leader_traits: Vec::with_capacity(8),
             state_flags: vec![Vec::new(); state_count].into_boxed_slice(),
             research_slots: vec![ResearchSlotState::default(), ResearchSlotState::default()],
             completed_research: ResearchSummary::default(),
             advisors: AdvisorRoster::default(),
-        }
+        };
+        runtime.assert_invariants();
+        runtime
     }
 
     pub fn with_research_slots(mut self, count: u8) -> Self {
         assert!(count > 0);
         self.research_slots = vec![ResearchSlotState::default(); usize::from(count)];
+        self.assert_invariants();
         self
     }
 
@@ -313,7 +322,57 @@ impl CountryRuntime {
     ) -> Self {
         self.fielded_divisions = divisions;
         self.fielded_demand = per_division_demand.scale(divisions);
+        self.assert_invariants();
         self
+    }
+
+    pub fn assert_invariants(&self) {
+        assert_eq!(self.state_defs.len(), self.states.len());
+        assert_eq!(self.state_defs.len(), self.state_flags.len());
+        assert!(!self.research_slots.is_empty());
+        assert!(self.country.stability_bp <= 10_000);
+        assert!(self.country.war_support_bp <= 10_000);
+
+        assert_unique_strs(
+            self.completed_focuses.iter().map(|focus| focus.id.as_ref()),
+            "completed focus",
+        );
+        assert_unique_strs(
+            self.active_ideas.iter().map(|idea| idea.id.as_ref()),
+            "active idea",
+        );
+        assert_unique_strs(self.country_flags.iter().map(Box::as_ref), "country flag");
+        assert_unique_strs(
+            self.country_leader_traits.iter().map(Box::as_ref),
+            "country leader trait",
+        );
+        assert_unique_pairs(
+            self.doctrine_cost_reductions
+                .iter()
+                .map(|reduction| (reduction.name.as_ref(), reduction.category.as_ref())),
+            "doctrine cost reduction",
+        );
+
+        for (index, (definition, state)) in
+            self.state_defs.iter().zip(self.states.iter()).enumerate()
+        {
+            assert_eq!(usize::from(definition.id.0), index);
+            assert!(state.infrastructure <= 10);
+            assert!(state.land_fort_level <= 10);
+            assert_unique_strs(
+                self.state_flags[index].iter().map(Box::as_ref),
+                "state flag",
+            );
+        }
+
+        for line in &self.production_lines {
+            assert!(line.unit_cost_centi > 0);
+            assert!(line.efficiency_permille > 0);
+        }
+
+        for idea in &self.active_ideas {
+            assert_ne!(idea.remaining_days, Some(0));
+        }
     }
 
     pub fn state_index(&self, state: StateId) -> usize {
@@ -486,6 +545,17 @@ impl CountryRuntime {
         self.active_ideas.retain(|idea| idea.id.as_ref() != id);
     }
 
+    pub fn add_doctrine_cost_reduction(&mut self, reduction: DoctrineCostReduction) {
+        if self
+            .doctrine_cost_reductions
+            .iter()
+            .any(|current| current.name == reduction.name && current.category == reduction.category)
+        {
+            return;
+        }
+        self.doctrine_cost_reductions.push(reduction);
+    }
+
     pub fn has_idea(&self, id: &str) -> bool {
         self.active_ideas.iter().any(|idea| idea.id.as_ref() == id)
     }
@@ -591,6 +661,18 @@ impl CountryRuntime {
         self.country_flags.push(flag);
     }
 
+    pub fn add_country_leader_trait(&mut self, trait_id: impl Into<Box<str>>) {
+        let trait_id = trait_id.into();
+        if self
+            .country_leader_traits
+            .iter()
+            .any(|current| current == &trait_id)
+        {
+            return;
+        }
+        self.country_leader_traits.push(trait_id);
+    }
+
     pub fn has_state_flag_by_index(&self, index: usize, flag: &str) -> bool {
         self.state_flags[index]
             .iter()
@@ -611,6 +693,30 @@ impl CountryRuntime {
     pub fn research_speed_bp(&self, ideas: &[IdeaDefinition]) -> u16 {
         let bonus = self.idea_modifiers(ideas).research_speed_bp;
         u16::try_from(bonus.clamp(0, i32::from(u16::MAX))).unwrap_or(u16::MAX)
+    }
+}
+
+fn assert_unique_strs<'a>(values: impl IntoIterator<Item = &'a str>, label: &str) {
+    let mut seen: Vec<&str> = Vec::new();
+    for value in values {
+        assert!(
+            seen.iter().all(|existing| existing != &value),
+            "duplicate {label}: {value}",
+        );
+        seen.push(value);
+    }
+}
+
+fn assert_unique_pairs<'a>(values: impl IntoIterator<Item = (&'a str, &'a str)>, label: &str) {
+    let mut seen: Vec<(&str, &str)> = Vec::new();
+    for value in values {
+        assert!(
+            seen.iter().all(|existing| existing != &value),
+            "duplicate {label}: {} / {}",
+            value.0,
+            value.1,
+        );
+        seen.push(value);
     }
 }
 
@@ -727,6 +833,11 @@ mod tests {
         let runtime = test_runtime();
 
         assert_eq!(runtime.state(StateId(1)).military_factories, 2);
+    }
+
+    #[test]
+    fn country_runtime_fixture_satisfies_invariants() {
+        test_runtime().assert_invariants();
     }
 
     #[test]

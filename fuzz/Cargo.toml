@@ -1,0 +1,31 @@
+[package]
+name = "hoi4simulator-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.hoi4simulator]
+path = ".."
+
+[[bin]]
+name = "clausewitz_parser"
+path = "fuzz_targets/clausewitz_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "simulator_actions"
+path = "fuzz_targets/simulator_actions.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

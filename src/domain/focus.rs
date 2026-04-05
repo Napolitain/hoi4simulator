@@ -42,6 +42,8 @@ pub enum FocusCondition {
     Not(Box<FocusCondition>),
     HasCompletedFocus(Box<str>),
     HasCountryFlag(Box<str>),
+    HasDlc(Box<str>),
+    HasGameRule { rule: Box<str>, option: Box<str> },
     HasIdea(Box<str>),
     HasWarSupportAtLeast(u16),
     NumOfFactoriesAtLeast(u16),
@@ -110,6 +112,14 @@ pub struct IdeaDefinition {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DoctrineCostReduction {
+    pub name: Box<str>,
+    pub category: Box<str>,
+    pub cost_reduction_bp: u16,
+    pub uses: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StateOperation {
     AddBuildingConstruction {
         kind: FocusBuildingKind,
@@ -131,6 +141,9 @@ pub struct StateScopedEffects {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FocusEffect {
     AddIdea(Box<str>),
+    AddArmyExperience(u16),
+    AddCountryLeaderTrait(Box<str>),
+    AddDoctrineCostReduction(DoctrineCostReduction),
     AddManpower(u64),
     AddPoliticalPower(u32),
     AddResearchSlot(u8),
@@ -144,6 +157,7 @@ pub enum FocusEffect {
         equipment: EquipmentKind,
         amount: u32,
     },
+    RemoveIdea(Box<str>),
     SetCountryFlag(Box<str>),
     StateScoped(StateScopedEffects),
     SwapIdea {

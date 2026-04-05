@@ -8,15 +8,16 @@ use fory::{Fory, ForyDefault, ForyObject, Serializer};
 use fory_core::StructSerializer;
 
 use crate::domain::{
-    CountryLaws, EconomyLaw, EquipmentKind, EquipmentProfile, FocusBuildingKind, FocusCondition,
-    FocusEffect, FocusStateScope, IdeaDefinition, IdeaModifiers, MobilizationLaw,
-    ModeledEquipmentProfiles, NationalFocus, ResourceLedger, StateCondition, StateOperation,
-    StateScopedEffects, TradeLaw,
+    CountryLaws, DoctrineCostReduction, EconomyLaw, EquipmentKind, EquipmentProfile,
+    FocusBuildingKind, FocusCondition, FocusEffect, FocusStateScope, IdeaDefinition, IdeaModifiers,
+    MobilizationLaw, ModeledEquipmentProfiles, NationalFocus, ResourceLedger, StateCondition,
+    StateOperation, StateScopedEffects, TradeLaw,
 };
 use crate::scenario::{France1936Scenario, Frontier};
 
 use super::clausewitz::{
-    ClausewitzBlock, ClausewitzItem, ClausewitzOperator, ClausewitzValue, parse_clausewitz,
+    ClausewitzAssignment, ClausewitzBlock, ClausewitzItem, ClausewitzOperator, ClausewitzValue,
+    parse_clausewitz,
 };
 
 const DATA_LAYOUT_VERSION: u32 = 3;
@@ -526,6 +527,26 @@ fn parse_focus_condition_block(block: &ClausewitzBlock) -> FocusCondition {
                     conditions.push(FocusCondition::HasCountryFlag(flag.into()));
                 }
             }
+            "has_dlc" => {
+                if let Some(dlc) = assignment.value.as_str() {
+                    conditions.push(FocusCondition::HasDlc(dlc.into()));
+                }
+            }
+            "has_game_rule" => {
+                if let Some(child) = assignment.value.as_block()
+                    && let Some(rule) = child
+                        .first_assignment("rule")
+                        .and_then(ClausewitzValue::as_str)
+                    && let Some(option) = child
+                        .first_assignment("option")
+                        .and_then(ClausewitzValue::as_str)
+                {
+                    conditions.push(FocusCondition::HasGameRule {
+                        rule: rule.into(),
+                        option: option.into(),
+                    });
+                }
+            }
             "has_idea" => {
                 if let Some(id) = assignment.value.as_str() {
                     conditions.push(FocusCondition::HasIdea(id.into()));
@@ -824,128 +845,221 @@ fn parse_focus_effects_block(block: &ClausewitzBlock) -> Vec<FocusEffect> {
         let ClausewitzItem::Assignment(assignment) = item else {
             continue;
         };
-        match assignment.key.as_ref() {
-            "add_ideas" => {
-                for id in clausewitz_value_strings(&assignment.value) {
-                    effects.push(FocusEffect::AddIdea(id));
-                }
-            }
-            "add_timed_idea" => {
-                if let Some(child) = assignment.value.as_block()
-                    && let Some(id) = child
-                        .first_assignment("idea")
-                        .and_then(ClausewitzValue::as_str)
-                    && let Some(days) = child
-                        .first_assignment("days")
-                        .and_then(ClausewitzValue::as_u64)
-                        .and_then(|value| u16::try_from(value).ok())
-                {
-                    effects.push(FocusEffect::AddTimedIdea {
-                        id: id.into(),
-                        days,
-                    });
-                }
-            }
-            "swap_ideas" => {
-                if let Some(child) = assignment.value.as_block()
-                    && let Some(remove) = child
-                        .first_assignment("remove_idea")
-                        .and_then(ClausewitzValue::as_str)
-                    && let Some(add) = child
-                        .first_assignment("add_idea")
-                        .and_then(ClausewitzValue::as_str)
-                {
-                    effects.push(FocusEffect::SwapIdea {
-                        remove: remove.into(),
-                        add: add.into(),
-                    });
-                }
-            }
-            "add_political_power" => {
-                if let Some(value) = clausewitz_amount_centi(&assignment.value) {
-                    effects.push(FocusEffect::AddPoliticalPower(value));
-                }
-            }
-            "add_stability" => {
-                if let Some(value) = clausewitz_percent_bp(&assignment.value) {
-                    effects.push(FocusEffect::AddStability(value));
-                }
-            }
-            "add_war_support" => {
-                if let Some(value) = clausewitz_percent_bp(&assignment.value) {
-                    effects.push(FocusEffect::AddWarSupport(value));
-                }
-            }
-            "add_manpower" => {
-                if let Some(value) = assignment.value.as_u64() {
-                    effects.push(FocusEffect::AddManpower(value));
-                }
-            }
-            "add_research_slot" => {
-                if let Some(value) = assignment
-                    .value
-                    .as_u64()
-                    .and_then(|value| u8::try_from(value).ok())
-                {
-                    effects.push(FocusEffect::AddResearchSlot(value));
-                }
-            }
-            "add_equipment_to_stockpile" => {
-                if let Some(child) = assignment.value.as_block()
-                    && let Some(token) = child
-                        .first_assignment("type")
-                        .and_then(ClausewitzValue::as_str)
-                    && let Some(amount) = child
-                        .first_assignment("amount")
-                        .and_then(ClausewitzValue::as_u64)
-                        .and_then(|value| u32::try_from(value).ok())
-                {
-                    effects.push(FocusEffect::AddEquipmentToStockpile {
-                        equipment: map_equipment_token(token),
-                        amount,
-                    });
-                }
-            }
-            "set_country_flag" => {
-                if let Some(flag) = assignment.value.as_str() {
-                    effects.push(FocusEffect::SetCountryFlag(flag.into()));
-                }
-            }
-            "every_owned_state" => {
-                if let Some(child) = assignment.value.as_block() {
-                    effects.push(FocusEffect::StateScoped(parse_state_scope_effect(
-                        FocusStateScope::EveryOwnedState,
-                        child,
-                    )));
-                }
-            }
-            "random_owned_state" => {
-                if let Some(child) = assignment.value.as_block() {
-                    effects.push(FocusEffect::StateScoped(parse_state_scope_effect(
-                        FocusStateScope::RandomOwnedState,
-                        child,
-                    )));
-                }
-            }
-            "random_controlled_state" => {
-                if let Some(child) = assignment.value.as_block() {
-                    effects.push(FocusEffect::StateScoped(parse_state_scope_effect(
-                        FocusStateScope::RandomControlledState,
-                        child,
-                    )));
-                }
-            }
-            "hidden_effect" => {
-                if let Some(child) = assignment.value.as_block() {
-                    effects.extend(parse_focus_effects_block(child));
-                }
-            }
-            "custom_effect_tooltip" | "complete_tooltip" | "show_ideas_tooltip" => {}
-            key => effects.push(FocusEffect::Unsupported(key.to_string().into())),
-        }
+        parse_focus_effect_assignment(assignment, &mut effects);
     }
 
     effects
+}
+
+fn parse_focus_effect_assignment(
+    assignment: &ClausewitzAssignment,
+    effects: &mut Vec<FocusEffect>,
+) {
+    match assignment.key.as_ref() {
+        "add_ideas" => {
+            for id in clausewitz_value_strings(&assignment.value) {
+                effects.push(FocusEffect::AddIdea(id));
+            }
+        }
+        "remove_ideas" | "remove_idea" => {
+            for id in clausewitz_value_strings(&assignment.value) {
+                effects.push(FocusEffect::RemoveIdea(id));
+            }
+        }
+        "add_timed_idea" => {
+            if let Some(child) = assignment.value.as_block()
+                && let Some(id) = child
+                    .first_assignment("idea")
+                    .and_then(ClausewitzValue::as_str)
+                && let Some(days) = child
+                    .first_assignment("days")
+                    .and_then(ClausewitzValue::as_u64)
+                    .and_then(|value| u16::try_from(value).ok())
+            {
+                effects.push(FocusEffect::AddTimedIdea {
+                    id: id.into(),
+                    days,
+                });
+            }
+        }
+        "swap_ideas" => {
+            if let Some(child) = assignment.value.as_block()
+                && let Some(remove) = child
+                    .first_assignment("remove_idea")
+                    .and_then(ClausewitzValue::as_str)
+                && let Some(add) = child
+                    .first_assignment("add_idea")
+                    .and_then(ClausewitzValue::as_str)
+            {
+                effects.push(FocusEffect::SwapIdea {
+                    remove: remove.into(),
+                    add: add.into(),
+                });
+            }
+        }
+        "army_experience" => {
+            if let Some(value) = assignment
+                .value
+                .as_u64()
+                .and_then(|value| u16::try_from(value).ok())
+            {
+                effects.push(FocusEffect::AddArmyExperience(value));
+            }
+        }
+        "add_doctrine_cost_reduction" => {
+            if let Some(child) = assignment.value.as_block()
+                && let Some(reduction) = parse_doctrine_cost_reduction(child)
+            {
+                effects.push(FocusEffect::AddDoctrineCostReduction(reduction));
+            }
+        }
+        "add_country_leader_trait" => {
+            if let Some(trait_id) = assignment.value.as_str() {
+                effects.push(FocusEffect::AddCountryLeaderTrait(trait_id.into()));
+            }
+        }
+        "add_political_power" => {
+            if let Some(value) = clausewitz_amount_centi(&assignment.value) {
+                effects.push(FocusEffect::AddPoliticalPower(value));
+            }
+        }
+        "add_stability" => {
+            if let Some(value) = clausewitz_percent_bp(&assignment.value) {
+                effects.push(FocusEffect::AddStability(value));
+            }
+        }
+        "add_war_support" => {
+            if let Some(value) = clausewitz_percent_bp(&assignment.value) {
+                effects.push(FocusEffect::AddWarSupport(value));
+            }
+        }
+        "add_manpower" => {
+            if let Some(value) = assignment.value.as_u64() {
+                effects.push(FocusEffect::AddManpower(value));
+            }
+        }
+        "add_research_slot" => {
+            if let Some(value) = assignment
+                .value
+                .as_u64()
+                .and_then(|value| u8::try_from(value).ok())
+            {
+                effects.push(FocusEffect::AddResearchSlot(value));
+            }
+        }
+        "add_equipment_to_stockpile" => {
+            if let Some(child) = assignment.value.as_block()
+                && let Some(token) = child
+                    .first_assignment("type")
+                    .and_then(ClausewitzValue::as_str)
+                && let Some(amount) = child
+                    .first_assignment("amount")
+                    .and_then(ClausewitzValue::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+            {
+                effects.push(FocusEffect::AddEquipmentToStockpile {
+                    equipment: map_equipment_token(token),
+                    amount,
+                });
+            }
+        }
+        "set_country_flag" => {
+            if let Some(flag) = assignment.value.as_str() {
+                effects.push(FocusEffect::SetCountryFlag(flag.into()));
+            }
+        }
+        "every_owned_state" => {
+            if let Some(child) = assignment.value.as_block() {
+                effects.push(FocusEffect::StateScoped(parse_state_scope_effect(
+                    FocusStateScope::EveryOwnedState,
+                    child,
+                )));
+            }
+        }
+        "random_owned_state" => {
+            if let Some(child) = assignment.value.as_block() {
+                effects.push(FocusEffect::StateScoped(parse_state_scope_effect(
+                    FocusStateScope::RandomOwnedState,
+                    child,
+                )));
+            }
+        }
+        "random_controlled_state" => {
+            if let Some(child) = assignment.value.as_block() {
+                effects.push(FocusEffect::StateScoped(parse_state_scope_effect(
+                    FocusStateScope::RandomControlledState,
+                    child,
+                )));
+            }
+        }
+        "if" | "IF" => {
+            if let Some(child) = assignment.value.as_block() {
+                effects.extend(parse_default_conditional_effect_block(child));
+            }
+        }
+        "hidden_effect" => {
+            if let Some(child) = assignment.value.as_block() {
+                effects.extend(parse_focus_effects_block(child));
+            }
+        }
+        "custom_effect_tooltip"
+        | "complete_tooltip"
+        | "mark_focus_tree_layout_dirty"
+        | "show_ideas_tooltip" => {}
+        key => effects.push(FocusEffect::Unsupported(key.to_string().into())),
+    }
+}
+
+fn parse_default_conditional_effect_block(block: &ClausewitzBlock) -> Vec<FocusEffect> {
+    let limit = block
+        .first_assignment("limit")
+        .or_else(|| block.first_assignment("LIMIT"))
+        .and_then(ClausewitzValue::as_block);
+    let prefer_body = limit.map(condition_prefers_default_branch).unwrap_or(true);
+
+    if prefer_body {
+        let mut effects = Vec::new();
+        for item in &block.items {
+            let ClausewitzItem::Assignment(assignment) = item else {
+                continue;
+            };
+            if matches!(assignment.key.as_ref(), "limit" | "LIMIT" | "else" | "ELSE") {
+                continue;
+            }
+            parse_focus_effect_assignment(assignment, &mut effects);
+        }
+        effects
+    } else {
+        block
+            .first_assignment("else")
+            .or_else(|| block.first_assignment("ELSE"))
+            .and_then(ClausewitzValue::as_block)
+            .map(parse_focus_effects_block)
+            .unwrap_or_default()
+    }
+}
+
+fn parse_doctrine_cost_reduction(block: &ClausewitzBlock) -> Option<DoctrineCostReduction> {
+    let name = block
+        .first_assignment("name")
+        .and_then(ClausewitzValue::as_str)?;
+    let category = block
+        .first_assignment("category")
+        .and_then(ClausewitzValue::as_str)?;
+    let cost_reduction_bp = block
+        .first_assignment("cost_reduction")
+        .and_then(clausewitz_percent_bp)?;
+    let uses = block
+        .first_assignment("uses")
+        .and_then(ClausewitzValue::as_u64)
+        .and_then(|value| u8::try_from(value).ok())?;
+
+    Some(DoctrineCostReduction {
+        name: name.into(),
+        category: category.into(),
+        cost_reduction_bp,
+        uses,
+    })
 }
 
 fn parse_state_scope_effect(scope: FocusStateScope, block: &ClausewitzBlock) -> StateScopedEffects {
@@ -1034,6 +1148,7 @@ fn collect_focus_effect_idea_ids(effects: &[FocusEffect], ids: &mut Vec<Box<str>
     for effect in effects {
         match effect {
             FocusEffect::AddIdea(id) => push_unique_boxed(ids, id),
+            FocusEffect::RemoveIdea(id) => push_unique_boxed(ids, id),
             FocusEffect::SetCountryFlag(_) | FocusEffect::Unsupported(_) => {}
             FocusEffect::AddTimedIdea { id, .. } => push_unique_boxed(ids, id),
             FocusEffect::SwapIdea { remove, add } => {
@@ -1047,7 +1162,10 @@ fn collect_focus_effect_idea_ids(effects: &[FocusEffect], ids: &mut Vec<Box<str>
                     }
                 }
             }
-            FocusEffect::AddManpower(_)
+            FocusEffect::AddArmyExperience(_)
+            | FocusEffect::AddCountryLeaderTrait(_)
+            | FocusEffect::AddDoctrineCostReduction(_)
+            | FocusEffect::AddManpower(_)
             | FocusEffect::AddPoliticalPower(_)
             | FocusEffect::AddResearchSlot(_)
             | FocusEffect::AddStability(_)
@@ -2277,11 +2395,94 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::domain::{CountryLaws, EconomyLaw, EquipmentKind, MobilizationLaw, TradeLaw};
+    use crate::data::clausewitz::parse_clausewitz;
+    use crate::domain::{
+        CountryLaws, DoctrineCostReduction, EconomyLaw, EquipmentKind, FocusCondition, FocusEffect,
+        MobilizationLaw, TradeLaw,
+    };
 
     use super::{
         DataProfilePaths, ingest_profile, load_france_1936_dataset, load_france_1936_scenario,
+        parse_focus_condition_block, parse_focus_effects_block,
     };
+
+    #[test]
+    fn focus_effect_parser_prefers_default_non_dlc_branch() {
+        let root = parse_clausewitz(
+            r#"
+            completion_reward = {
+                if = {
+                    limit = { has_dlc = "Arms Against Tyranny" }
+                    add_country_leader_trait = dlc_only_trait
+                    ELSE = {
+                        remove_ideas = FRA_victors_of_wwi
+                        army_experience = 10
+                        add_doctrine_cost_reduction = {
+                            name = FRA_army_reform
+                            cost_reduction = 0.5
+                            uses = 2
+                            category = land_doctrine
+                        }
+                    }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let block = root
+            .first_assignment("completion_reward")
+            .and_then(|value| value.as_block())
+            .unwrap();
+
+        let effects = parse_focus_effects_block(block);
+
+        assert_eq!(
+            effects,
+            vec![
+                FocusEffect::RemoveIdea("FRA_victors_of_wwi".into()),
+                FocusEffect::AddArmyExperience(10),
+                FocusEffect::AddDoctrineCostReduction(DoctrineCostReduction {
+                    name: "FRA_army_reform".into(),
+                    category: "land_doctrine".into(),
+                    cost_reduction_bp: 5_000,
+                    uses: 2,
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn focus_condition_parser_preserves_dlc_and_game_rule_gates() {
+        let root = parse_clausewitz(
+            r#"
+            available = {
+                NOT = { has_dlc = "La Resistance" }
+                has_game_rule = {
+                    rule = obsolete_focus_branches_visibility
+                    option = HIDE
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let block = root
+            .first_assignment("available")
+            .and_then(|value| value.as_block())
+            .unwrap();
+
+        let condition = parse_focus_condition_block(block);
+
+        assert_eq!(
+            condition,
+            FocusCondition::All(vec![
+                FocusCondition::Not(Box::new(FocusCondition::HasDlc("La Resistance".into()))),
+                FocusCondition::HasGameRule {
+                    rule: "obsolete_focus_branches_visibility".into(),
+                    option: "HIDE".into(),
+                },
+            ])
+        );
+    }
 
     #[test]
     fn ingest_profile_mirrors_raw_files_and_generates_structured_france_dataset() {

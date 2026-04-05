@@ -332,6 +332,8 @@ impl FranceBeamPlanner {
             crate::domain::FocusCondition::Unsupported(_) => false,
             crate::domain::FocusCondition::HasCompletedFocus(_)
             | crate::domain::FocusCondition::HasCountryFlag(_)
+            | crate::domain::FocusCondition::HasDlc(_)
+            | crate::domain::FocusCondition::HasGameRule { .. }
             | crate::domain::FocusCondition::HasIdea(_)
             | crate::domain::FocusCondition::HasWarSupportAtLeast(_)
             | crate::domain::FocusCondition::NumOfFactoriesAtLeast(_)
@@ -380,7 +382,11 @@ impl FranceBeamPlanner {
             crate::domain::FocusEffect::SwapIdea { add, .. } => {
                 self.scenario.idea_by_id(add).is_some()
             }
-            crate::domain::FocusEffect::AddManpower(_)
+            crate::domain::FocusEffect::RemoveIdea(_)
+            | crate::domain::FocusEffect::AddArmyExperience(_)
+            | crate::domain::FocusEffect::AddCountryLeaderTrait(_)
+            | crate::domain::FocusEffect::AddDoctrineCostReduction(_)
+            | crate::domain::FocusEffect::AddManpower(_)
             | crate::domain::FocusEffect::AddPoliticalPower(_)
             | crate::domain::FocusEffect::AddResearchSlot(_)
             | crate::domain::FocusEffect::AddStability(_)
@@ -438,8 +444,19 @@ impl FranceBeamPlanner {
                     crate::domain::FocusEffect::AddResearchSlot(amount) => {
                         i64::from(*amount) * 12_000
                     }
-                    crate::domain::FocusEffect::AddIdea(_)
-                    | crate::domain::FocusEffect::AddTimedIdea { .. } => 5_000,
+                    crate::domain::FocusEffect::AddIdea(id) => self.idea_effect_score(id).max(500),
+                    crate::domain::FocusEffect::AddTimedIdea { id, days } => {
+                        let base = self.idea_effect_score(id).max(500);
+                        base * i64::from((*days).max(35)) / 70
+                    }
+                    crate::domain::FocusEffect::RemoveIdea(id) => -self.idea_effect_score(id),
+                    crate::domain::FocusEffect::AddArmyExperience(amount) => {
+                        i64::from(*amount) * 50
+                    }
+                    crate::domain::FocusEffect::AddDoctrineCostReduction(reduction) => {
+                        i64::from(reduction.cost_reduction_bp) * i64::from(reduction.uses)
+                    }
+                    crate::domain::FocusEffect::AddCountryLeaderTrait(_) => 250,
                     crate::domain::FocusEffect::AddPoliticalPower(amount) => {
                         i64::from(*amount / 100) * 20
                     }
@@ -452,7 +469,9 @@ impl FranceBeamPlanner {
                         i64::from(*amount / 10)
                     }
                     crate::domain::FocusEffect::SetCountryFlag(_) => 500,
-                    crate::domain::FocusEffect::SwapIdea { .. } => 4_000,
+                    crate::domain::FocusEffect::SwapIdea { remove, add } => {
+                        self.idea_effect_score(add) - self.idea_effect_score(remove)
+                    }
                     crate::domain::FocusEffect::StateScoped(scope) => scope
                         .operations
                         .iter()
@@ -495,6 +514,27 @@ impl FranceBeamPlanner {
                     crate::domain::FocusEffect::Unsupported(_) => -100_000,
                 }
         })
+    }
+
+    fn idea_effect_score(&self, id: &str) -> i64 {
+        let Some(idea) = self.scenario.idea_by_id(id) else {
+            return 0;
+        };
+        let modifiers = idea.modifiers;
+        i64::from(-modifiers.consumer_goods_bp) * 4
+            + i64::from(modifiers.stability_bp) * 2
+            + i64::from(modifiers.war_support_bp) * 2
+            + i64::from(modifiers.political_power_daily_centi) * 200
+            + i64::from(modifiers.factory_output_bp) * 4
+            + i64::from(modifiers.research_speed_bp) * 5
+            + i64::from(modifiers.manpower_bp) * 2
+            + i64::from(modifiers.resource_factor_bp) * 2
+            + i64::from(
+                modifiers.civilian_factory_construction_bp
+                    + modifiers.military_factory_construction_bp
+                    + modifiers.infrastructure_construction_bp
+                    + modifiers.land_fort_construction_bp,
+            ) * 4
     }
 
     fn next_research_branch(

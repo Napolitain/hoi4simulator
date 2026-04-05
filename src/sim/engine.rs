@@ -623,6 +623,8 @@ impl SimulationEngine {
             }
             FocusCondition::HasCompletedFocus(id) => Ok(country.has_completed_focus(id)),
             FocusCondition::HasCountryFlag(flag) => Ok(country.has_country_flag(flag)),
+            FocusCondition::HasDlc(_) => Ok(false),
+            FocusCondition::HasGameRule { .. } => Ok(false),
             FocusCondition::HasIdea(id) => Ok(country.has_idea(id)),
             FocusCondition::HasWarSupportAtLeast(value) => {
                 Ok(country.current_war_support_bp(ideas) >= *value)
@@ -732,6 +734,9 @@ impl SimulationEngine {
                 }
                 country.add_idea(id.clone(), None);
             }
+            FocusEffect::RemoveIdea(id) => {
+                country.remove_idea(id);
+            }
             FocusEffect::AddTimedIdea { id, days } => {
                 if scenario.idea_by_id(id).is_none() {
                     return Err(SimulationError::UnsupportedFocusEffect(id.clone()));
@@ -744,6 +749,15 @@ impl SimulationEngine {
                 }
                 country.remove_idea(remove);
                 country.add_idea(add.clone(), None);
+            }
+            FocusEffect::AddArmyExperience(amount) => {
+                country.army_experience = country.army_experience.saturating_add(*amount);
+            }
+            FocusEffect::AddDoctrineCostReduction(reduction) => {
+                country.add_doctrine_cost_reduction(reduction.clone());
+            }
+            FocusEffect::AddCountryLeaderTrait(trait_id) => {
+                country.add_country_leader_trait(trait_id.clone());
             }
             FocusEffect::AddPoliticalPower(amount) => {
                 country.country.political_power_centi = country
@@ -976,14 +990,15 @@ mod tests {
     use proptest::prelude::*;
 
     use crate::domain::{
-        EconomyLaw, FocusBuildingKind, FocusCondition, FocusEffect, FocusStateScope, GameDate,
-        IdeaDefinition, IdeaModifiers, NationalFocus, StateCondition, StateOperation,
-        StateScopedEffects,
+        DoctrineCostReduction, EconomyLaw, EquipmentKind, FocusBuildingKind, FocusCondition,
+        FocusEffect, FocusStateScope, GameDate, IdeaDefinition, IdeaModifiers, MobilizationLaw,
+        NationalFocus, StateCondition, StateOperation, StateScopedEffects, TradeLaw,
     };
     use crate::scenario::France1936Scenario;
     use crate::sim::{
         Action, AdvisorAction, AdvisorKind, ConstructionAction, ConstructionKind, FocusAction,
         LawAction, LawCategory, LawTarget, ProductionAction, ResearchAction, ResearchBranch,
+        StateId,
     };
 
     use super::{SimulationConfig, SimulationEngine, SimulationError};
@@ -1390,6 +1405,220 @@ mod tests {
         assert!(result.country.has_completed_focus("FRA_begin_rearmament"));
     }
 
+    #[test]
+    fn simulator_tracks_remove_idea_and_doctrine_side_effects() {
+        let scenario = France1936Scenario::standard().with_exact_focus_data(
+            2,
+            vec!["FRA_victors_of_wwi".into()],
+            Vec::new(),
+            vec![NationalFocus {
+                id: "FRA_army_reform".into(),
+                days: 1,
+                prerequisites: Vec::new(),
+                mutually_exclusive: Vec::new(),
+                available: FocusCondition::Always,
+                bypass: FocusCondition::Not(Box::new(FocusCondition::Always)),
+                search_filters: vec!["FOCUS_FILTER_RESEARCH".into()],
+                effects: vec![
+                    FocusEffect::RemoveIdea("FRA_victors_of_wwi".into()),
+                    FocusEffect::AddArmyExperience(10),
+                    FocusEffect::AddDoctrineCostReduction(DoctrineCostReduction {
+                        name: "FRA_army_reform".into(),
+                        category: "land_doctrine".into(),
+                        cost_reduction_bp: 5_000,
+                        uses: 2,
+                    }),
+                    FocusEffect::AddCountryLeaderTrait("tenacious_negotiator".into()),
+                ],
+            }],
+            vec![IdeaDefinition {
+                id: "FRA_victors_of_wwi".into(),
+                modifiers: IdeaModifiers {
+                    research_speed_bp: -1_000,
+                    ..IdeaModifiers::default()
+                },
+            }],
+            Vec::new(),
+        );
+        let runtime = scenario.bootstrap_runtime();
+        let engine = SimulationEngine::default();
+        let actions = [Action::Focus(FocusAction {
+            date: GameDate::new(1936, 1, 1),
+            focus_id: "FRA_army_reform".into(),
+        })];
+
+        let result = engine
+            .simulate(
+                &scenario,
+                runtime,
+                &actions,
+                GameDate::new(1936, 1, 1),
+                scenario.pivot_window.start,
+            )
+            .unwrap();
+
+        assert!(!result.country.has_idea("FRA_victors_of_wwi"));
+        assert_eq!(result.country.army_experience, 10);
+        assert_eq!(
+            result.country.doctrine_cost_reductions,
+            vec![DoctrineCostReduction {
+                name: "FRA_army_reform".into(),
+                category: "land_doctrine".into(),
+                cost_reduction_bp: 5_000,
+                uses: 2,
+            }]
+        );
+        assert_eq!(
+            result.country.country_leader_traits,
+            vec![Box::<str>::from("tenacious_negotiator")]
+        );
+    }
+
+    fn fuzz_scenario() -> France1936Scenario {
+        France1936Scenario::standard().with_exact_focus_data(
+            3,
+            vec!["FRA_victors_of_wwi".into()],
+            Vec::new(),
+            vec![
+                NationalFocus {
+                    id: "FRA_devalue_the_franc".into(),
+                    days: 1,
+                    prerequisites: Vec::new(),
+                    mutually_exclusive: Vec::new(),
+                    available: FocusCondition::Always,
+                    bypass: FocusCondition::Not(Box::new(FocusCondition::Always)),
+                    search_filters: vec!["FOCUS_FILTER_INDUSTRY".into()],
+                    effects: vec![FocusEffect::AddTimedIdea {
+                        id: "FRA_devalued_currency".into(),
+                        days: 14,
+                    }],
+                },
+                NationalFocus {
+                    id: "FRA_begin_rearmament".into(),
+                    days: 1,
+                    prerequisites: vec!["FRA_devalue_the_franc".into()],
+                    mutually_exclusive: Vec::new(),
+                    available: FocusCondition::Always,
+                    bypass: FocusCondition::Not(Box::new(FocusCondition::Always)),
+                    search_filters: vec!["FOCUS_FILTER_INDUSTRY".into()],
+                    effects: vec![
+                        FocusEffect::AddResearchSlot(1),
+                        FocusEffect::RemoveIdea("FRA_victors_of_wwi".into()),
+                    ],
+                },
+                NationalFocus {
+                    id: "FRA_army_reform".into(),
+                    days: 1,
+                    prerequisites: vec!["FRA_begin_rearmament".into()],
+                    mutually_exclusive: Vec::new(),
+                    available: FocusCondition::Always,
+                    bypass: FocusCondition::Not(Box::new(FocusCondition::Always)),
+                    search_filters: vec!["FOCUS_FILTER_RESEARCH".into()],
+                    effects: vec![
+                        FocusEffect::AddArmyExperience(5),
+                        FocusEffect::AddDoctrineCostReduction(DoctrineCostReduction {
+                            name: "FRA_army_reform".into(),
+                            category: "land_doctrine".into(),
+                            cost_reduction_bp: 5_000,
+                            uses: 2,
+                        }),
+                    ],
+                },
+            ],
+            vec![
+                IdeaDefinition {
+                    id: "FRA_victors_of_wwi".into(),
+                    modifiers: IdeaModifiers {
+                        research_speed_bp: -500,
+                        ..IdeaModifiers::default()
+                    },
+                },
+                IdeaDefinition {
+                    id: "FRA_devalued_currency".into(),
+                    modifiers: IdeaModifiers {
+                        consumer_goods_bp: -1_000,
+                        ..IdeaModifiers::default()
+                    },
+                },
+            ],
+            Vec::new(),
+        )
+    }
+
+    fn generated_action_from_spec(
+        scenario: &France1936Scenario,
+        spec: (u8, u8, u8, u8, u8),
+    ) -> Action {
+        let (kind, day, a, b, c) = spec;
+        let date = scenario.start_date.add_days(u16::from(day % 90));
+
+        match kind % 6 {
+            0 => {
+                let focus = &scenario.focuses[usize::from(a) % scenario.focuses.len()];
+                Action::Focus(FocusAction {
+                    date,
+                    focus_id: focus.id.clone(),
+                })
+            }
+            1 => Action::Research(ResearchAction {
+                date,
+                slot: a % 4,
+                branch: match b % 4 {
+                    0 => ResearchBranch::Industry,
+                    1 => ResearchBranch::Construction,
+                    2 => ResearchBranch::Electronics,
+                    _ => ResearchBranch::Production,
+                },
+            }),
+            2 => Action::Law(LawAction {
+                date,
+                target: match a % 7 {
+                    0 => LawTarget::Economy(EconomyLaw::CivilianEconomy),
+                    1 => LawTarget::Economy(EconomyLaw::EarlyMobilization),
+                    2 => LawTarget::Economy(EconomyLaw::PartialMobilization),
+                    3 => LawTarget::Economy(EconomyLaw::WarEconomy),
+                    4 => LawTarget::Trade(TradeLaw::ExportFocus),
+                    5 => LawTarget::Trade(TradeLaw::LimitedExports),
+                    _ => LawTarget::Mobilization(match b % 3 {
+                        0 => MobilizationLaw::VolunteerOnly,
+                        1 => MobilizationLaw::LimitedConscription,
+                        _ => MobilizationLaw::ExtensiveConscription,
+                    }),
+                },
+            }),
+            3 => Action::Construction(ConstructionAction {
+                date,
+                state: StateId(a % 12),
+                kind: match b % 4 {
+                    0 => ConstructionKind::CivilianFactory,
+                    1 => ConstructionKind::MilitaryFactory,
+                    2 => ConstructionKind::Infrastructure,
+                    _ => ConstructionKind::LandFort,
+                },
+            }),
+            4 => Action::Production(ProductionAction {
+                date,
+                slot: a % 6,
+                equipment: match b % 5 {
+                    0 => EquipmentKind::InfantryEquipment,
+                    1 => EquipmentKind::SupportEquipment,
+                    2 => EquipmentKind::Artillery,
+                    3 => EquipmentKind::AntiTank,
+                    _ => EquipmentKind::AntiAir,
+                },
+                factories: c % 12,
+            }),
+            _ => Action::Advisor(AdvisorAction {
+                date,
+                kind: match a % 3 {
+                    0 => AdvisorKind::IndustryConcern,
+                    1 => AdvisorKind::ResearchInstitute,
+                    _ => AdvisorKind::MilitaryIndustrialist,
+                },
+            }),
+        }
+    }
+
     proptest! {
         #[test]
         fn simulator_rejects_duplicate_research_branches_for_any_branch_and_same_day(
@@ -1422,6 +1651,38 @@ mod tests {
                 engine.simulate(&scenario, runtime, &actions, date, scenario.pivot_window.start);
 
             prop_assert_eq!(result, Err(SimulationError::DuplicateResearchBranch(branch)));
+        }
+
+        #[test]
+        fn simulator_generated_action_sequences_preserve_runtime_invariants(
+            specs in prop::collection::vec((0u8..6, 0u8..120, 0u8..16, 0u8..16, 0u8..16), 0..24),
+        ) {
+            let scenario = fuzz_scenario();
+            let mut actions: Vec<_> = specs
+                .into_iter()
+                .map(|spec| generated_action_from_spec(&scenario, spec))
+                .collect();
+            actions.sort_by_key(Action::date);
+
+            let runtime = scenario.bootstrap_runtime();
+            runtime.assert_invariants();
+            let end = actions
+                .last()
+                .map(Action::date)
+                .unwrap_or(scenario.start_date);
+            let engine = SimulationEngine::default();
+
+            let result = engine.simulate(
+                &scenario,
+                runtime,
+                &actions,
+                end,
+                scenario.pivot_window.start,
+            );
+
+            if let Ok(outcome) = result {
+                outcome.country.assert_invariants();
+            }
         }
     }
 }
