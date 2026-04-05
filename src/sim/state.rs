@@ -756,9 +756,11 @@ impl FrancePlanningState {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use crate::domain::{
-        CountryLaws, DivisionTemplate, EquipmentKind, GameDate, IdeaDefinition, IdeaModifiers,
-        ResourceLedger,
+        CountryLaws, DivisionTemplate, EquipmentDemand, EquipmentKind, GameDate, IdeaDefinition,
+        IdeaModifiers, ResourceLedger,
     };
     use crate::scenario::{France1936Scenario, Frontier};
     use crate::sim::actions::{ConstructionKind, StateId};
@@ -821,6 +823,24 @@ mod tests {
             .into_boxed_slice(),
             vec![ProductionLine::new(EquipmentKind::InfantryEquipment, 5)].into_boxed_slice(),
         )
+    }
+
+    fn equipment_demand(
+        infantry_equipment: u16,
+        support_equipment: u16,
+        artillery: u16,
+        anti_tank: u16,
+        anti_air: u16,
+        manpower: u16,
+    ) -> EquipmentDemand {
+        EquipmentDemand {
+            infantry_equipment: u32::from(infantry_equipment.max(1)),
+            support_equipment: u32::from(support_equipment),
+            artillery: u32::from(artillery),
+            anti_tank: u32::from(anti_tank),
+            anti_air: u32::from(anti_air),
+            manpower: u32::from(manpower.max(1)),
+        }
     }
 
     #[test]
@@ -999,5 +1019,72 @@ mod tests {
         });
 
         assert_eq!(runtime.queued_factory_projects(StateId(0)), 1);
+    }
+
+    proptest! {
+        #[test]
+        fn stockpile_ready_divisions_is_monotonic_with_more_stockpile_and_manpower(
+            demand in (1u16..200, 0u16..50, 0u16..50, 0u16..50, 0u16..50, 1u16..20_000),
+            stock in (0u16..500, 0u16..100, 0u16..100, 0u16..100, 0u16..100),
+            deltas in (0u16..500, 0u16..100, 0u16..100, 0u16..100, 0u16..100),
+            manpower_delta in 0u32..500_000,
+            manpower in 1u32..1_000_000,
+        ) {
+            let demand = equipment_demand(
+                demand.0, demand.1, demand.2, demand.3, demand.4, demand.5,
+            );
+            let base = Stockpile {
+                infantry_equipment: u32::from(stock.0),
+                support_equipment: u32::from(stock.1),
+                artillery: u32::from(stock.2),
+                anti_tank: u32::from(stock.3),
+                anti_air: u32::from(stock.4),
+                unmodeled_equipment: 0,
+            };
+            let improved = Stockpile {
+                infantry_equipment: base.infantry_equipment + u32::from(deltas.0),
+                support_equipment: base.support_equipment + u32::from(deltas.1),
+                artillery: base.artillery + u32::from(deltas.2),
+                anti_tank: base.anti_tank + u32::from(deltas.3),
+                anti_air: base.anti_air + u32::from(deltas.4),
+                unmodeled_equipment: 0,
+            };
+
+            let base_ready = base.ready_divisions(demand, u64::from(manpower));
+            let improved_ready =
+                improved.ready_divisions(demand, u64::from(manpower) + u64::from(manpower_delta));
+
+            prop_assert!(improved_ready >= base_ready);
+        }
+
+        #[test]
+        fn weekly_stability_drift_preserves_total_basis_points(
+            weekly_bp in -500i32..500,
+            days in 0usize..365,
+        ) {
+            let mut runtime = test_runtime();
+            let ideas = [IdeaDefinition {
+                id: "FRA_weekly_drift".into(),
+                modifiers: IdeaModifiers {
+                    stability_weekly_bp: weekly_bp,
+                    ..IdeaModifiers::default()
+                },
+            }];
+            runtime.add_idea("FRA_weekly_drift", None);
+            let mut total_drift = 0_i32;
+
+            for _ in 0..days {
+                let drift_bp = runtime.next_daily_stability_drift_bp(&ideas);
+                total_drift += drift_bp;
+                runtime.country.advance_day(0, drift_bp);
+                runtime.assert_invariants();
+            }
+
+            prop_assert_eq!(
+                total_drift * 7 + runtime.stability_weekly_accumulator_bp,
+                i32::try_from(days).unwrap_or(i32::MAX) * weekly_bp,
+            );
+            prop_assert!(runtime.stability_weekly_accumulator_bp.abs() < 7);
+        }
     }
 }

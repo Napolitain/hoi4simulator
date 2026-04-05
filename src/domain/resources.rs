@@ -153,7 +153,27 @@ impl ResourceKind {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::{ResourceKind, ResourceLedger};
+
+    fn ledger(
+        steel: u16,
+        aluminium: u16,
+        tungsten: u16,
+        chromium: u16,
+        oil: u16,
+        rubber: u16,
+    ) -> ResourceLedger {
+        ResourceLedger {
+            steel: u32::from(steel),
+            aluminium: u32::from(aluminium),
+            tungsten: u32::from(tungsten),
+            chromium: u32::from(chromium),
+            oil: u32::from(oil),
+            rubber: u32::from(rubber),
+        }
+    }
 
     #[test]
     fn resource_ledger_parses_clausewitz_resource_names() {
@@ -200,5 +220,77 @@ mod tests {
         assert_eq!(demand.scale(3).utilization_bp(available), 9_333);
         assert_eq!(demand.scale_bp(15_000).steel, 4);
         assert_eq!(demand.get(ResourceKind::Steel), 3);
+    }
+
+    proptest! {
+        #[test]
+        fn resource_ledger_cap_is_bounded_and_idempotent(
+            demand in (0u16..500, 0u16..500, 0u16..500, 0u16..500, 0u16..500, 0u16..500),
+            available in (0u16..500, 0u16..500, 0u16..500, 0u16..500, 0u16..500, 0u16..500),
+        ) {
+            let demand = ledger(demand.0, demand.1, demand.2, demand.3, demand.4, demand.5);
+            let available = ledger(
+                available.0,
+                available.1,
+                available.2,
+                available.3,
+                available.4,
+                available.5,
+            );
+
+            let capped = demand.cap_at(available);
+
+            prop_assert!(capped.steel <= demand.steel && capped.steel <= available.steel);
+            prop_assert!(capped.aluminium <= demand.aluminium && capped.aluminium <= available.aluminium);
+            prop_assert!(capped.tungsten <= demand.tungsten && capped.tungsten <= available.tungsten);
+            prop_assert!(capped.chromium <= demand.chromium && capped.chromium <= available.chromium);
+            prop_assert!(capped.oil <= demand.oil && capped.oil <= available.oil);
+            prop_assert!(capped.rubber <= demand.rubber && capped.rubber <= available.rubber);
+            prop_assert_eq!(capped.cap_at(available), capped);
+        }
+
+        #[test]
+        fn resource_ledger_saturating_sub_recombines_with_capped_overlap(
+            demand in (0u16..500, 0u16..500, 0u16..500, 0u16..500, 0u16..500, 0u16..500),
+            available in (0u16..500, 0u16..500, 0u16..500, 0u16..500, 0u16..500, 0u16..500),
+        ) {
+            let demand = ledger(demand.0, demand.1, demand.2, demand.3, demand.4, demand.5);
+            let available = ledger(
+                available.0,
+                available.1,
+                available.2,
+                available.3,
+                available.4,
+                available.5,
+            );
+
+            prop_assert_eq!(
+                demand.saturating_sub(available).plus(demand.cap_at(available)),
+                demand,
+            );
+        }
+
+        #[test]
+        fn resource_ledger_utilization_stays_in_bounds(
+            demand in (0u16..500, 0u16..500, 0u16..500, 0u16..500, 0u16..500, 0u16..500),
+            available in (0u16..500, 0u16..500, 0u16..500, 0u16..500, 0u16..500, 0u16..500),
+        ) {
+            let demand = ledger(demand.0, demand.1, demand.2, demand.3, demand.4, demand.5);
+            let available = ledger(
+                available.0,
+                available.1,
+                available.2,
+                available.3,
+                available.4,
+                available.5,
+            );
+
+            let utilization = demand.utilization_bp(available);
+
+            prop_assert!(utilization <= 10_000);
+            if available.total() == 0 {
+                prop_assert_eq!(utilization, 0);
+            }
+        }
     }
 }

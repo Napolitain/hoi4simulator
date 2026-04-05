@@ -91,6 +91,7 @@ impl SimulationEngine {
         pivot_date: GameDate,
     ) -> Result<SimulationOutcome, SimulationError> {
         assert!(scenario.pivot_window.contains(pivot_date));
+        debug_assert_country_invariants(&country);
 
         if actions
             .windows(2)
@@ -113,12 +114,14 @@ impl SimulationEngine {
 
             for action in &actions[day_start..action_index] {
                 self.apply_action(scenario, &mut country, action.clone(), pivot_date)?;
+                debug_assert_country_invariants(&country);
             }
 
             self.progress_focus(scenario, &mut country)?;
             self.progress_research(scenario, &mut country);
             self.advance_construction(scenario, &mut country);
             self.advance_production(scenario, &mut country);
+            debug_assert_country_invariants(&country);
 
             if country.country.date == end {
                 break;
@@ -130,6 +133,7 @@ impl SimulationEngine {
                 stability_drift_bp,
             );
             country.tick_active_ideas();
+            debug_assert_country_invariants(&country);
         }
 
         if action_index < actions.len() {
@@ -987,6 +991,12 @@ impl SimulationEngine {
     }
 }
 
+#[inline]
+fn debug_assert_country_invariants(country: &CountryRuntime) {
+    #[cfg(debug_assertions)]
+    country.assert_invariants();
+}
+
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
@@ -1653,6 +1663,31 @@ mod tests {
                 engine.simulate(&scenario, runtime, &actions, date, scenario.pivot_window.start);
 
             prop_assert_eq!(result, Err(SimulationError::DuplicateResearchBranch(branch)));
+        }
+
+        #[test]
+        fn simulator_no_action_runs_preserve_invariants_and_monotone_stockpile(
+            day_offset in 0u16..120,
+        ) {
+            let scenario = France1936Scenario::standard();
+            let runtime = scenario.bootstrap_runtime();
+            let initial_stockpile = runtime.stockpile;
+            let initial_political_power = runtime.country.political_power_centi;
+            let end = scenario.start_date.add_days(day_offset);
+            let engine = SimulationEngine::default();
+
+            let outcome = engine
+                .simulate(&scenario, runtime, &[], end, scenario.pivot_window.start)
+                .unwrap();
+
+            outcome.country.assert_invariants();
+            prop_assert_eq!(outcome.country.country.date, end);
+            prop_assert!(outcome.country.country.political_power_centi >= initial_political_power);
+            prop_assert!(outcome.country.stockpile.infantry_equipment >= initial_stockpile.infantry_equipment);
+            prop_assert!(outcome.country.stockpile.support_equipment >= initial_stockpile.support_equipment);
+            prop_assert!(outcome.country.stockpile.artillery >= initial_stockpile.artillery);
+            prop_assert!(outcome.country.stockpile.anti_tank >= initial_stockpile.anti_tank);
+            prop_assert!(outcome.country.stockpile.anti_air >= initial_stockpile.anti_air);
         }
 
         #[test]
