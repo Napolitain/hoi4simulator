@@ -124,9 +124,11 @@ impl SimulationEngine {
                 break;
             }
 
-            country
-                .country
-                .advance_day(country.political_power_daily_bonus_centi(&scenario.ideas));
+            let stability_drift_bp = country.next_daily_stability_drift_bp(&scenario.ideas);
+            country.country.advance_day(
+                country.political_power_daily_bonus_centi(&scenario.ideas),
+                stability_drift_bp,
+            );
             country.tick_active_ideas();
         }
 

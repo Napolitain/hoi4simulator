@@ -523,10 +523,12 @@ impl FranceBeamPlanner {
         let modifiers = idea.modifiers;
         i64::from(-modifiers.consumer_goods_bp) * 4
             + i64::from(modifiers.stability_bp) * 2
+            + i64::from(modifiers.stability_weekly_bp) * 20
             + i64::from(modifiers.war_support_bp) * 2
             + i64::from(modifiers.political_power_daily_centi) * 200
             + i64::from(modifiers.factory_output_bp) * 4
             + i64::from(modifiers.research_speed_bp) * 5
+            + i64::from(modifiers.recruitable_population_bp) * 2
             + i64::from(modifiers.manpower_bp) * 2
             + i64::from(modifiers.resource_factor_bp) * 2
             + i64::from(

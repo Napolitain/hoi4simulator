@@ -1237,9 +1237,11 @@ fn parse_idea_modifiers(block: &ClausewitzBlock) -> IdeaModifiers {
         match assignment.key.as_ref() {
             "consumer_goods_factor" => modifiers.consumer_goods_bp += value_bp,
             "stability_factor" => modifiers.stability_bp += value_bp,
+            "stability_weekly" => modifiers.stability_weekly_bp += value_bp,
             "war_support_factor" => modifiers.war_support_bp += value_bp,
             "industrial_capacity_factory" => modifiers.factory_output_bp += value_bp,
             "research_speed_factor" => modifiers.research_speed_bp += value_bp,
+            "conscription" => modifiers.recruitable_population_bp += value_bp,
             "conscription_factor" => modifiers.manpower_bp += value_bp,
             "local_resources_factor" => modifiers.resource_factor_bp += value_bp,
             "political_power_gain" => {
@@ -2398,12 +2400,12 @@ mod tests {
     use crate::data::clausewitz::parse_clausewitz;
     use crate::domain::{
         CountryLaws, DoctrineCostReduction, EconomyLaw, EquipmentKind, FocusCondition, FocusEffect,
-        MobilizationLaw, TradeLaw,
+        IdeaModifiers, MobilizationLaw, TradeLaw,
     };
 
     use super::{
         DataProfilePaths, ingest_profile, load_france_1936_dataset, load_france_1936_scenario,
-        parse_focus_condition_block, parse_focus_effects_block,
+        parse_focus_condition_block, parse_focus_effects_block, parse_idea_modifiers,
     };
 
     #[test]
@@ -2481,6 +2483,38 @@ mod tests {
                     option: "HIDE".into(),
                 },
             ])
+        );
+    }
+
+    #[test]
+    fn idea_parser_captures_flat_recruitable_population_bonus() {
+        let root = parse_clausewitz(
+            r#"
+            idea = {
+                modifier = {
+                    conscription = 0.03
+                    conscription_factor = 0.25
+                    stability_weekly = 0.0025
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let block = root
+            .first_assignment("idea")
+            .and_then(|value| value.as_block())
+            .unwrap();
+
+        let modifiers = parse_idea_modifiers(block);
+
+        assert_eq!(
+            modifiers,
+            IdeaModifiers {
+                recruitable_population_bp: 300,
+                manpower_bp: 2_500,
+                stability_weekly_bp: 25,
+                ..IdeaModifiers::default()
+            }
         );
     }
 

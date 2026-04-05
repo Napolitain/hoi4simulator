@@ -60,10 +60,12 @@ pub enum FocusCondition {
 pub struct IdeaModifiers {
     pub consumer_goods_bp: i32,
     pub stability_bp: i32,
+    pub stability_weekly_bp: i32,
     pub war_support_bp: i32,
     pub political_power_daily_centi: i32,
     pub factory_output_bp: i32,
     pub research_speed_bp: i32,
+    pub recruitable_population_bp: i32,
     pub manpower_bp: i32,
     pub resource_factor_bp: i32,
     pub civilian_factory_construction_bp: i32,
@@ -77,11 +79,14 @@ impl IdeaModifiers {
         Self {
             consumer_goods_bp: self.consumer_goods_bp + other.consumer_goods_bp,
             stability_bp: self.stability_bp + other.stability_bp,
+            stability_weekly_bp: self.stability_weekly_bp + other.stability_weekly_bp,
             war_support_bp: self.war_support_bp + other.war_support_bp,
             political_power_daily_centi: self.political_power_daily_centi
                 + other.political_power_daily_centi,
             factory_output_bp: self.factory_output_bp + other.factory_output_bp,
             research_speed_bp: self.research_speed_bp + other.research_speed_bp,
+            recruitable_population_bp: self.recruitable_population_bp
+                + other.recruitable_population_bp,
             manpower_bp: self.manpower_bp + other.manpower_bp,
             resource_factor_bp: self.resource_factor_bp + other.resource_factor_bp,
             civilian_factory_construction_bp: self.civilian_factory_construction_bp

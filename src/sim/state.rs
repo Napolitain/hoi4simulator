@@ -52,10 +52,12 @@ impl CountryState {
         }
     }
 
-    pub fn advance_day(&mut self, daily_bonus_centi: u16) {
+    pub fn advance_day(&mut self, daily_bonus_centi: u16, stability_bp_delta: i32) {
         self.date = self.date.next_day();
         self.political_power_centi += u32::from(self.political_power_daily_centi);
         self.political_power_centi += u32::from(daily_bonus_centi);
+        let stability_bp = i32::from(self.stability_bp) + stability_bp_delta;
+        self.stability_bp = u16::try_from(stability_bp.clamp(0, 10_000)).unwrap_or(10_000);
     }
 
     pub fn available_manpower(&self) -> u64 {
@@ -257,6 +259,7 @@ pub struct CountryRuntime {
     pub states: Box<[StateRuntime]>,
     pub stockpile: Stockpile,
     pub army_experience: u16,
+    pub stability_weekly_accumulator_bp: i32,
     pub fielded_divisions: u16,
     pub fielded_demand: EquipmentDemand,
     pub production_lines: Box<[ProductionLine]>,
@@ -289,6 +292,7 @@ impl CountryRuntime {
             states,
             stockpile: Stockpile::default(),
             army_experience: 0,
+            stability_weekly_accumulator_bp: 0,
             fielded_divisions: 0,
             fielded_demand: EquipmentDemand::default(),
             production_lines,
@@ -332,6 +336,7 @@ impl CountryRuntime {
         assert!(!self.research_slots.is_empty());
         assert!(self.country.stability_bp <= 10_000);
         assert!(self.country.war_support_bp <= 10_000);
+        assert!(self.stability_weekly_accumulator_bp.abs() < 7);
 
         assert_unique_strs(
             self.completed_focuses.iter().map(|focus| focus.id.as_ref()),
@@ -522,10 +527,21 @@ impl CountryRuntime {
     }
 
     pub fn available_manpower(&self, ideas: &[IdeaDefinition]) -> u64 {
-        let base = self.country.available_manpower();
-        let modifier_bp = 10_000 + self.idea_modifiers(ideas).manpower_bp;
+        let modifiers = self.idea_modifiers(ideas);
+        let recruitable_bp = i32::from(self.country.laws.mobilization.manpower_permyriad())
+            + modifiers.recruitable_population_bp;
+        let recruitable_bp = u64::try_from(recruitable_bp.clamp(0, i32::MAX)).unwrap_or_default();
+        let base = self.country.population.saturating_mul(recruitable_bp) / 10_000;
+        let modifier_bp = 10_000 + modifiers.manpower_bp;
         let modifier_bp = u64::try_from(modifier_bp.clamp(0, i32::MAX)).unwrap_or_default();
         base.saturating_mul(modifier_bp) / 10_000
+    }
+
+    pub fn next_daily_stability_drift_bp(&mut self, ideas: &[IdeaDefinition]) -> i32 {
+        self.stability_weekly_accumulator_bp += self.idea_modifiers(ideas).stability_weekly_bp;
+        let daily_bp = self.stability_weekly_accumulator_bp / 7;
+        self.stability_weekly_accumulator_bp -= daily_bp * 7;
+        daily_bp
     }
 
     pub fn add_idea(&mut self, id: impl Into<Box<str>>, duration_days: Option<u16>) {
@@ -740,7 +756,10 @@ impl FrancePlanningState {
 
 #[cfg(test)]
 mod tests {
-    use crate::domain::{CountryLaws, DivisionTemplate, EquipmentKind, GameDate, ResourceLedger};
+    use crate::domain::{
+        CountryLaws, DivisionTemplate, EquipmentKind, GameDate, IdeaDefinition, IdeaModifiers,
+        ResourceLedger,
+    };
     use crate::scenario::{France1936Scenario, Frontier};
     use crate::sim::actions::{ConstructionKind, StateId};
 
@@ -811,7 +830,7 @@ mod tests {
             40_000_000,
             CountryLaws::default(),
         );
-        country.advance_day(0);
+        country.advance_day(0, 0);
 
         assert_eq!(country.date, GameDate::new(1936, 1, 2));
         assert_eq!(country.political_power_centi, 2 * POLITICAL_POWER_UNIT);
@@ -849,6 +868,44 @@ mod tests {
         assert_eq!(runtime.total_military_factories(), 6);
         assert_eq!(runtime.consumer_goods_factories(ideas), 6);
         assert_eq!(runtime.available_civilian_factories(ideas), 8);
+    }
+
+    #[test]
+    fn country_runtime_applies_flat_and_scaled_manpower_modifiers() {
+        let runtime = test_runtime();
+        let ideas = [IdeaDefinition {
+            id: "FRA_service_reform".into(),
+            modifiers: IdeaModifiers {
+                recruitable_population_bp: 300,
+                manpower_bp: 2_500,
+                ..IdeaModifiers::default()
+            },
+        }];
+        let mut runtime = runtime;
+        runtime.add_idea("FRA_service_reform", None);
+
+        assert_eq!(runtime.available_manpower(&ideas), 2_750_000);
+    }
+
+    #[test]
+    fn country_runtime_accumulates_weekly_stability_without_losing_basis_points() {
+        let mut runtime = test_runtime();
+        let ideas = [IdeaDefinition {
+            id: "FRA_home_front".into(),
+            modifiers: IdeaModifiers {
+                stability_weekly_bp: 25,
+                ..IdeaModifiers::default()
+            },
+        }];
+        runtime.add_idea("FRA_home_front", None);
+
+        for _ in 0..14 {
+            let drift_bp = runtime.next_daily_stability_drift_bp(&ideas);
+            runtime.country.advance_day(0, drift_bp);
+        }
+
+        assert_eq!(runtime.country.stability_bp, 5_050);
+        assert_eq!(runtime.stability_weekly_accumulator_bp, 0);
     }
 
     #[test]
