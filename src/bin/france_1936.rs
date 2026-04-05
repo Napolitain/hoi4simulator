@@ -60,9 +60,16 @@ fn run() -> Result<(), String> {
         BeamSearchConfig::new(8, 35),
         PlannerWeights::default(),
     );
-    let plan = planner
-        .plan()
-        .map_err(|error| format!("planner failed: {error:?}"))?;
+    let (plan, hard_requirements_met) = match planner.plan() {
+        Ok(plan) => (plan, true),
+        Err(hoi4simulator::sim::SimulationError::HardRequirementsUnsatisfied) => (
+            planner
+                .best_effort_plan()
+                .map_err(|error| format!("planner failed: {error:?}"))?,
+            false,
+        ),
+        Err(error) => return Err(format!("planner failed: {error:?}")),
+    };
     let per_division_demand = scenario.force_plan.template.per_division_demand();
 
     println!("profile: {}", profile);
@@ -93,6 +100,7 @@ fn run() -> Result<(), String> {
         plan.final_state
             .supported_divisions(per_division_demand, &scenario.ideas)
     );
+    println!("hard requirements met: {}", hard_requirements_met);
     println!(
         "frontier forts complete: {}",
         plan.final_state

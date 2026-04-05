@@ -23,5 +23,6 @@ pub use research::{
 pub use resources::{ResourceKind, ResourceLedger};
 pub use templates::{
     DivisionTemplate, EquipmentDemand, EquipmentKind, EquipmentProfile, EquipmentReserveRatios,
-    ModeledEquipmentProfiles, SupportCompanies, TemplateDesignConstraints, TemplateFitness,
+    FieldedDivision, ModeledEquipmentProfiles, SupportCompanies, TemplateDesignConstraints,
+    TemplateFitness,
 };

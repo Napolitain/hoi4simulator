@@ -120,7 +120,7 @@ pub struct ForcePlan {
     pub template: DivisionTemplate,
     pub frontline_divisions: u16,
     pub frontline_demand: EquipmentDemand,
-    pub starting_fielded_demand: EquipmentDemand,
+    pub starting_fielded_equipped_demand: EquipmentDemand,
     pub reserve_demand: EquipmentDemand,
     pub stockpile_target_demand: EquipmentDemand,
     pub total_demand: EquipmentDemand,

@@ -3,8 +3,8 @@ use fory::ForyObject;
 use crate::data::{DataError, StructuredFrance1936Dataset};
 use crate::domain::{
     CountryLaws, DivisionTemplate, EquipmentDemand, EquipmentFactoryAllocation, EquipmentKind,
-    ForceGoalSpec, ForcePlan, GameDate, HardFocusGoal, IdeaDefinition, Milestone, MilestoneKind,
-    ModeledEquipmentProfiles, NationalFocus, PivotWindow, ResourceLedger, TechId,
+    FieldedDivision, ForceGoalSpec, ForcePlan, GameDate, HardFocusGoal, IdeaDefinition, Milestone,
+    MilestoneKind, ModeledEquipmentProfiles, NationalFocus, PivotWindow, ResourceLedger, TechId,
     TechnologyModifiers, TechnologyNode, TechnologyTree,
 };
 use crate::sim::{
@@ -37,6 +37,8 @@ pub struct France1936Scenario {
     pub equipment_profiles: ModeledEquipmentProfiles,
     pub domestic_resources: ResourceLedger,
     pub starting_fielded_divisions: u16,
+    pub starting_fielded_equipped_demand: Option<EquipmentDemand>,
+    pub starting_fielded_force: Box<[FieldedDivision]>,
     pub starting_research_slots: u8,
     pub starting_ideas: Box<[Box<str>]>,
     pub starting_country_flags: Box<[Box<str>]>,
@@ -346,6 +348,7 @@ impl France1936Scenario {
             force_goal,
             equipment_profiles,
             starting_fielded_divisions,
+            None,
         );
 
         Self {
@@ -358,6 +361,8 @@ impl France1936Scenario {
             equipment_profiles,
             domestic_resources,
             starting_fielded_divisions,
+            starting_fielded_equipped_demand: None,
+            starting_fielded_force: Vec::new().into_boxed_slice(),
             starting_research_slots: 2,
             starting_ideas: Vec::new().into_boxed_slice(),
             starting_country_flags: Vec::new().into_boxed_slice(),
@@ -489,6 +494,7 @@ impl France1936Scenario {
             dataset
                 .starting_fielded_divisions
                 .max(force_goal.division_band().min),
+            None,
         );
 
         let economic_construction_order = sorted_state_ids(
@@ -569,6 +575,8 @@ impl France1936Scenario {
             equipment_profiles: dataset.equipment_profiles,
             domestic_resources,
             starting_fielded_divisions: dataset.starting_fielded_divisions,
+            starting_fielded_equipped_demand: None,
+            starting_fielded_force: Vec::new().into_boxed_slice(),
             starting_research_slots: 2,
             starting_ideas: Vec::new().into_boxed_slice(),
             starting_country_flags: Vec::new().into_boxed_slice(),
@@ -597,12 +605,16 @@ impl France1936Scenario {
             self.initial_production_lines.clone(),
         )
         .with_research_slots(self.starting_research_slots)
-        .with_equipment_profiles(self.equipment_profiles)
-        .with_fielded_force(
-            self.starting_fielded_divisions
-                .min(self.force_plan.frontline_divisions),
-            self.force_plan.template.per_division_demand(),
-        );
+        .with_equipment_profiles(self.equipment_profiles);
+        runtime = if self.starting_fielded_force.is_empty() {
+            runtime.with_fielded_force(
+                self.starting_fielded_divisions
+                    .min(self.force_plan.frontline_divisions),
+                self.force_plan.template.per_division_demand(),
+            )
+        } else {
+            runtime.with_exact_fielded_force(self.starting_fielded_force.clone())
+        };
 
         for idea in self.starting_ideas.iter().cloned() {
             runtime.add_idea(idea, None);
@@ -655,6 +667,7 @@ impl France1936Scenario {
             self.force_goal,
             self.equipment_profiles,
             self.starting_fielded_divisions,
+            self.starting_fielded_equipped_demand,
         );
         self
     }
@@ -686,6 +699,35 @@ impl France1936Scenario {
             self.force_goal,
             self.equipment_profiles,
             self.starting_fielded_divisions,
+            self.starting_fielded_equipped_demand,
+        );
+        self
+    }
+
+    pub fn with_exact_fielded_force_data(mut self, fielded_force: Vec<FieldedDivision>) -> Self {
+        let starting_fielded_divisions = fielded_force
+            .iter()
+            .filter(|division| division.target_demand.has_equipment())
+            .count();
+        let starting_fielded_equipped_demand = fielded_force
+            .iter()
+            .filter(|division| division.target_demand.has_equipment())
+            .fold(EquipmentDemand::default(), |total, division| {
+                total.plus(division.equipped_demand)
+            });
+
+        self.starting_fielded_divisions =
+            u16::try_from(starting_fielded_divisions).unwrap_or(u16::MAX);
+        self.starting_fielded_equipped_demand = Some(starting_fielded_equipped_demand);
+        self.starting_fielded_force = fielded_force.into_boxed_slice();
+        self.force_plan = Self::derive_force_plan(
+            self.start_date,
+            self.initial_country.population,
+            self.domestic_resources,
+            self.force_goal,
+            self.equipment_profiles,
+            self.starting_fielded_divisions,
+            self.starting_fielded_equipped_demand,
         );
         self
     }
@@ -794,6 +836,7 @@ impl France1936Scenario {
         force_goal: ForceGoalSpec,
         equipment_profiles: ModeledEquipmentProfiles,
         starting_fielded_divisions: u16,
+        exact_starting_fielded_equipped_demand: Option<EquipmentDemand>,
     ) -> ForcePlan {
         let division_band = force_goal.division_band();
         let min_divisions = division_band
@@ -817,11 +860,13 @@ impl France1936Scenario {
                     continue;
                 }
 
-                let starting_fielded_demand =
-                    template.demand_for(starting_fielded_divisions.min(divisions));
+                let starting_fielded_equipped_demand = exact_starting_fielded_equipped_demand
+                    .unwrap_or_else(|| {
+                        template.demand_for(starting_fielded_divisions.min(divisions))
+                    });
                 let reserve_demand = frontline_demand.reserve_buffer(force_goal.reserve_ratios);
                 let stockpile_target_demand = frontline_demand
-                    .saturating_sub(starting_fielded_demand)
+                    .saturating_sub(starting_fielded_equipped_demand.without_manpower())
                     .plus(reserve_demand);
                 let total_demand = frontline_demand.plus(reserve_demand);
                 let factory_allocation = derive_factory_allocation(
@@ -847,7 +892,7 @@ impl France1936Scenario {
                     template,
                     frontline_divisions: divisions,
                     frontline_demand,
-                    starting_fielded_demand,
+                    starting_fielded_equipped_demand,
                     reserve_demand,
                     stockpile_target_demand,
                     total_demand,
@@ -866,11 +911,13 @@ impl France1936Scenario {
         best_plan.map(|(_, plan)| plan).unwrap_or_else(|| {
             let template = DivisionTemplate::canonical_france_line();
             let frontline_demand = template.demand_for(min_divisions);
-            let starting_fielded_demand =
-                template.demand_for(starting_fielded_divisions.min(min_divisions));
+            let starting_fielded_equipped_demand = exact_starting_fielded_equipped_demand
+                .unwrap_or_else(|| {
+                    template.demand_for(starting_fielded_divisions.min(min_divisions))
+                });
             let reserve_demand = frontline_demand.reserve_buffer(force_goal.reserve_ratios);
             let stockpile_target_demand = frontline_demand
-                .saturating_sub(starting_fielded_demand)
+                .saturating_sub(starting_fielded_equipped_demand.without_manpower())
                 .plus(reserve_demand);
             let total_demand = frontline_demand.plus(reserve_demand);
             let factory_allocation = derive_factory_allocation(
@@ -886,7 +933,7 @@ impl France1936Scenario {
                 template,
                 frontline_divisions: min_divisions,
                 frontline_demand,
-                starting_fielded_demand,
+                starting_fielded_equipped_demand,
                 reserve_demand,
                 stockpile_target_demand,
                 total_demand,
@@ -1069,8 +1116,8 @@ fn frontier_order_priority(frontier: Option<Frontier>) -> u8 {
 mod tests {
     use crate::data::{StructuredFrance1936Dataset, StructuredProductionLine, StructuredState};
     use crate::domain::{
-        CountryLaws, EquipmentKind, IdeaDefinition, IdeaModifiers, MilestoneKind,
-        ModeledEquipmentProfiles, ResourceLedger, TargetBand,
+        CountryLaws, EquipmentDemand, EquipmentKind, FieldedDivision, IdeaDefinition,
+        IdeaModifiers, MilestoneKind, ModeledEquipmentProfiles, ResourceLedger, TargetBand,
     };
     use crate::scenario::CountryScenario;
 
@@ -1273,5 +1320,36 @@ mod tests {
         );
 
         assert!(boosted.domestic_resources.total() > scenario.domestic_resources.total());
+    }
+
+    #[test]
+    fn exact_fielded_force_data_increases_stockpile_target_for_understrength_start() {
+        let scenario = France1936Scenario::standard();
+        let baseline = scenario
+            .force_plan
+            .stockpile_target_demand
+            .infantry_equipment;
+        let demand = EquipmentDemand {
+            infantry_equipment: 1_000,
+            support_equipment: 0,
+            artillery: 0,
+            anti_tank: 0,
+            anti_air: 0,
+            manpower: 1_000,
+        };
+        let exact = scenario.with_exact_fielded_force_data(vec![
+            FieldedDivision::new(
+                demand,
+                demand.scale_equipment_basis_points(5_000)
+            );
+            72
+        ]);
+
+        assert_eq!(exact.starting_fielded_divisions, 72);
+        assert!(exact.starting_fielded_equipped_demand.is_some());
+        assert!(
+            exact.force_plan.stockpile_target_demand.infantry_equipment > baseline,
+            "exact fielded force should include the opening reinforcement gap"
+        );
     }
 }

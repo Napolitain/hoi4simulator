@@ -75,6 +75,10 @@ impl FranceBeamPlanner {
         Err(SimulationError::HardRequirementsUnsatisfied)
     }
 
+    pub fn best_effort_plan(&self) -> Result<PlannedSolution, SimulationError> {
+        self.search(self.config)
+    }
+
     fn search(&self, config: BeamSearchConfig) -> Result<PlannedSolution, SimulationError> {
         let end_date = self.scenario.milestones[3].date;
         let mut frontier = self.seed_nodes(config);
@@ -84,6 +88,7 @@ impl FranceBeamPlanner {
             .any(|node| node.runtime.country.date < end_date)
         {
             let mut next_frontier = Vec::with_capacity(frontier.len());
+            let mut last_error = None;
 
             for node in frontier.into_iter() {
                 if node.runtime.country.date >= end_date {
@@ -100,21 +105,41 @@ impl FranceBeamPlanner {
                 let mut child_actions = node.actions.clone();
                 child_actions.extend(window_actions.iter().cloned());
 
-                let outcome = self.simulator.simulate(
+                let outcome = match self.simulator.simulate(
                     &self.scenario,
                     node.runtime.clone(),
                     &window_actions,
                     window_end,
                     node.pivot_date,
-                )?;
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        last_error = Some(error);
+                        continue;
+                    }
+                };
+
+                let mut next_runtime = outcome.country;
+                if window_end < end_date {
+                    let stability_drift_bp =
+                        next_runtime.next_daily_stability_drift_bp(&self.scenario.ideas);
+                    next_runtime.country.advance_day(
+                        next_runtime.political_power_daily_bonus_centi(&self.scenario.ideas),
+                        stability_drift_bp,
+                    );
+                    next_runtime.tick_active_ideas();
+                }
 
                 next_frontier.push(PlannerNode {
                     template: node.template,
                     pivot_date: node.pivot_date,
                     actions: child_actions,
-                    score: self.score(&outcome.country),
-                    runtime: outcome.country,
+                    score: self.score(&next_runtime),
+                    runtime: next_runtime,
                 });
+            }
+            if next_frontier.is_empty() {
+                return Err(last_error.unwrap_or(SimulationError::HardRequirementsUnsatisfied));
             }
 
             next_frontier.sort_by(|left, right| {
@@ -1270,6 +1295,29 @@ mod tests {
         ));
         assert_eq!(plan.final_state.country.date, scenario.milestones[3].date);
         assert!(!plan.actions.is_empty());
+    }
+
+    #[test]
+    fn france_beam_planner_plan_replays_to_the_same_final_state() {
+        let scenario = France1936Scenario::standard();
+        let planner = FranceBeamPlanner::new(
+            scenario.clone(),
+            SimulationEngine::default(),
+            crate::solver::BeamSearchConfig::new(4, 35),
+            crate::solver::PlannerWeights::default(),
+        );
+        let plan = planner.plan().unwrap();
+        let replay = SimulationEngine::default()
+            .simulate(
+                &scenario,
+                scenario.bootstrap_runtime(),
+                &plan.actions,
+                scenario.milestones[3].date,
+                plan.pivot_date,
+            )
+            .unwrap();
+
+        assert_eq!(replay.country, plan.final_state);
     }
 
     #[test]

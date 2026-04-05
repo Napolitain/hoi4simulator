@@ -48,6 +48,7 @@ pub enum SimulationError {
     ActionDateOutOfRange(GameDate),
     InvalidState(super::actions::StateId),
     NoFreeFactorySlot(super::actions::StateId),
+    ConstructionCapReached(super::actions::StateId, ConstructionKind),
     FocusAlreadyInProgress,
     FocusUnavailable(Box<str>),
     UnknownFocus(Box<str>),
@@ -280,6 +281,26 @@ impl SimulationEngine {
             if runtime.free_slots(definition) <= queued {
                 return Err(SimulationError::NoFreeFactorySlot(action.state));
             }
+        }
+        if matches!(action.kind, ConstructionKind::Infrastructure)
+            && runtime.infrastructure.saturating_add(
+                country.queued_kind_projects(action.state, ConstructionKind::Infrastructure),
+            ) >= 10
+        {
+            return Err(SimulationError::ConstructionCapReached(
+                action.state,
+                action.kind,
+            ));
+        }
+        if matches!(action.kind, ConstructionKind::LandFort)
+            && runtime.land_fort_level.saturating_add(
+                country.queued_kind_projects(action.state, ConstructionKind::LandFort),
+            ) >= 10
+        {
+            return Err(SimulationError::ConstructionCapReached(
+                action.state,
+                action.kind,
+            ));
         }
 
         country.construction_queue.push(ConstructionProject {
@@ -593,8 +614,12 @@ impl SimulationEngine {
         match project.kind {
             ConstructionKind::CivilianFactory => state.civilian_factories += 1,
             ConstructionKind::MilitaryFactory => state.military_factories += 1,
-            ConstructionKind::Infrastructure => state.infrastructure += 1,
-            ConstructionKind::LandFort => state.land_fort_level += 1,
+            ConstructionKind::Infrastructure => {
+                state.infrastructure = state.infrastructure.saturating_add(1).min(10)
+            }
+            ConstructionKind::LandFort => {
+                state.land_fort_level = state.land_fort_level.saturating_add(1).min(10)
+            }
         }
     }
 
@@ -988,8 +1013,18 @@ impl SimulationEngine {
             FocusBuildingKind::MilitaryFactory => {
                 country.states[state_index].military_factories += 1
             }
-            FocusBuildingKind::Infrastructure => country.states[state_index].infrastructure += 1,
-            FocusBuildingKind::LandFort => country.states[state_index].land_fort_level += 1,
+            FocusBuildingKind::Infrastructure => {
+                country.states[state_index].infrastructure = country.states[state_index]
+                    .infrastructure
+                    .saturating_add(1)
+                    .min(10)
+            }
+            FocusBuildingKind::LandFort => {
+                country.states[state_index].land_fort_level = country.states[state_index]
+                    .land_fort_level
+                    .saturating_add(1)
+                    .min(10)
+            }
         }
     }
 
@@ -1255,6 +1290,49 @@ mod tests {
     }
 
     #[test]
+    fn simulator_rejects_infrastructure_above_level_ten() {
+        let scenario = France1936Scenario::standard();
+        let mut runtime = scenario.bootstrap_runtime();
+        let engine = SimulationEngine::default();
+        let date = GameDate::new(1936, 1, 1);
+        runtime.state_defs[usize::from(France1936Scenario::ILE_DE_FRANCE.0)]
+            .infrastructure_target = 10;
+        let actions = [
+            Action::Construction(ConstructionAction {
+                date,
+                state: France1936Scenario::ILE_DE_FRANCE,
+                kind: ConstructionKind::Infrastructure,
+            }),
+            Action::Construction(ConstructionAction {
+                date,
+                state: France1936Scenario::ILE_DE_FRANCE,
+                kind: ConstructionKind::Infrastructure,
+            }),
+            Action::Construction(ConstructionAction {
+                date,
+                state: France1936Scenario::ILE_DE_FRANCE,
+                kind: ConstructionKind::Infrastructure,
+            }),
+        ];
+
+        let result = engine.simulate(
+            &scenario,
+            runtime,
+            &actions,
+            date,
+            scenario.pivot_window.start,
+        );
+
+        assert_eq!(
+            result,
+            Err(SimulationError::ConstructionCapReached(
+                France1936Scenario::ILE_DE_FRANCE,
+                ConstructionKind::Infrastructure,
+            ))
+        );
+    }
+
+    #[test]
     fn simulator_rejects_pre_pivot_military_construction() {
         let scenario = France1936Scenario::standard();
         let runtime = scenario.bootstrap_runtime();
@@ -1277,6 +1355,22 @@ mod tests {
             result,
             Err(SimulationError::HeuristicViolation(_))
         ));
+    }
+
+    #[test]
+    fn focus_building_completion_clamps_infrastructure_and_land_forts() {
+        let scenario = France1936Scenario::standard();
+        let mut runtime = scenario.bootstrap_runtime();
+        let engine = SimulationEngine::default();
+        let state_index = usize::from(France1936Scenario::ILE_DE_FRANCE.0);
+        runtime.states[state_index].infrastructure = 10;
+        runtime.states[state_index].land_fort_level = 10;
+
+        engine.finish_focus_building(&mut runtime, state_index, FocusBuildingKind::Infrastructure);
+        engine.finish_focus_building(&mut runtime, state_index, FocusBuildingKind::LandFort);
+
+        assert_eq!(runtime.states[state_index].infrastructure, 10);
+        assert_eq!(runtime.states[state_index].land_fort_level, 10);
     }
 
     #[test]

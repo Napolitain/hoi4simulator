@@ -9,11 +9,11 @@ use fory::{Fory, ForyDefault, ForyObject, Serializer};
 use fory_core::StructSerializer;
 
 use crate::domain::{
-    CountryLaws, DoctrineCostReduction, EconomyLaw, EquipmentKind, EquipmentProfile,
-    FocusBuildingKind, FocusCondition, FocusEffect, FocusStateScope, IdeaDefinition, IdeaModifiers,
-    MobilizationLaw, ModeledEquipmentProfiles, NationalFocus, ResearchBranch, ResourceLedger,
-    StateCondition, StateOperation, StateScopedEffects, TechId, TechnologyModifiers,
-    TechnologyNode, TechnologyTree, TradeLaw,
+    CountryLaws, DoctrineCostReduction, EconomyLaw, EquipmentDemand, EquipmentKind,
+    EquipmentProfile, FieldedDivision, FocusBuildingKind, FocusCondition, FocusEffect,
+    FocusStateScope, IdeaDefinition, IdeaModifiers, MobilizationLaw, ModeledEquipmentProfiles,
+    NationalFocus, ResearchBranch, ResourceLedger, StateCondition, StateOperation,
+    StateScopedEffects, TechId, TechnologyModifiers, TechnologyNode, TechnologyTree, TradeLaw,
 };
 use crate::scenario::{France1936Scenario, Frontier};
 
@@ -267,13 +267,18 @@ pub fn load_france_1936_scenario(
 ) -> Result<France1936Scenario, DataError> {
     let dataset = load_france_1936_dataset(paths)?;
     let mut scenario = France1936Scenario::from_dataset(dataset)?;
-    let equipment_catalog =
-        resolve_equipment_catalog(&parse_equipment_definitions(&paths.raw_root())?)?;
-    let setup = extract_exact_country_setup(&parse_country_history(&paths.raw_root(), "FRA")?);
-    let focuses = parse_france_focuses(&paths.raw_root())?;
+    let raw_root = paths.raw_root();
+    let equipment_catalog = resolve_equipment_catalog(&parse_equipment_definitions(&raw_root)?)?;
+    let country_history = parse_country_history(&raw_root, "FRA")?;
+    let setup = extract_exact_country_setup(&country_history);
+    let focuses = parse_france_focuses(&raw_root)?;
     let idea_ids = referenced_idea_ids(&focuses, &setup.starting_ideas);
-    let ideas = parse_idea_definitions(&paths.raw_root(), &idea_ids)?;
-    let technologies = parse_technology_tree(&paths.raw_root(), &equipment_catalog)?;
+    let ideas = parse_idea_definitions(&raw_root, &idea_ids)?;
+    let technologies = parse_technology_tree(&raw_root, &equipment_catalog)?;
+    let mut oob_warnings = Vec::new();
+    if let Some(oob) = load_france_1936_oob(&raw_root, &country_history, &mut oob_warnings)? {
+        scenario = scenario.with_exact_fielded_force_data(extract_exact_fielded_force(&oob)?);
+    }
 
     scenario.initial_country.stability_bp = setup.starting_stability_bp;
     scenario.initial_country.war_support_bp = setup.starting_war_support_bp;
@@ -2309,6 +2314,161 @@ fn load_france_1936_oob(
     .map(Some)
 }
 
+fn extract_exact_fielded_force(oob: &ClausewitzBlock) -> Result<Vec<FieldedDivision>, DataError> {
+    let templates = parse_exact_division_templates(oob)?;
+    let mut division_blocks = Vec::new();
+    collect_named_blocks(oob, "division", &mut division_blocks);
+    let mut divisions = Vec::with_capacity(division_blocks.len());
+
+    for division in division_blocks {
+        let template_name = division
+            .first_assignment("division_template")
+            .and_then(ClausewitzValue::as_str)
+            .ok_or_else(|| {
+                DataError::Validation(
+                    "France 1936 OOB division was missing a division_template".to_string(),
+                )
+            })?;
+        let target_demand = *templates.get(template_name).ok_or_else(|| {
+            DataError::Validation(format!(
+                "France 1936 OOB referenced unknown division template {template_name}"
+            ))
+        })?;
+        let equipment_factor_bp = division
+            .first_assignment("start_equipment_factor")
+            .and_then(clausewitz_percent_bp)
+            .unwrap_or(10_000);
+        let equipped_demand = target_demand.scale_equipment_basis_points(equipment_factor_bp);
+        divisions.push(FieldedDivision::new(target_demand, equipped_demand));
+    }
+
+    Ok(divisions)
+}
+
+fn parse_exact_division_templates(
+    oob: &ClausewitzBlock,
+) -> Result<HashMap<Box<str>, EquipmentDemand>, DataError> {
+    let mut template_blocks = Vec::new();
+    collect_named_blocks(oob, "division_template", &mut template_blocks);
+    let mut templates = HashMap::with_capacity(template_blocks.len());
+
+    for template in template_blocks {
+        let name = template
+            .first_assignment("name")
+            .and_then(ClausewitzValue::as_str)
+            .ok_or_else(|| {
+                DataError::Validation(
+                    "France 1936 OOB division template was missing a name".to_string(),
+                )
+            })?;
+        let mut demand = EquipmentDemand::default();
+
+        if let Some(regiments) = template
+            .first_assignment("regiments")
+            .and_then(ClausewitzValue::as_block)
+        {
+            apply_template_section_demand(regiments, &mut demand, TemplateSection::Regiments)?;
+        }
+        if let Some(support) = template
+            .first_assignment("support")
+            .and_then(ClausewitzValue::as_block)
+        {
+            apply_template_section_demand(support, &mut demand, TemplateSection::Support)?;
+        }
+
+        if templates.insert(name.into(), demand).is_some() {
+            return Err(DataError::Validation(format!(
+                "France 1936 OOB repeated division template {name}"
+            )));
+        }
+    }
+
+    Ok(templates)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TemplateSection {
+    Regiments,
+    Support,
+}
+
+fn apply_template_section_demand(
+    block: &ClausewitzBlock,
+    demand: &mut EquipmentDemand,
+    section: TemplateSection,
+) -> Result<(), DataError> {
+    for item in &block.items {
+        let ClausewitzItem::Assignment(assignment) = item else {
+            continue;
+        };
+        match section {
+            TemplateSection::Regiments => add_regiment_demand(assignment.key.as_ref(), demand)?,
+            TemplateSection::Support => add_support_demand(assignment.key.as_ref(), demand)?,
+        }
+    }
+
+    Ok(())
+}
+
+fn add_regiment_demand(token: &str, demand: &mut EquipmentDemand) -> Result<(), DataError> {
+    match token {
+        "infantry" | "mountaineers" | "cavalry" | "motorized" => {
+            demand.infantry_equipment += 1_000;
+            demand.manpower += 1_000;
+        }
+        "artillery" => {
+            demand.artillery += 36;
+            demand.manpower += 500;
+        }
+        "anti_tank" => {
+            demand.anti_tank += 36;
+            demand.manpower += 500;
+        }
+        "anti_air" => {
+            demand.anti_air += 36;
+            demand.manpower += 500;
+        }
+        "light_armor" => {
+            demand.manpower += 500;
+        }
+        _ => {
+            return Err(DataError::Validation(format!(
+                "France 1936 OOB used unsupported regiment token {token}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn add_support_demand(token: &str, demand: &mut EquipmentDemand) -> Result<(), DataError> {
+    match token {
+        "engineer" | "recon" | "mot_recon" => {
+            demand.support_equipment += 30;
+            demand.manpower += 300;
+        }
+        "artillery" => {
+            demand.artillery += 36;
+            demand.manpower += 500;
+        }
+        "anti_tank" => {
+            demand.anti_tank += 24;
+            demand.manpower += 300;
+        }
+        "anti_air" => {
+            demand.anti_air += 24;
+            demand.manpower += 300;
+        }
+        _ => {
+            return Err(DataError::Validation(format!(
+                "France 1936 OOB used unsupported support token {token}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 fn extract_production_equipment_token(block: &ClausewitzBlock) -> Option<String> {
     let equipment = block.first_assignment("equipment")?;
     match equipment {
@@ -2735,15 +2895,15 @@ mod tests {
 
     use crate::data::clausewitz::parse_clausewitz;
     use crate::domain::{
-        CountryLaws, DoctrineCostReduction, EconomyLaw, EquipmentKind, FocusCondition, FocusEffect,
-        IdeaModifiers, MobilizationLaw, TradeLaw,
+        CountryLaws, DoctrineCostReduction, EconomyLaw, EquipmentDemand, EquipmentKind,
+        FocusCondition, FocusEffect, IdeaModifiers, MobilizationLaw, TradeLaw,
     };
 
     use super::{
-        DataProfilePaths, extract_exact_country_setup, ingest_profile, load_france_1936_dataset,
-        load_france_1936_scenario, parse_equipment_definitions, parse_focus_condition_block,
-        parse_focus_effects_block, parse_idea_modifiers, parse_technology_tree,
-        resolve_equipment_catalog,
+        DataProfilePaths, extract_exact_country_setup, extract_exact_fielded_force, ingest_profile,
+        load_france_1936_dataset, load_france_1936_scenario, parse_equipment_definitions,
+        parse_focus_condition_block, parse_focus_effects_block, parse_idea_modifiers,
+        parse_technology_tree, resolve_equipment_catalog,
     };
 
     #[test]
@@ -2995,6 +3155,70 @@ mod tests {
             artillery.equipment_unlocks[0].kind,
             EquipmentKind::Artillery
         );
+    }
+
+    #[test]
+    fn exact_fielded_force_parser_uses_oob_templates_and_equipment_factors() {
+        let root = parse_clausewitz(
+            r#"
+            division_template = {
+                name = "Division d'Infanterie"
+                regiments = {
+                    infantry = { x = 0 y = 0 }
+                    infantry = { x = 0 y = 1 }
+                }
+                support = {
+                    engineer = { x = 0 y = 0 }
+                    artillery = { x = 0 y = 1 }
+                }
+            }
+            division_template = {
+                name = "Brigade de Chars de Combat"
+                regiments = {
+                    light_armor = { x = 0 y = 0 }
+                    light_armor = { x = 0 y = 1 }
+                }
+            }
+            units = {
+                division = {
+                    division_template = "Division d'Infanterie"
+                    start_equipment_factor = 0.5
+                }
+                division = {
+                    division_template = "Brigade de Chars de Combat"
+                }
+            }
+            "#,
+        )
+        .unwrap();
+
+        let divisions = extract_exact_fielded_force(&root).unwrap();
+
+        assert_eq!(divisions.len(), 2);
+        assert_eq!(
+            divisions[0].target_demand,
+            EquipmentDemand {
+                infantry_equipment: 2_000,
+                support_equipment: 30,
+                artillery: 36,
+                anti_tank: 0,
+                anti_air: 0,
+                manpower: 2_800,
+            }
+        );
+        assert_eq!(
+            divisions[0].equipped_demand,
+            EquipmentDemand {
+                infantry_equipment: 1_000,
+                support_equipment: 15,
+                artillery: 18,
+                anti_tank: 0,
+                anti_air: 0,
+                manpower: 2_800,
+            }
+        );
+        assert!(!divisions[1].target_demand.has_equipment());
+        assert_eq!(divisions[1].target_demand.manpower, 1_000);
     }
 
     #[test]

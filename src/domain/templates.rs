@@ -22,6 +22,12 @@ pub struct EquipmentDemand {
     pub manpower: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct FieldedDivision {
+    pub target_demand: EquipmentDemand,
+    pub equipped_demand: EquipmentDemand,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EquipmentReserveRatios {
     pub infantry_equipment_bp: u16,
@@ -134,6 +140,12 @@ impl EquipmentDemand {
         }
     }
 
+    pub fn scale_equipment_basis_points(self, basis_points: u16) -> Self {
+        let mut scaled = self.scale_basis_points(basis_points);
+        scaled.manpower = self.manpower;
+        scaled
+    }
+
     pub fn reserve_buffer(self, reserve_ratios: EquipmentReserveRatios) -> Self {
         Self {
             infantry_equipment: self
@@ -158,6 +170,41 @@ impl EquipmentDemand {
                 .div_ceil(10_000),
             manpower: 0,
         }
+    }
+
+    pub const fn has_equipment(self) -> bool {
+        self.infantry_equipment > 0
+            || self.support_equipment > 0
+            || self.artillery > 0
+            || self.anti_tank > 0
+            || self.anti_air > 0
+    }
+
+    pub fn without_manpower(self) -> Self {
+        Self {
+            manpower: 0,
+            ..self
+        }
+    }
+}
+
+impl FieldedDivision {
+    pub fn new(target_demand: EquipmentDemand, equipped_demand: EquipmentDemand) -> Self {
+        assert!(equipped_demand.infantry_equipment <= target_demand.infantry_equipment);
+        assert!(equipped_demand.support_equipment <= target_demand.support_equipment);
+        assert!(equipped_demand.artillery <= target_demand.artillery);
+        assert!(equipped_demand.anti_tank <= target_demand.anti_tank);
+        assert!(equipped_demand.anti_air <= target_demand.anti_air);
+        assert_eq!(equipped_demand.manpower, target_demand.manpower);
+
+        Self {
+            target_demand,
+            equipped_demand,
+        }
+    }
+
+    pub fn reinforcement_gap(self) -> EquipmentDemand {
+        self.target_demand.saturating_sub(self.equipped_demand)
     }
 }
 
@@ -432,7 +479,7 @@ mod tests {
     use crate::domain::ResourceLedger;
 
     use super::{
-        DivisionTemplate, EquipmentDemand, EquipmentKind, EquipmentReserveRatios,
+        DivisionTemplate, EquipmentDemand, EquipmentKind, EquipmentReserveRatios, FieldedDivision,
         ModeledEquipmentProfiles, TemplateDesignConstraints,
     };
 
@@ -577,6 +624,56 @@ mod tests {
                 anti_tank: 0,
                 anti_air: 0,
                 manpower: 2_000,
+            }
+        );
+    }
+
+    #[test]
+    fn equipment_only_scaling_preserves_fielded_manpower() {
+        let demand = EquipmentDemand {
+            infantry_equipment: 8_000,
+            support_equipment: 60,
+            artillery: 36,
+            anti_tank: 0,
+            anti_air: 0,
+            manpower: 9_800,
+        };
+
+        assert_eq!(
+            demand.scale_equipment_basis_points(5_000),
+            EquipmentDemand {
+                infantry_equipment: 4_000,
+                support_equipment: 30,
+                artillery: 18,
+                anti_tank: 0,
+                anti_air: 0,
+                manpower: 9_800,
+            }
+        );
+    }
+
+    #[test]
+    fn fielded_division_tracks_reinforcement_gap_without_double_counting_manpower() {
+        let target = EquipmentDemand {
+            infantry_equipment: 8_000,
+            support_equipment: 60,
+            artillery: 36,
+            anti_tank: 0,
+            anti_air: 0,
+            manpower: 9_800,
+        };
+        let equipped = target.scale_equipment_basis_points(5_000);
+        let division = FieldedDivision::new(target, equipped);
+
+        assert_eq!(
+            division.reinforcement_gap(),
+            EquipmentDemand {
+                infantry_equipment: 4_000,
+                support_equipment: 30,
+                artillery: 18,
+                anti_tank: 0,
+                anti_air: 0,
+                manpower: 0,
             }
         );
     }

@@ -1,7 +1,7 @@
 use crate::domain::{
-    CountryLaws, DoctrineCostReduction, EquipmentDemand, EquipmentKind, FocusBuildingKind,
-    GameDate, IdeaDefinition, IdeaModifiers, ModeledEquipmentProfiles, ResourceLedger, TechId,
-    TechnologyModifiers, TechnologyNode, TechnologyTree,
+    CountryLaws, DoctrineCostReduction, EquipmentDemand, EquipmentKind, FieldedDivision,
+    FocusBuildingKind, GameDate, IdeaDefinition, IdeaModifiers, ModeledEquipmentProfiles,
+    ResourceLedger, TechId, TechnologyModifiers, TechnologyNode, TechnologyTree,
 };
 use crate::scenario::{Frontier, FrontierFortRequirement};
 
@@ -144,6 +144,29 @@ impl Stockpile {
         }
     }
 
+    pub fn covers(self, demand: EquipmentDemand) -> bool {
+        self.infantry_equipment >= demand.infantry_equipment
+            && self.support_equipment >= demand.support_equipment
+            && self.artillery >= demand.artillery
+            && self.anti_tank >= demand.anti_tank
+            && self.anti_air >= demand.anti_air
+    }
+
+    pub fn saturating_sub_demand(self, demand: EquipmentDemand) -> Self {
+        Self {
+            infantry_equipment: self
+                .infantry_equipment
+                .saturating_sub(demand.infantry_equipment),
+            support_equipment: self
+                .support_equipment
+                .saturating_sub(demand.support_equipment),
+            artillery: self.artillery.saturating_sub(demand.artillery),
+            anti_tank: self.anti_tank.saturating_sub(demand.anti_tank),
+            anti_air: self.anti_air.saturating_sub(demand.anti_air),
+            unmodeled_equipment: self.unmodeled_equipment,
+        }
+    }
+
     pub fn ready_divisions(self, demand: EquipmentDemand, manpower_available: u64) -> u16 {
         assert!(demand.infantry_equipment > 0);
         assert!(demand.manpower > 0);
@@ -281,6 +304,7 @@ pub struct CountryRuntime {
     pub stability_weekly_accumulator_bp: i32,
     pub fielded_divisions: u16,
     pub fielded_demand: EquipmentDemand,
+    pub fielded_force: Box<[FieldedDivision]>,
     pub equipment_profiles: ModeledEquipmentProfiles,
     pub technology_modifiers: TechnologyModifiers,
     pub completed_technologies: Box<[bool]>,
@@ -317,6 +341,7 @@ impl CountryRuntime {
             stability_weekly_accumulator_bp: 0,
             fielded_divisions: 0,
             fielded_demand: EquipmentDemand::default(),
+            fielded_force: Vec::new().into_boxed_slice(),
             equipment_profiles: ModeledEquipmentProfiles::default_1936(),
             technology_modifiers: TechnologyModifiers::default(),
             completed_technologies: Vec::new().into_boxed_slice(),
@@ -357,6 +382,23 @@ impl CountryRuntime {
     ) -> Self {
         self.fielded_divisions = divisions;
         self.fielded_demand = per_division_demand.scale(divisions);
+        self.fielded_force = Vec::new().into_boxed_slice();
+        self.assert_invariants();
+        self
+    }
+
+    pub fn with_exact_fielded_force(mut self, fielded_force: Box<[FieldedDivision]>) -> Self {
+        let fielded_divisions = fielded_force
+            .iter()
+            .filter(|division| division.target_demand.has_equipment())
+            .count();
+        self.fielded_divisions = u16::try_from(fielded_divisions).unwrap_or(u16::MAX);
+        self.fielded_demand = fielded_force
+            .iter()
+            .fold(EquipmentDemand::default(), |total, division| {
+                total.plus(division.target_demand)
+            });
+        self.fielded_force = fielded_force;
         self.assert_invariants();
         self
     }
@@ -426,6 +468,30 @@ impl CountryRuntime {
 
         for idea in &self.active_ideas {
             assert_ne!(idea.remaining_days, Some(0));
+        }
+
+        if !self.fielded_force.is_empty() {
+            let exact_fielded_divisions = self
+                .fielded_force
+                .iter()
+                .filter(|division| division.target_demand.has_equipment())
+                .count();
+            let exact_fielded_demand =
+                self.fielded_force
+                    .iter()
+                    .fold(EquipmentDemand::default(), |total, division| {
+                        assert_eq!(
+                            division.equipped_demand.manpower,
+                            division.target_demand.manpower
+                        );
+                        total.plus(division.target_demand)
+                    });
+
+            assert_eq!(
+                self.fielded_divisions,
+                u16::try_from(exact_fielded_divisions).unwrap_or(u16::MAX)
+            );
+            assert_eq!(self.fielded_demand, exact_fielded_demand);
         }
     }
 
@@ -754,9 +820,31 @@ impl CountryRuntime {
         let free_manpower = self
             .available_manpower(ideas)
             .saturating_sub(u64::from(self.fielded_demand.manpower));
+        if self.fielded_force.is_empty() {
+            return self
+                .fielded_divisions
+                .saturating_add(self.stockpile.ready_divisions(demand, free_manpower));
+        }
 
-        self.fielded_divisions
-            .saturating_add(self.stockpile.ready_divisions(demand, free_manpower))
+        let mut remaining_stockpile = self.stockpile;
+        let mut ready_fielded = 0_u16;
+
+        for division in self.fielded_force.iter() {
+            if !division.target_demand.has_equipment() {
+                continue;
+            }
+            let gap = division.reinforcement_gap();
+            if !gap.has_equipment() {
+                ready_fielded = ready_fielded.saturating_add(1);
+                continue;
+            }
+            if remaining_stockpile.covers(gap) {
+                remaining_stockpile = remaining_stockpile.saturating_sub_demand(gap);
+                ready_fielded = ready_fielded.saturating_add(1);
+            }
+        }
+
+        ready_fielded.saturating_add(remaining_stockpile.ready_divisions(demand, free_manpower))
     }
 
     pub fn queued_kind_projects(&self, state: StateId, kind: ConstructionKind) -> u8 {
@@ -920,8 +1008,8 @@ mod tests {
     use proptest::prelude::*;
 
     use crate::domain::{
-        CountryLaws, DivisionTemplate, EquipmentDemand, EquipmentKind, GameDate, IdeaDefinition,
-        IdeaModifiers, ModeledEquipmentProfiles, ResourceLedger, TradeLaw,
+        CountryLaws, DivisionTemplate, EquipmentDemand, EquipmentKind, FieldedDivision, GameDate,
+        IdeaDefinition, IdeaModifiers, ModeledEquipmentProfiles, ResourceLedger, TradeLaw,
     };
     use crate::scenario::{France1936Scenario, Frontier};
     use crate::sim::actions::{ConstructionKind, StateId};
@@ -1282,6 +1370,57 @@ mod tests {
         };
 
         assert_eq!(stocked_runtime.supported_divisions(demand, &[]), 26);
+    }
+
+    #[test]
+    fn exact_fielded_force_requires_reinforcement_before_counting_understrength_divisions() {
+        let demand = EquipmentDemand {
+            infantry_equipment: 1_000,
+            support_equipment: 0,
+            artillery: 0,
+            anti_tank: 0,
+            anti_air: 0,
+            manpower: 1_000,
+        };
+        let runtime = test_runtime().with_exact_fielded_force(
+            vec![
+                FieldedDivision::new(demand, demand),
+                FieldedDivision::new(demand, demand.scale_equipment_basis_points(5_000)),
+            ]
+            .into_boxed_slice(),
+        );
+        let mut reinforced = runtime.clone();
+        reinforced.stockpile.infantry_equipment = 500;
+
+        assert_eq!(runtime.supported_divisions(demand, &[]), 1);
+        assert_eq!(reinforced.supported_divisions(demand, &[]), 2);
+    }
+
+    #[test]
+    fn exact_fielded_force_ignores_unmodeled_only_divisions_in_readiness_count() {
+        let demand = EquipmentDemand {
+            infantry_equipment: 1_000,
+            support_equipment: 0,
+            artillery: 0,
+            anti_tank: 0,
+            anti_air: 0,
+            manpower: 1_000,
+        };
+        let armor_only = EquipmentDemand {
+            manpower: 500,
+            ..EquipmentDemand::default()
+        };
+        let runtime = test_runtime().with_exact_fielded_force(
+            vec![
+                FieldedDivision::new(demand, demand),
+                FieldedDivision::new(armor_only, armor_only),
+            ]
+            .into_boxed_slice(),
+        );
+
+        assert_eq!(runtime.fielded_divisions, 1);
+        assert_eq!(runtime.fielded_demand.manpower, 1_500);
+        assert_eq!(runtime.supported_divisions(demand, &[]), 1);
     }
 
     #[test]
