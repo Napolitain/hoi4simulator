@@ -135,6 +135,24 @@ impl ResourceLedger {
 
         u16::try_from((capped_total * 10_000 / available_total).min(10_000)).unwrap_or(10_000)
     }
+
+    pub fn fulfillment_bp(self, available: Self) -> u16 {
+        fn resource_fulfillment_bp(required: u32, available: u32) -> u16 {
+            if required == 0 {
+                return 10_000;
+            }
+
+            u16::try_from((u64::from(available) * 10_000 / u64::from(required)).min(10_000))
+                .unwrap_or(10_000)
+        }
+
+        resource_fulfillment_bp(self.steel, available.steel)
+            .min(resource_fulfillment_bp(self.aluminium, available.aluminium))
+            .min(resource_fulfillment_bp(self.tungsten, available.tungsten))
+            .min(resource_fulfillment_bp(self.chromium, available.chromium))
+            .min(resource_fulfillment_bp(self.oil, available.oil))
+            .min(resource_fulfillment_bp(self.rubber, available.rubber))
+    }
 }
 
 impl ResourceKind {
@@ -218,6 +236,7 @@ mod tests {
         );
         assert_eq!(demand.scale(3).cap_at(available).tungsten, 3);
         assert_eq!(demand.scale(3).utilization_bp(available), 9_333);
+        assert_eq!(demand.scale(3).fulfillment_bp(available), 5_000);
         assert_eq!(demand.scale_bp(15_000).steel, 4);
         assert_eq!(demand.get(ResourceKind::Steel), 3);
     }
@@ -291,6 +310,63 @@ mod tests {
             if available.total() == 0 {
                 prop_assert_eq!(utilization, 0);
             }
+        }
+
+        #[test]
+        fn resource_ledger_fulfillment_stays_in_bounds_and_never_overallocates(
+            demand in (0u16..500, 0u16..500, 0u16..500, 0u16..500, 0u16..500, 0u16..500),
+            available in (0u16..500, 0u16..500, 0u16..500, 0u16..500, 0u16..500, 0u16..500),
+            extra in (0u16..500, 0u16..500, 0u16..500, 0u16..500, 0u16..500, 0u16..500),
+        ) {
+            let demand = ledger(demand.0, demand.1, demand.2, demand.3, demand.4, demand.5);
+            let available = ledger(
+                available.0,
+                available.1,
+                available.2,
+                available.3,
+                available.4,
+                available.5,
+            );
+            let improved_available = ledger(
+                u16::try_from(available.steel)
+                    .unwrap_or(u16::MAX)
+                    .saturating_add(extra.0),
+                u16::try_from(available.aluminium)
+                    .unwrap_or(u16::MAX)
+                    .saturating_add(extra.1),
+                u16::try_from(available.tungsten)
+                    .unwrap_or(u16::MAX)
+                    .saturating_add(extra.2),
+                u16::try_from(available.chromium)
+                    .unwrap_or(u16::MAX)
+                    .saturating_add(extra.3),
+                u16::try_from(available.oil)
+                    .unwrap_or(u16::MAX)
+                    .saturating_add(extra.4),
+                u16::try_from(available.rubber)
+                    .unwrap_or(u16::MAX)
+                    .saturating_add(extra.5),
+            );
+
+            let fulfillment = demand.fulfillment_bp(available);
+            let improved_fulfillment = demand.fulfillment_bp(improved_available);
+            let consumed = demand.scale_bp(fulfillment);
+
+            prop_assert!(fulfillment <= 10_000);
+            prop_assert!(improved_fulfillment >= fulfillment);
+            prop_assert_eq!(
+                demand.cap_at(available) == demand,
+                fulfillment == 10_000 || !demand.any_positive()
+            );
+            prop_assert!(consumed.steel <= demand.steel && consumed.steel <= available.steel);
+            prop_assert!(
+                consumed.aluminium <= demand.aluminium
+                    && consumed.aluminium <= available.aluminium
+            );
+            prop_assert!(consumed.tungsten <= demand.tungsten && consumed.tungsten <= available.tungsten);
+            prop_assert!(consumed.chromium <= demand.chromium && consumed.chromium <= available.chromium);
+            prop_assert!(consumed.oil <= demand.oil && consumed.oil <= available.oil);
+            prop_assert!(consumed.rubber <= demand.rubber && consumed.rubber <= available.rubber);
         }
     }
 }

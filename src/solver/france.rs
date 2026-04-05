@@ -1025,35 +1025,15 @@ impl FranceBeamPlanner {
                 .required_military_factories
                 .saturating_sub(runtime.total_military_factories()),
         );
-        let current_resource_use = [
-            EquipmentKind::InfantryEquipment,
-            EquipmentKind::SupportEquipment,
-            EquipmentKind::Artillery,
-            EquipmentKind::AntiTank,
-            EquipmentKind::AntiAir,
-        ]
-        .into_iter()
-        .fold(
-            crate::domain::ResourceLedger::default(),
-            |total, equipment| {
-                let assigned = runtime
-                    .production_lines
-                    .iter()
-                    .find(|line| line.equipment == equipment)
-                    .map(|line| u16::from(line.factories))
-                    .unwrap_or(0);
-                total.plus(
-                    self.scenario
-                        .equipment_profiles
-                        .profile(equipment)
-                        .resources
-                        .scale(assigned),
-                )
-            },
-        );
+        let available_resources = runtime.domestic_resources(&self.scenario.ideas);
+        let current_resource_use = runtime.daily_resource_demand(self.scenario.equipment_profiles);
+        let resource_fulfillment_bp = current_resource_use.fulfillment_bp(available_resources);
         let resource_utilization = i64::from(
-            current_resource_use.utilization_bp(runtime.domestic_resources(&self.scenario.ideas)),
+            current_resource_use
+                .scale_bp(resource_fulfillment_bp)
+                .utilization_bp(available_resources),
         );
+        let resource_fulfillment = i64::from(resource_fulfillment_bp);
         let manpower_headroom = runtime
             .available_manpower(&self.scenario.ideas)
             .saturating_sub(u64::from(force_plan.frontline_demand.manpower));
@@ -1066,7 +1046,8 @@ impl FranceBeamPlanner {
         score += ready_divisions * i64::from(self.strategic_goals.readiness) * 60;
         score += completed_focuses * i64::from(self.strategic_goals.politics) * 120;
         score += completed_research * i64::from(self.strategic_goals.research) * 100;
-        score += resource_utilization * 6;
+        score += resource_utilization * 3;
+        score += resource_fulfillment * 3;
         score += i64::try_from(manpower_headroom / 1_000).unwrap_or(i64::MAX) * 2;
 
         if runtime.country.date >= self.scenario.milestones[0].date {

@@ -553,20 +553,26 @@ impl SimulationEngine {
 
     fn advance_production(&self, scenario: &France1936Scenario, country: &mut CountryRuntime) {
         let output_bonus_bp = u32::from(country.military_output_bp(&scenario.ideas));
+        let mut available_resources = country.domestic_resources(&scenario.ideas);
 
         for line in &mut country.production_lines {
             if line.factories == 0 {
                 continue;
             }
 
+            let resource_demand = line.daily_resource_demand(scenario.equipment_profiles);
+            let resource_fulfillment_bp = resource_demand.fulfillment_bp(available_resources);
+            let consumed_resources = resource_demand.scale_bp(resource_fulfillment_bp);
             let prior_efficiency = line.efficiency_permille;
             let daily_ic_centi = self.production_daily_ic_centi(
                 line.factories,
                 line.efficiency_permille,
                 output_bonus_bp,
             );
+            let daily_ic_centi = self.scale_by_bp(daily_ic_centi, resource_fulfillment_bp);
 
             line.accumulated_ic_centi = line.accumulated_ic_centi.saturating_add(daily_ic_centi);
+            available_resources = available_resources.saturating_sub(consumed_resources);
 
             let produced_units = line.accumulated_ic_centi / line.unit_cost_centi;
             line.accumulated_ic_centi %= line.unit_cost_centi;
@@ -1018,6 +1024,10 @@ impl SimulationEngine {
         u32::try_from(daily_ic_centi).unwrap_or(u32::MAX)
     }
 
+    fn scale_by_bp(&self, value: u32, basis_points: u16) -> u32 {
+        u32::try_from(u64::from(value) * u64::from(basis_points) / 10_000).unwrap_or(u32::MAX)
+    }
+
     fn state_index(
         &self,
         country: &CountryRuntime,
@@ -1042,9 +1052,9 @@ impl SimulationEngine {
 }
 
 #[inline]
-fn debug_assert_country_invariants(country: &CountryRuntime) {
+fn debug_assert_country_invariants(_country: &CountryRuntime) {
     #[cfg(debug_assertions)]
-    country.assert_invariants();
+    _country.assert_invariants();
 }
 
 #[cfg(test)]
@@ -1054,7 +1064,8 @@ mod tests {
     use crate::domain::{
         DoctrineCostReduction, EconomyLaw, EquipmentKind, FocusBuildingKind, FocusCondition,
         FocusEffect, FocusStateScope, GameDate, IdeaDefinition, IdeaModifiers, MobilizationLaw,
-        NationalFocus, StateCondition, StateOperation, StateScopedEffects, TradeLaw,
+        NationalFocus, ResourceLedger, StateCondition, StateOperation, StateScopedEffects,
+        TradeLaw,
     };
     use crate::scenario::France1936Scenario;
     use crate::sim::{
@@ -1913,7 +1924,15 @@ mod tests {
             unit_cost_centi in 1u32..20_000,
             accumulated_ic_centi in 0u32..20_000,
         ) {
-            let scenario = France1936Scenario::standard();
+            let mut scenario = France1936Scenario::standard();
+            scenario.initial_country.laws.trade = TradeLaw::ClosedEconomy;
+            for state in scenario.initial_state_defs.iter_mut() {
+                state.resources = ResourceLedger::default();
+            }
+            scenario.initial_state_defs[0].resources = ResourceLedger {
+                steel: 1_000,
+                ..ResourceLedger::default()
+            };
             let mut runtime = scenario.bootstrap_runtime();
             let mut line = ProductionLine::new_with_cost(
                 EquipmentKind::InfantryEquipment,
@@ -1949,7 +1968,15 @@ mod tests {
             factories in 1u8..15,
             days in 1usize..365,
         ) {
-            let scenario = France1936Scenario::standard();
+            let mut scenario = France1936Scenario::standard();
+            scenario.initial_country.laws.trade = TradeLaw::ClosedEconomy;
+            for state in scenario.initial_state_defs.iter_mut() {
+                state.resources = ResourceLedger::default();
+            }
+            scenario.initial_state_defs[0].resources = ResourceLedger {
+                steel: 1_000,
+                ..ResourceLedger::default()
+            };
             let mut runtime = scenario.bootstrap_runtime();
             runtime.production_lines = vec![ProductionLine::new(EquipmentKind::InfantryEquipment, factories)]
                 .into_boxed_slice();
@@ -1963,6 +1990,55 @@ mod tests {
                 prop_assert!(current_efficiency <= engine.config.production_efficiency_cap_permille);
                 previous_efficiency = current_efficiency;
             }
+        }
+
+        #[test]
+        fn advance_production_single_line_scales_ic_by_resource_fulfillment(
+            factories in 1u8..15,
+            efficiency_permille in 100u16..1001,
+            available_steel in 0u16..40,
+        ) {
+            let mut scenario = France1936Scenario::standard();
+            scenario.initial_country.laws.trade = TradeLaw::ClosedEconomy;
+            for state in scenario.initial_state_defs.iter_mut() {
+                state.resources = ResourceLedger::default();
+            }
+            scenario.initial_state_defs[0].resources = ResourceLedger {
+                steel: u32::from(available_steel),
+                ..ResourceLedger::default()
+            };
+
+            let mut runtime = scenario.bootstrap_runtime();
+            let mut line = ProductionLine::new_with_cost(
+                EquipmentKind::InfantryEquipment,
+                factories,
+                1,
+            );
+            line.efficiency_permille = efficiency_permille;
+            runtime.production_lines = vec![line].into_boxed_slice();
+            runtime.stockpile = Stockpile::default();
+            let engine = SimulationEngine::new(SimulationConfig {
+                production_efficiency_gain_permille: 0,
+                ..SimulationConfig::default()
+            });
+
+            let line_before = runtime.production_lines[0];
+            let available_resources = runtime.domestic_resources(&scenario.ideas);
+            let resource_demand = line_before.daily_resource_demand(scenario.equipment_profiles);
+            let fulfillment_bp = resource_demand.fulfillment_bp(available_resources);
+            let expected_ic = engine.scale_by_bp(
+                engine.production_daily_ic_centi(
+                    line_before.factories,
+                    line_before.efficiency_permille,
+                    u32::from(runtime.military_output_bp(&scenario.ideas)),
+                ),
+                fulfillment_bp,
+            );
+
+            engine.advance_production(&scenario, &mut runtime);
+
+            prop_assert_eq!(runtime.stockpile.infantry_equipment, expected_ic);
+            prop_assert_eq!(runtime.production_lines[0].accumulated_ic_centi, 0);
         }
 
         #[test]
@@ -2019,5 +2095,33 @@ mod tests {
                 .civilian_factories,
             initial_civs + 1,
         );
+    }
+
+    #[test]
+    fn advance_production_scales_output_linearly_under_resource_shortage() {
+        let mut scenario = France1936Scenario::standard();
+        scenario.initial_country.laws.trade = TradeLaw::ClosedEconomy;
+        for state in scenario.initial_state_defs.iter_mut() {
+            state.resources = ResourceLedger::default();
+        }
+        scenario.initial_state_defs[0].resources = ResourceLedger {
+            steel: 10,
+            ..ResourceLedger::default()
+        };
+
+        let mut runtime = scenario.bootstrap_runtime();
+        let mut line = ProductionLine::new_with_cost(EquipmentKind::InfantryEquipment, 10, 100);
+        line.efficiency_permille = 1_000;
+        runtime.production_lines = vec![line].into_boxed_slice();
+        runtime.stockpile = Stockpile::default();
+        let engine = SimulationEngine::new(SimulationConfig {
+            production_efficiency_gain_permille: 0,
+            ..SimulationConfig::default()
+        });
+
+        engine.advance_production(&scenario, &mut runtime);
+
+        assert_eq!(runtime.stockpile.infantry_equipment, 22);
+        assert_eq!(runtime.production_lines[0].accumulated_ic_centi, 50);
     }
 }

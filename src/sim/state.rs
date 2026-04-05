@@ -1,6 +1,6 @@
 use crate::domain::{
     CountryLaws, DoctrineCostReduction, EquipmentDemand, EquipmentKind, FocusBuildingKind,
-    GameDate, IdeaDefinition, IdeaModifiers, ResourceLedger,
+    GameDate, IdeaDefinition, IdeaModifiers, ModeledEquipmentProfiles, ResourceLedger,
 };
 use crate::scenario::{Frontier, FrontierFortRequirement};
 
@@ -211,6 +211,16 @@ impl ProductionLine {
 
         self.equipment = equipment;
         self.factories = factories;
+    }
+
+    pub fn daily_resource_demand(
+        self,
+        equipment_profiles: ModeledEquipmentProfiles,
+    ) -> ResourceLedger {
+        equipment_profiles
+            .profile(self.equipment)
+            .resources
+            .scale(u16::from(self.factories))
     }
 }
 
@@ -630,9 +640,21 @@ impl CountryRuntime {
             .fold(ResourceLedger::default(), |total, state| {
                 total.plus(state.resources)
             });
-        let modifier_bp = 10_000 + self.idea_modifiers(ideas).resource_factor_bp;
+        let modifier_bp = i32::from(self.country.laws.trade.local_resource_retention_bp())
+            + self.idea_modifiers(ideas).resource_factor_bp;
         let modifier_bp = u16::try_from(modifier_bp.clamp(0, i32::from(u16::MAX))).unwrap_or(0);
         base.scale_bp(modifier_bp)
+    }
+
+    pub fn daily_resource_demand(
+        &self,
+        equipment_profiles: ModeledEquipmentProfiles,
+    ) -> ResourceLedger {
+        self.production_lines
+            .iter()
+            .fold(ResourceLedger::default(), |total, line| {
+                total.plus(line.daily_resource_demand(equipment_profiles))
+            })
     }
 
     pub fn ready_divisions(&self, demand: EquipmentDemand, ideas: &[IdeaDefinition]) -> u16 {
@@ -776,7 +798,7 @@ mod tests {
 
     use crate::domain::{
         CountryLaws, DivisionTemplate, EquipmentDemand, EquipmentKind, GameDate, IdeaDefinition,
-        IdeaModifiers, ResourceLedger,
+        IdeaModifiers, ModeledEquipmentProfiles, ResourceLedger, TradeLaw,
     };
     use crate::scenario::{France1936Scenario, Frontier};
     use crate::sim::actions::{ConstructionKind, StateId};
@@ -1055,15 +1077,67 @@ mod tests {
     }
 
     #[test]
-    fn runtime_aggregates_static_domestic_resources() {
+    fn runtime_aggregates_trade_law_adjusted_domestic_resources() {
         let runtime = test_runtime();
         let ideas = &[];
 
         assert_eq!(
             runtime.domestic_resources(ideas),
             ResourceLedger {
+                steel: 6,
+                tungsten: 2,
+                ..ResourceLedger::default()
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_closed_economy_exposes_full_domestic_resources() {
+        let mut runtime = test_runtime();
+        runtime.country.laws.trade = TradeLaw::ClosedEconomy;
+
+        assert_eq!(
+            runtime.domestic_resources(&[]),
+            ResourceLedger {
                 steel: 12,
                 tungsten: 4,
+                ..ResourceLedger::default()
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_domestic_resources_apply_trade_law_and_local_resource_bonus() {
+        let mut runtime = test_runtime();
+        runtime.country.laws.trade = TradeLaw::LimitedExports;
+        let ideas = [IdeaDefinition {
+            id: "FRA_resource_policy".into(),
+            modifiers: IdeaModifiers {
+                resource_factor_bp: 1_500,
+                ..IdeaModifiers::default()
+            },
+        }];
+        runtime.add_idea("FRA_resource_policy", None);
+
+        assert_eq!(
+            runtime.domestic_resources(&ideas),
+            ResourceLedger {
+                steel: 10,
+                tungsten: 3,
+                ..ResourceLedger::default()
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_aggregates_daily_resource_demand_from_production_lines() {
+        let runtime = test_runtime();
+        let profiles = ModeledEquipmentProfiles::default_1936();
+
+        assert_eq!(
+            runtime.daily_resource_demand(profiles),
+            ResourceLedger {
+                steel: 10,
                 ..ResourceLedger::default()
             }
         );
@@ -1121,6 +1195,21 @@ mod tests {
         assert_eq!(line.accumulated_ic_centi, 0);
         assert_eq!(line.factories, 4);
         assert_eq!(line.equipment, EquipmentKind::Artillery);
+    }
+
+    #[test]
+    fn production_line_reports_daily_resource_demand_from_equipment_profile() {
+        let line = ProductionLine::new(EquipmentKind::Artillery, 3);
+        let profiles = ModeledEquipmentProfiles::default_1936();
+
+        assert_eq!(
+            line.daily_resource_demand(profiles),
+            ResourceLedger {
+                steel: 6,
+                tungsten: 3,
+                ..ResourceLedger::default()
+            }
+        );
     }
 
     #[test]

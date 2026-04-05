@@ -72,6 +72,7 @@ impl France1936Scenario {
         let equipment_profiles = ModeledEquipmentProfiles::default_1936();
         let force_goal = ForceGoalSpec::france_1939_default();
         let starting_fielded_divisions = force_goal.division_band().min;
+        let initial_country = CountryState::new(start_date, 41_000_000, CountryLaws::default());
         let initial_state_defs = vec![
             StateDefinition {
                 id: Self::ILE_DE_FRANCE,
@@ -333,10 +334,11 @@ impl France1936Scenario {
             ProductionLine::new(crate::domain::EquipmentKind::AntiAir, 1),
         ]
         .into_boxed_slice();
-        let domestic_resources = aggregate_domestic_resources(&initial_state_defs);
+        let domestic_resources = aggregate_domestic_resources(&initial_state_defs)
+            .scale_bp(initial_country.laws.trade.local_resource_retention_bp());
         let force_plan = Self::derive_force_plan(
             start_date,
-            41_000_000,
+            initial_country.population,
             domestic_resources,
             force_goal,
             equipment_profiles,
@@ -399,7 +401,7 @@ impl France1936Scenario {
             .into_boxed_slice(),
             frontier_fort_order: vec![Self::LORRAINE, Self::ALSACE, Self::NORD, Self::PICARDY]
                 .into_boxed_slice(),
-            initial_country: CountryState::new(start_date, 41_000_000, CountryLaws::default()),
+            initial_country,
             initial_state_defs,
             initial_states,
             initial_production_lines,
@@ -469,11 +471,13 @@ impl France1936Scenario {
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        let domestic_resources = aggregate_domestic_resources(&initial_state_defs);
+        let initial_country = CountryState::new(start_date, dataset.population, dataset.laws);
+        let domestic_resources = aggregate_domestic_resources(&initial_state_defs)
+            .scale_bp(initial_country.laws.trade.local_resource_retention_bp());
         let force_goal = ForceGoalSpec::france_1939_default();
         let force_plan = Self::derive_force_plan(
             start_date,
-            dataset.population,
+            initial_country.population,
             domestic_resources,
             force_goal,
             dataset.equipment_profiles,
@@ -571,7 +575,7 @@ impl France1936Scenario {
             infrastructure_order,
             military_construction_order,
             frontier_fort_order,
-            initial_country: CountryState::new(start_date, dataset.population, dataset.laws),
+            initial_country,
             initial_state_defs,
             initial_states,
             initial_production_lines,
@@ -625,6 +629,15 @@ impl France1936Scenario {
         self.focuses = focuses.into_boxed_slice();
         self.ideas = ideas.into_boxed_slice();
         self.hard_focus_goals = hard_focus_goals.into_boxed_slice();
+        self.domestic_resources = self.bootstrap_runtime().domestic_resources(&self.ideas);
+        self.force_plan = Self::derive_force_plan(
+            self.start_date,
+            self.initial_country.population,
+            self.domestic_resources,
+            self.force_goal,
+            self.equipment_profiles,
+            self.starting_fielded_divisions,
+        );
         self
     }
 
@@ -720,10 +733,13 @@ impl France1936Scenario {
                 );
                 let daily_resource_use =
                     derive_daily_resource_use(factory_allocation, equipment_profiles);
+                let resource_fulfillment_bp = daily_resource_use.fulfillment_bp(domestic_resources);
                 let resource_overdraw = daily_resource_use
                     .saturating_sub(domestic_resources)
                     .total();
-                let resource_utilization_bp = daily_resource_use.utilization_bp(domestic_resources);
+                let resource_utilization_bp = daily_resource_use
+                    .scale_bp(resource_fulfillment_bp)
+                    .utilization_bp(domestic_resources);
                 let score = i64::from(divisions) * 20_000 + i64::from(resource_utilization_bp) * 4
                     - i64::from(resource_overdraw) * 50_000
                     - i64::from(factory_allocation.total()) * 40
@@ -764,6 +780,9 @@ impl France1936Scenario {
                 equipment_profiles,
                 factory_capacity_centi,
             );
+            let daily_resource_use =
+                derive_daily_resource_use(factory_allocation, equipment_profiles);
+            let resource_fulfillment_bp = daily_resource_use.fulfillment_bp(domestic_resources);
 
             ForcePlan {
                 template,
@@ -775,15 +794,10 @@ impl France1936Scenario {
                 total_demand,
                 required_military_factories: factory_allocation.total(),
                 factory_allocation,
-                daily_resource_use: derive_daily_resource_use(
-                    factory_allocation,
-                    equipment_profiles,
-                ),
-                resource_utilization_bp: derive_daily_resource_use(
-                    factory_allocation,
-                    equipment_profiles,
-                )
-                .utilization_bp(domestic_resources),
+                daily_resource_use,
+                resource_utilization_bp: daily_resource_use
+                    .scale_bp(resource_fulfillment_bp)
+                    .utilization_bp(domestic_resources),
             }
         })
     }
@@ -957,8 +971,8 @@ fn frontier_order_priority(frontier: Option<Frontier>) -> u8 {
 mod tests {
     use crate::data::{StructuredFrance1936Dataset, StructuredProductionLine, StructuredState};
     use crate::domain::{
-        CountryLaws, EquipmentKind, MilestoneKind, ModeledEquipmentProfiles, ResourceLedger,
-        TargetBand,
+        CountryLaws, EquipmentKind, IdeaDefinition, IdeaModifiers, MilestoneKind,
+        ModeledEquipmentProfiles, ResourceLedger, TargetBand,
     };
     use crate::scenario::CountryScenario;
 
@@ -1140,5 +1154,26 @@ mod tests {
             runtime.production_lines[1].equipment,
             EquipmentKind::Unmodeled
         );
+    }
+
+    #[test]
+    fn exact_focus_data_refreshes_scenario_resource_availability() {
+        let scenario = France1936Scenario::standard();
+        let boosted = scenario.clone().with_exact_focus_data(
+            2,
+            vec![Box::<str>::from("FRA_local_resources")],
+            Vec::new(),
+            Vec::new(),
+            vec![IdeaDefinition {
+                id: "FRA_local_resources".into(),
+                modifiers: IdeaModifiers {
+                    resource_factor_bp: 2_500,
+                    ..IdeaModifiers::default()
+                },
+            }],
+            Vec::new(),
+        );
+
+        assert!(boosted.domestic_resources.total() > scenario.domestic_resources.total());
     }
 }

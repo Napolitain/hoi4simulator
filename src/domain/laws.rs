@@ -38,6 +38,16 @@ impl MobilizationLaw {
     }
 }
 
+impl TradeLaw {
+    pub fn local_resource_retention_bp(self) -> u16 {
+        match self {
+            Self::ExportFocus => 5_000,
+            Self::LimitedExports => 7_500,
+            Self::ClosedEconomy => 10_000,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ForyObject)]
 pub struct CountryLaws {
     pub economy: EconomyLaw,
@@ -75,5 +85,18 @@ mod tests {
         assert_eq!(laws.economy, EconomyLaw::CivilianEconomy);
         assert_eq!(laws.trade, TradeLaw::ExportFocus);
         assert_eq!(laws.mobilization, MobilizationLaw::LimitedConscription);
+    }
+
+    #[test]
+    fn trade_law_scales_local_resource_retention() {
+        assert_eq!(TradeLaw::ExportFocus.local_resource_retention_bp(), 5_000);
+        assert_eq!(
+            TradeLaw::LimitedExports.local_resource_retention_bp(),
+            7_500
+        );
+        assert_eq!(
+            TradeLaw::ClosedEconomy.local_resource_retention_bp(),
+            10_000
+        );
     }
 }
