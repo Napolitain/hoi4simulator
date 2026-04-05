@@ -1,6 +1,6 @@
 use crate::domain::{
-    FocusBuildingKind, FocusCondition, FocusEffect, FocusStateScope, GameDate, StateCondition,
-    StateOperation,
+    EquipmentDemand, EquipmentFactoryAllocation, EquipmentKind, FocusBuildingKind, FocusCondition,
+    FocusEffect, FocusStateScope, GameDate, StateCondition, StateOperation,
 };
 use crate::scenario::France1936Scenario;
 
@@ -257,15 +257,18 @@ impl SimulationEngine {
         let runtime = country.states[state_index];
 
         let phase = self.phase_for(country.country.date, pivot_date);
+        let minimum_force_target_met = country.supported_divisions(
+            scenario.force_plan.template.per_division_demand(),
+            &scenario.ideas,
+        ) >= scenario.force_goal.fort_construction_division_floor();
         let context = ConstructionDecisionContext {
             phase,
             military_factory_target_met: country.total_military_factories()
                 >= scenario.force_plan.required_military_factories,
-            minimum_force_target_met: country.supported_divisions(
-                scenario.force_plan.template.per_division_demand(),
-                &scenario.ideas,
-            ) >= scenario.force_goal.division_band().min,
+            minimum_force_target_met,
             frontier_forts_met: country.frontier_forts_complete(&scenario.frontier_forts),
+            frontier_fort_priority: country.country.date >= scenario.milestones[2].date
+                || self.military_base_covers_readiness_shortfall(scenario, country),
             civilian_exception: false,
             infrastructure_is_justified: runtime.infrastructure < definition.infrastructure_target,
         };
@@ -1135,6 +1138,139 @@ impl SimulationEngine {
         u32::try_from(daily_ic_centi).unwrap_or(u32::MAX)
     }
 
+    fn military_base_covers_readiness_shortfall(
+        &self,
+        scenario: &France1936Scenario,
+        country: &CountryRuntime,
+    ) -> bool {
+        let shortfall = self.readiness_shortfall_demand(scenario, country);
+        if !shortfall.has_equipment() {
+            return true;
+        }
+
+        let days_remaining = u16::try_from(
+            country
+                .country
+                .date
+                .days_until(scenario.milestones[3].date)
+                .max(1),
+        )
+        .unwrap_or(u16::MAX);
+        let allocation = self.factory_allocation_for_demand(
+            shortfall,
+            country.equipment_profiles,
+            days_remaining,
+        );
+        country.total_military_factories() >= allocation.total()
+    }
+
+    fn readiness_shortfall_demand(
+        &self,
+        scenario: &France1936Scenario,
+        country: &CountryRuntime,
+    ) -> EquipmentDemand {
+        let mut remaining_stockpile = country.stockpile;
+        let mut ready_divisions = 0_u16;
+        let target_ready = scenario.force_goal.division_band().min;
+        let mut shortfall = EquipmentDemand::default();
+
+        for division in country.fielded_force.iter() {
+            if !division.target_demand.has_equipment() {
+                continue;
+            }
+            if ready_divisions >= target_ready {
+                break;
+            }
+
+            let gap = division.reinforcement_gap();
+            if !gap.has_equipment() {
+                ready_divisions = ready_divisions.saturating_add(1);
+                continue;
+            }
+            if remaining_stockpile.covers(gap) {
+                remaining_stockpile = remaining_stockpile.saturating_sub_demand(gap);
+                ready_divisions = ready_divisions.saturating_add(1);
+                continue;
+            }
+
+            shortfall = shortfall.plus(EquipmentDemand {
+                infantry_equipment: gap
+                    .infantry_equipment
+                    .saturating_sub(remaining_stockpile.infantry_equipment),
+                support_equipment: gap
+                    .support_equipment
+                    .saturating_sub(remaining_stockpile.support_equipment),
+                artillery: gap.artillery.saturating_sub(remaining_stockpile.artillery),
+                anti_tank: gap.anti_tank.saturating_sub(remaining_stockpile.anti_tank),
+                anti_air: gap.anti_air.saturating_sub(remaining_stockpile.anti_air),
+                manpower: 0,
+            });
+            remaining_stockpile = remaining_stockpile.saturating_sub_demand(gap);
+            ready_divisions = ready_divisions.saturating_add(1);
+        }
+
+        if ready_divisions < target_ready {
+            shortfall = shortfall.plus(
+                scenario
+                    .force_plan
+                    .template
+                    .per_division_demand()
+                    .without_manpower()
+                    .scale(target_ready.saturating_sub(ready_divisions)),
+            );
+        }
+
+        shortfall
+    }
+
+    fn factory_allocation_for_demand(
+        &self,
+        demand: EquipmentDemand,
+        equipment_profiles: crate::domain::ModeledEquipmentProfiles,
+        days_remaining: u16,
+    ) -> EquipmentFactoryAllocation {
+        let factory_capacity_centi = self.estimated_factory_capacity_centi(days_remaining).max(1);
+        let mut allocation = EquipmentFactoryAllocation::default();
+
+        for equipment in [
+            EquipmentKind::InfantryEquipment,
+            EquipmentKind::SupportEquipment,
+            EquipmentKind::Artillery,
+            EquipmentKind::AntiTank,
+            EquipmentKind::AntiAir,
+        ] {
+            let amount = demand.get(equipment);
+            if amount == 0 {
+                continue;
+            }
+            let total_ic = u64::from(amount)
+                * u64::from(equipment_profiles.profile(equipment).unit_cost_centi);
+            allocation.set(
+                equipment,
+                u16::try_from(total_ic.div_ceil(factory_capacity_centi)).unwrap_or(u16::MAX),
+            );
+        }
+
+        allocation
+    }
+
+    fn estimated_factory_capacity_centi(&self, days: u16) -> u64 {
+        let mut efficiency = 100_u16;
+        let mut total = 0_u64;
+
+        for _ in 0..days {
+            total += u64::from(self.config.production_output_centi_per_factory)
+                * u64::from(efficiency)
+                / 1_000;
+            if efficiency < self.config.production_efficiency_cap_permille {
+                efficiency = (efficiency + self.config.production_efficiency_gain_permille)
+                    .min(self.config.production_efficiency_cap_permille);
+            }
+        }
+
+        total
+    }
+
     fn scale_by_bp(&self, value: u32, basis_points: u16) -> u32 {
         u32::try_from(u64::from(value) * u64::from(basis_points) / 10_000).unwrap_or(u32::MAX)
     }
@@ -1333,7 +1469,7 @@ mod tests {
     }
 
     #[test]
-    fn simulator_rejects_pre_pivot_military_construction() {
+    fn simulator_allows_pre_pivot_military_construction() {
         let scenario = France1936Scenario::standard();
         let runtime = scenario.bootstrap_runtime();
         let engine = SimulationEngine::default();
@@ -1351,10 +1487,13 @@ mod tests {
             scenario.pivot_window.start,
         );
 
-        assert!(matches!(
-            result,
-            Err(SimulationError::HeuristicViolation(_))
-        ));
+        let outcome =
+            result.expect("pre-pivot military factories stay legal for EarlyMilitaryPivot");
+        assert_eq!(outcome.country.construction_queue.len(), 1);
+        assert_eq!(
+            outcome.country.construction_queue[0].kind,
+            ConstructionKind::MilitaryFactory
+        );
     }
 
     #[test]

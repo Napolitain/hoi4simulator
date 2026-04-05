@@ -37,6 +37,7 @@ pub struct France1936Scenario {
     pub equipment_profiles: ModeledEquipmentProfiles,
     pub domestic_resources: ResourceLedger,
     pub starting_fielded_divisions: u16,
+    pub starting_fielded_target_demand: Option<EquipmentDemand>,
     pub starting_fielded_equipped_demand: Option<EquipmentDemand>,
     pub starting_fielded_force: Box<[FieldedDivision]>,
     pub starting_research_slots: u8,
@@ -56,6 +57,17 @@ pub struct France1936Scenario {
     pub initial_state_defs: Box<[StateDefinition]>,
     pub initial_states: Box<[StateRuntime]>,
     pub initial_production_lines: Box<[ProductionLine]>,
+}
+
+struct ForcePlanInputs {
+    start_date: GameDate,
+    population: u64,
+    domestic_resources: ResourceLedger,
+    force_goal: ForceGoalSpec,
+    equipment_profiles: ModeledEquipmentProfiles,
+    starting_fielded_divisions: u16,
+    exact_starting_fielded_target_demand: Option<EquipmentDemand>,
+    exact_starting_fielded_equipped_demand: Option<EquipmentDemand>,
 }
 
 impl France1936Scenario {
@@ -341,26 +353,28 @@ impl France1936Scenario {
         .into_boxed_slice();
         let domestic_resources = aggregate_domestic_resources(&initial_state_defs)
             .scale_bp(initial_country.laws.trade.local_resource_retention_bp());
-        let force_plan = Self::derive_force_plan(
+        let force_plan = Self::derive_force_plan(ForcePlanInputs {
             start_date,
-            initial_country.population,
+            population: initial_country.population,
             domestic_resources,
             force_goal,
             equipment_profiles,
             starting_fielded_divisions,
-            None,
-        );
+            exact_starting_fielded_target_demand: None,
+            exact_starting_fielded_equipped_demand: None,
+        });
 
         Self {
             reference_tag: "FRA",
             start_date,
-            pivot_window: PivotWindow::new(GameDate::new(1938, 6, 1), GameDate::new(1939, 1, 1)),
+            pivot_window: PivotWindow::new(GameDate::new(1937, 1, 1), GameDate::new(1939, 1, 1)),
             milestones: Self::default_milestones(),
             force_goal,
             force_plan,
             equipment_profiles,
             domestic_resources,
             starting_fielded_divisions,
+            starting_fielded_target_demand: None,
             starting_fielded_equipped_demand: None,
             starting_fielded_force: Vec::new().into_boxed_slice(),
             starting_research_slots: 2,
@@ -485,17 +499,18 @@ impl France1936Scenario {
         let domestic_resources = aggregate_domestic_resources(&initial_state_defs)
             .scale_bp(initial_country.laws.trade.local_resource_retention_bp());
         let force_goal = ForceGoalSpec::france_1939_default();
-        let force_plan = Self::derive_force_plan(
+        let force_plan = Self::derive_force_plan(ForcePlanInputs {
             start_date,
-            initial_country.population,
+            population: initial_country.population,
             domestic_resources,
             force_goal,
-            dataset.equipment_profiles,
-            dataset
+            equipment_profiles: dataset.equipment_profiles,
+            starting_fielded_divisions: dataset
                 .starting_fielded_divisions
                 .max(force_goal.division_band().min),
-            None,
-        );
+            exact_starting_fielded_target_demand: None,
+            exact_starting_fielded_equipped_demand: None,
+        });
 
         let economic_construction_order = sorted_state_ids(
             &initial_state_defs,
@@ -568,13 +583,14 @@ impl France1936Scenario {
         Ok(Self {
             reference_tag: "FRA",
             start_date,
-            pivot_window: PivotWindow::new(GameDate::new(1938, 6, 1), GameDate::new(1939, 1, 1)),
+            pivot_window: PivotWindow::new(GameDate::new(1937, 1, 1), GameDate::new(1939, 1, 1)),
             milestones: Self::default_milestones(),
             force_goal,
             force_plan,
             equipment_profiles: dataset.equipment_profiles,
             domestic_resources,
             starting_fielded_divisions: dataset.starting_fielded_divisions,
+            starting_fielded_target_demand: None,
             starting_fielded_equipped_demand: None,
             starting_fielded_force: Vec::new().into_boxed_slice(),
             starting_research_slots: 2,
@@ -660,15 +676,16 @@ impl France1936Scenario {
         self.ideas = ideas.into_boxed_slice();
         self.hard_focus_goals = hard_focus_goals.into_boxed_slice();
         self.domestic_resources = self.starting_domestic_resources();
-        self.force_plan = Self::derive_force_plan(
-            self.start_date,
-            self.initial_country.population,
-            self.domestic_resources,
-            self.force_goal,
-            self.equipment_profiles,
-            self.starting_fielded_divisions,
-            self.starting_fielded_equipped_demand,
-        );
+        self.force_plan = Self::derive_force_plan(ForcePlanInputs {
+            start_date: self.start_date,
+            population: self.initial_country.population,
+            domestic_resources: self.domestic_resources,
+            force_goal: self.force_goal,
+            equipment_profiles: self.equipment_profiles,
+            starting_fielded_divisions: self.starting_fielded_divisions,
+            exact_starting_fielded_target_demand: self.starting_fielded_target_demand,
+            exact_starting_fielded_equipped_demand: self.starting_fielded_equipped_demand,
+        });
         self
     }
 
@@ -692,15 +709,16 @@ impl France1936Scenario {
         self.starting_technologies = starting_technologies.into_boxed_slice();
         self.equipment_profiles = self.starting_equipment_profiles();
         self.domestic_resources = self.starting_domestic_resources();
-        self.force_plan = Self::derive_force_plan(
-            self.start_date,
-            self.initial_country.population,
-            self.domestic_resources,
-            self.force_goal,
-            self.equipment_profiles,
-            self.starting_fielded_divisions,
-            self.starting_fielded_equipped_demand,
-        );
+        self.force_plan = Self::derive_force_plan(ForcePlanInputs {
+            start_date: self.start_date,
+            population: self.initial_country.population,
+            domestic_resources: self.domestic_resources,
+            force_goal: self.force_goal,
+            equipment_profiles: self.equipment_profiles,
+            starting_fielded_divisions: self.starting_fielded_divisions,
+            exact_starting_fielded_target_demand: self.starting_fielded_target_demand,
+            exact_starting_fielded_equipped_demand: self.starting_fielded_equipped_demand,
+        });
         self
     }
 
@@ -709,6 +727,11 @@ impl France1936Scenario {
             .iter()
             .filter(|division| division.target_demand.has_equipment())
             .count();
+        let starting_fielded_target_demand = fielded_force
+            .iter()
+            .fold(EquipmentDemand::default(), |total, division| {
+                total.plus(division.target_demand)
+            });
         let starting_fielded_equipped_demand = fielded_force
             .iter()
             .filter(|division| division.target_demand.has_equipment())
@@ -718,17 +741,19 @@ impl France1936Scenario {
 
         self.starting_fielded_divisions =
             u16::try_from(starting_fielded_divisions).unwrap_or(u16::MAX);
+        self.starting_fielded_target_demand = Some(starting_fielded_target_demand);
         self.starting_fielded_equipped_demand = Some(starting_fielded_equipped_demand);
         self.starting_fielded_force = fielded_force.into_boxed_slice();
-        self.force_plan = Self::derive_force_plan(
-            self.start_date,
-            self.initial_country.population,
-            self.domestic_resources,
-            self.force_goal,
-            self.equipment_profiles,
-            self.starting_fielded_divisions,
-            self.starting_fielded_equipped_demand,
-        );
+        self.force_plan = Self::derive_force_plan(ForcePlanInputs {
+            start_date: self.start_date,
+            population: self.initial_country.population,
+            domestic_resources: self.domestic_resources,
+            force_goal: self.force_goal,
+            equipment_profiles: self.equipment_profiles,
+            starting_fielded_divisions: self.starting_fielded_divisions,
+            exact_starting_fielded_target_demand: self.starting_fielded_target_demand,
+            exact_starting_fielded_equipped_demand: self.starting_fielded_equipped_demand,
+        });
         self
     }
 
@@ -829,15 +854,17 @@ impl France1936Scenario {
         base.scale_bp(modifier_bp)
     }
 
-    fn derive_force_plan(
-        start_date: GameDate,
-        population: u64,
-        domestic_resources: ResourceLedger,
-        force_goal: ForceGoalSpec,
-        equipment_profiles: ModeledEquipmentProfiles,
-        starting_fielded_divisions: u16,
-        exact_starting_fielded_equipped_demand: Option<EquipmentDemand>,
-    ) -> ForcePlan {
+    fn derive_force_plan(inputs: ForcePlanInputs) -> ForcePlan {
+        let ForcePlanInputs {
+            start_date,
+            population,
+            domestic_resources,
+            force_goal,
+            equipment_profiles,
+            starting_fielded_divisions,
+            exact_starting_fielded_target_demand,
+            exact_starting_fielded_equipped_demand,
+        } = inputs;
         let division_band = force_goal.division_band();
         let min_divisions = division_band
             .min
@@ -854,63 +881,74 @@ impl France1936Scenario {
         let mut best_plan = None::<(i64, ForcePlan)>;
 
         for template in DivisionTemplate::france_line_candidates() {
-            for divisions in min_divisions..=division_band.max {
-                let frontline_demand = template.demand_for(divisions);
-                if u64::from(frontline_demand.manpower) > manpower_budget {
-                    continue;
-                }
+            let divisions = min_divisions;
+            let additional_divisions = divisions.saturating_sub(starting_fielded_divisions);
+            let frontline_demand = exact_starting_fielded_target_demand
+                .unwrap_or_else(|| template.demand_for(divisions));
+            let frontline_demand = if exact_starting_fielded_target_demand.is_some() {
+                frontline_demand.plus(template.demand_for(additional_divisions))
+            } else {
+                frontline_demand
+            };
+            if u64::from(frontline_demand.manpower) > manpower_budget {
+                continue;
+            }
 
-                let starting_fielded_equipped_demand = exact_starting_fielded_equipped_demand
-                    .unwrap_or_else(|| {
-                        template.demand_for(starting_fielded_divisions.min(divisions))
-                    });
-                let reserve_demand = frontline_demand.reserve_buffer(force_goal.reserve_ratios);
-                let stockpile_target_demand = frontline_demand
-                    .saturating_sub(starting_fielded_equipped_demand.without_manpower())
-                    .plus(reserve_demand);
-                let total_demand = frontline_demand.plus(reserve_demand);
-                let factory_allocation = derive_factory_allocation(
-                    stockpile_target_demand,
-                    equipment_profiles,
-                    factory_capacity_centi,
-                );
-                let daily_resource_use =
-                    derive_daily_resource_use(factory_allocation, equipment_profiles);
-                let resource_fulfillment_bp = daily_resource_use.fulfillment_bp(domestic_resources);
-                let resource_overdraw = daily_resource_use
-                    .saturating_sub(domestic_resources)
-                    .total();
-                let resource_utilization_bp = daily_resource_use
-                    .scale_bp(resource_fulfillment_bp)
-                    .utilization_bp(domestic_resources);
-                let score = i64::from(divisions) * 20_000 + i64::from(resource_utilization_bp) * 4
-                    - i64::from(resource_overdraw) * 50_000
-                    - i64::from(factory_allocation.total()) * 40
-                    - i64::from(template.estimated_ic_cost_centi() / 100);
+            let starting_fielded_equipped_demand = exact_starting_fielded_equipped_demand
+                .unwrap_or_else(|| template.demand_for(starting_fielded_divisions.min(divisions)));
+            let reserve_demand = frontline_demand.reserve_buffer(force_goal.reserve_ratios);
+            let stockpile_target_demand = frontline_demand
+                .saturating_sub(starting_fielded_equipped_demand.without_manpower())
+                .plus(reserve_demand);
+            let total_demand = frontline_demand.plus(reserve_demand);
+            let factory_allocation = derive_factory_allocation(
+                stockpile_target_demand,
+                equipment_profiles,
+                factory_capacity_centi,
+            );
+            let daily_resource_use =
+                derive_daily_resource_use(factory_allocation, equipment_profiles);
+            let resource_fulfillment_bp = daily_resource_use.fulfillment_bp(domestic_resources);
+            let resource_overdraw = daily_resource_use
+                .saturating_sub(domestic_resources)
+                .total();
+            let resource_utilization_bp = daily_resource_use
+                .scale_bp(resource_fulfillment_bp)
+                .utilization_bp(domestic_resources);
+            let score = i64::from(resource_utilization_bp) * 4
+                - i64::from(resource_overdraw) * 50_000
+                - i64::from(factory_allocation.total()) * 40
+                - i64::from(template.estimated_ic_cost_centi() / 100);
 
-                let plan = ForcePlan {
-                    template,
-                    frontline_divisions: divisions,
-                    frontline_demand,
-                    starting_fielded_equipped_demand,
-                    reserve_demand,
-                    stockpile_target_demand,
-                    total_demand,
-                    required_military_factories: factory_allocation.total(),
-                    factory_allocation,
-                    daily_resource_use,
-                    resource_utilization_bp,
-                };
-                match best_plan {
-                    Some((best_score, _)) if best_score >= score => {}
-                    _ => best_plan = Some((score, plan)),
-                }
+            let plan = ForcePlan {
+                template,
+                frontline_divisions: divisions,
+                frontline_demand,
+                starting_fielded_equipped_demand,
+                reserve_demand,
+                stockpile_target_demand,
+                total_demand,
+                required_military_factories: factory_allocation.total(),
+                factory_allocation,
+                daily_resource_use,
+                resource_utilization_bp,
+            };
+            match best_plan {
+                Some((best_score, _)) if best_score >= score => {}
+                _ => best_plan = Some((score, plan)),
             }
         }
 
         best_plan.map(|(_, plan)| plan).unwrap_or_else(|| {
             let template = DivisionTemplate::canonical_france_line();
-            let frontline_demand = template.demand_for(min_divisions);
+            let additional_divisions = min_divisions.saturating_sub(starting_fielded_divisions);
+            let frontline_demand = exact_starting_fielded_target_demand
+                .unwrap_or_else(|| template.demand_for(min_divisions));
+            let frontline_demand = if exact_starting_fielded_target_demand.is_some() {
+                frontline_demand.plus(template.demand_for(additional_divisions))
+            } else {
+                frontline_demand
+            };
             let starting_fielded_equipped_demand = exact_starting_fielded_equipped_demand
                 .unwrap_or_else(|| {
                     template.demand_for(starting_fielded_divisions.min(min_divisions))
@@ -1325,10 +1363,6 @@ mod tests {
     #[test]
     fn exact_fielded_force_data_increases_stockpile_target_for_understrength_start() {
         let scenario = France1936Scenario::standard();
-        let baseline = scenario
-            .force_plan
-            .stockpile_target_demand
-            .infantry_equipment;
         let demand = EquipmentDemand {
             infantry_equipment: 1_000,
             support_equipment: 0,
@@ -1346,10 +1380,43 @@ mod tests {
         ]);
 
         assert_eq!(exact.starting_fielded_divisions, 72);
+        assert_eq!(exact.force_plan.frontline_divisions, 72);
         assert!(exact.starting_fielded_equipped_demand.is_some());
-        assert!(
-            exact.force_plan.stockpile_target_demand.infantry_equipment > baseline,
-            "exact fielded force should include the opening reinforcement gap"
+        assert_eq!(exact.force_plan.frontline_demand, demand.scale(72));
+        assert_eq!(
+            exact.force_plan.stockpile_target_demand,
+            demand
+                .scale(72)
+                .saturating_sub(
+                    demand
+                        .scale_equipment_basis_points(5_000)
+                        .scale(72)
+                        .without_manpower()
+                )
+                .plus(
+                    demand
+                        .scale(72)
+                        .reserve_buffer(exact.force_goal.reserve_ratios)
+                )
         );
+    }
+
+    #[test]
+    fn exact_fielded_force_data_keeps_force_plan_at_existing_fielded_division_count() {
+        let scenario = France1936Scenario::standard();
+        let demand = EquipmentDemand {
+            infantry_equipment: 900,
+            support_equipment: 18,
+            artillery: 24,
+            anti_tank: 0,
+            anti_air: 0,
+            manpower: 1_200,
+        };
+        let exact =
+            scenario.with_exact_fielded_force_data(vec![FieldedDivision::new(demand, demand); 74]);
+
+        assert_eq!(exact.starting_fielded_divisions, 74);
+        assert_eq!(exact.force_plan.frontline_divisions, 74);
+        assert_eq!(exact.force_plan.frontline_demand, demand.scale(74));
     }
 }

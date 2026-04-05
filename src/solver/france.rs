@@ -1,4 +1,7 @@
-use crate::domain::{EquipmentKind, GameDate, NationalFocus, StrategicGoalWeights};
+use crate::domain::{
+    EquipmentDemand, EquipmentFactoryAllocation, EquipmentKind, GameDate, NationalFocus,
+    StrategicGoalWeights,
+};
 use crate::scenario::France1936Scenario;
 use crate::sim::{
     Action, AdvisorAction, AdvisorKind, ConstructionAction, ConstructionKind, CountryRuntime,
@@ -82,6 +85,7 @@ impl FranceBeamPlanner {
     fn search(&self, config: BeamSearchConfig) -> Result<PlannedSolution, SimulationError> {
         let end_date = self.scenario.milestones[3].date;
         let mut frontier = self.seed_nodes(config);
+        let seed_count = frontier.len();
 
         while frontier
             .iter()
@@ -149,13 +153,20 @@ impl FranceBeamPlanner {
                     .then_with(|| left.template.cmp(&right.template))
                     .then_with(|| left.pivot_date.cmp(&right.pivot_date))
             });
-            next_frontier.truncate(config.beam_width);
+            next_frontier.truncate(config.beam_width.max(seed_count));
             frontier = next_frontier;
         }
 
         let best = frontier
-            .into_iter()
+            .iter()
+            .filter(|node| self.hard_requirements_met(&node.runtime))
             .max_by(|left, right| left.score.cmp(&right.score))
+            .cloned()
+            .or_else(|| {
+                frontier
+                    .into_iter()
+                    .max_by(|left, right| left.score.cmp(&right.score))
+            })
             .expect("planner seeds at least one node");
 
         Ok(PlannedSolution {
@@ -294,6 +305,13 @@ impl FranceBeamPlanner {
 
         if self.focus_advances_hard_goal(&focus.id, &node.runtime) {
             score += 1_000_000;
+        }
+        if !node
+            .runtime
+            .frontier_forts_complete(&self.scenario.frontier_forts)
+            && self.focus_builds_land_forts(focus)
+        {
+            score += 750_000;
         }
 
         match phase {
@@ -502,6 +520,11 @@ impl FranceBeamPlanner {
                         .iter()
                         .map(|operation| match operation {
                             crate::domain::StateOperation::AddBuildingConstruction {
+                                kind: crate::domain::FocusBuildingKind::LandFort,
+                                level,
+                                ..
+                            } => i64::from(*level) * 8_000,
+                            crate::domain::StateOperation::AddBuildingConstruction {
                                 kind: crate::domain::FocusBuildingKind::CivilianFactory,
                                 level,
                                 ..
@@ -522,6 +545,11 @@ impl FranceBeamPlanner {
                                 .operations
                                 .iter()
                                 .map(|nested| match nested {
+                                    crate::domain::StateOperation::AddBuildingConstruction {
+                                        kind: crate::domain::FocusBuildingKind::LandFort,
+                                        level,
+                                        ..
+                                    } => i64::from(*level) * 4_000,
                                     crate::domain::StateOperation::AddBuildingConstruction {
                                         level,
                                         ..
@@ -562,6 +590,30 @@ impl FranceBeamPlanner {
                     + modifiers.infrastructure_construction_bp
                     + modifiers.land_fort_construction_bp,
             ) * 4
+    }
+
+    fn focus_builds_land_forts(&self, focus: &NationalFocus) -> bool {
+        focus.effects.iter().any(|effect| match effect {
+            crate::domain::FocusEffect::StateScoped(scope) => scope
+                .operations
+                .iter()
+                .any(Self::state_operation_builds_land_forts),
+            _ => false,
+        })
+    }
+
+    fn state_operation_builds_land_forts(operation: &crate::domain::StateOperation) -> bool {
+        match operation {
+            crate::domain::StateOperation::AddBuildingConstruction {
+                kind: crate::domain::FocusBuildingKind::LandFort,
+                ..
+            } => true,
+            crate::domain::StateOperation::NestedScope(scope) => scope
+                .operations
+                .iter()
+                .any(Self::state_operation_builds_land_forts),
+            _ => false,
+        }
     }
 
     fn next_research_branch(
@@ -776,13 +828,45 @@ impl FranceBeamPlanner {
         node: &PlannerNode,
         date: GameDate,
     ) -> Option<crate::sim::ProductionAction> {
-        let unassigned = node.runtime.unassigned_military_factories();
-        if unassigned == 0 {
-            return None;
-        }
-
-        let demand = self.scenario.force_plan.stockpile_target_demand;
-        let desired_allocation = self.scenario.force_plan.factory_allocation;
+        let minimum_supported = self.scenario.force_goal.division_band().min;
+        let current_supported = node.runtime.supported_divisions(
+            self.scenario.force_plan.template.per_division_demand(),
+            &self.scenario.ideas,
+        );
+        let (demand_gap, desired_allocation) = if current_supported < minimum_supported {
+            let shortfall = self.readiness_shortfall_demand(&node.runtime);
+            let days_remaining = u16::try_from(
+                node.runtime
+                    .country
+                    .date
+                    .days_until(self.scenario.milestones[3].date)
+                    .max(1),
+            )
+            .unwrap_or(u16::MAX);
+            (
+                shortfall,
+                self.factory_allocation_for_demand(
+                    shortfall,
+                    node.runtime.equipment_profiles,
+                    days_remaining,
+                ),
+            )
+        } else {
+            (
+                self.scenario
+                    .force_plan
+                    .stockpile_target_demand
+                    .saturating_sub(EquipmentDemand {
+                        infantry_equipment: node.runtime.stockpile.infantry_equipment,
+                        support_equipment: node.runtime.stockpile.support_equipment,
+                        artillery: node.runtime.stockpile.artillery,
+                        anti_tank: node.runtime.stockpile.anti_tank,
+                        anti_air: node.runtime.stockpile.anti_air,
+                        manpower: 0,
+                    }),
+                self.scenario.force_plan.factory_allocation,
+            )
+        };
         let equipment = [
             EquipmentKind::InfantryEquipment,
             EquipmentKind::SupportEquipment,
@@ -791,47 +875,236 @@ impl FranceBeamPlanner {
             EquipmentKind::AntiAir,
         ]
         .into_iter()
+        .filter(|equipment| demand_gap.get(*equipment) > 0)
         .max_by_key(|equipment| {
             let target_factories = desired_allocation.get(*equipment);
-            let assigned_factories = node
-                .runtime
-                .production_lines
-                .iter()
-                .find(|line| line.equipment == *equipment)
-                .map(|line| u16::from(line.factories))
-                .unwrap_or(0);
-            let stockpile_gap = demand
-                .get(*equipment)
-                .saturating_sub(node.runtime.stockpile.get(*equipment));
+            let assigned_factories =
+                self.assigned_factories_for_equipment(&node.runtime, *equipment);
+            let stockpile_gap = demand_gap.get(*equipment);
 
             (
                 target_factories.saturating_sub(assigned_factories),
                 stockpile_gap,
             )
         })?;
+        let current_assigned = self.assigned_factories_for_equipment(&node.runtime, equipment);
+        let target_factories = desired_allocation
+            .get(equipment)
+            .max(current_assigned.saturating_add(1));
+        let unassigned = node.runtime.unassigned_military_factories();
 
-        let slot = node
+        if let Some(slot) = node
             .runtime
             .production_lines
             .iter()
-            .position(|line| line.equipment == equipment)?;
-        let current_factories = node.runtime.production_lines[slot].factories;
-        let target_factories = desired_allocation
-            .get(equipment)
-            .max(u16::from(current_factories) + 1);
+            .position(|line| line.equipment == equipment)
+        {
+            let current_factories = node.runtime.production_lines[slot].factories;
+            let factories = u8::try_from(
+                u16::from(current_factories)
+                    .saturating_add(unassigned.min(2))
+                    .min(target_factories),
+            )
+            .unwrap_or(u8::MAX);
+            if factories != current_factories {
+                return Some(crate::sim::ProductionAction {
+                    date,
+                    slot: u8::try_from(slot).unwrap_or(u8::MAX),
+                    equipment,
+                    factories,
+                });
+            }
+        }
+
+        let donor_slot =
+            self.production_donor_slot(node, equipment, desired_allocation, demand_gap)?;
+        let donor_line = node.runtime.production_lines[donor_slot];
+        let needed_factories = target_factories
+            .saturating_sub(current_assigned)
+            .max(u16::from(donor_line.factories).min(1));
         let factories = u8::try_from(
-            u16::from(current_factories)
+            u16::from(donor_line.factories)
                 .saturating_add(unassigned.min(2))
-                .min(target_factories),
+                .min(needed_factories.max(1)),
         )
         .unwrap_or(u8::MAX);
 
         Some(crate::sim::ProductionAction {
             date,
-            slot: u8::try_from(slot).unwrap_or(u8::MAX),
+            slot: u8::try_from(donor_slot).unwrap_or(u8::MAX),
             equipment,
             factories,
         })
+    }
+
+    fn assigned_factories_for_equipment(
+        &self,
+        runtime: &CountryRuntime,
+        equipment: EquipmentKind,
+    ) -> u16 {
+        runtime
+            .production_lines
+            .iter()
+            .filter(|line| line.equipment == equipment)
+            .map(|line| u16::from(line.factories))
+            .sum()
+    }
+
+    fn production_donor_slot(
+        &self,
+        node: &PlannerNode,
+        target: EquipmentKind,
+        desired_allocation: EquipmentFactoryAllocation,
+        demand_gap: EquipmentDemand,
+    ) -> Option<usize> {
+        node.runtime
+            .production_lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.equipment != target && line.factories > 0)
+            .filter(|(_, line)| {
+                let assigned = self.assigned_factories_for_equipment(&node.runtime, line.equipment);
+                let desired = desired_allocation.get(line.equipment);
+                line.equipment == EquipmentKind::Unmodeled
+                    || assigned > desired
+                    || demand_gap.get(line.equipment) == 0
+            })
+            .max_by_key(|(_, line)| {
+                let assigned = self.assigned_factories_for_equipment(&node.runtime, line.equipment);
+                let desired = desired_allocation.get(line.equipment);
+                (
+                    line.equipment == EquipmentKind::Unmodeled,
+                    assigned.saturating_sub(desired),
+                    node.runtime.stockpile.get(line.equipment),
+                    line.factories,
+                )
+            })
+            .map(|(slot, _)| slot)
+    }
+
+    fn readiness_shortfall_demand(&self, runtime: &CountryRuntime) -> EquipmentDemand {
+        let mut remaining_stockpile = runtime.stockpile;
+        let mut ready_divisions = 0_u16;
+        let target_ready = self.scenario.force_goal.division_band().min;
+        let mut shortfall = EquipmentDemand::default();
+
+        for division in runtime.fielded_force.iter() {
+            if !division.target_demand.has_equipment() {
+                continue;
+            }
+            if ready_divisions >= target_ready {
+                break;
+            }
+
+            let gap = division.reinforcement_gap();
+            if !gap.has_equipment() {
+                ready_divisions = ready_divisions.saturating_add(1);
+                continue;
+            }
+            if remaining_stockpile.covers(gap) {
+                remaining_stockpile = remaining_stockpile.saturating_sub_demand(gap);
+                ready_divisions = ready_divisions.saturating_add(1);
+                continue;
+            }
+
+            shortfall = shortfall.plus(EquipmentDemand {
+                infantry_equipment: gap
+                    .infantry_equipment
+                    .saturating_sub(remaining_stockpile.infantry_equipment),
+                support_equipment: gap
+                    .support_equipment
+                    .saturating_sub(remaining_stockpile.support_equipment),
+                artillery: gap.artillery.saturating_sub(remaining_stockpile.artillery),
+                anti_tank: gap.anti_tank.saturating_sub(remaining_stockpile.anti_tank),
+                anti_air: gap.anti_air.saturating_sub(remaining_stockpile.anti_air),
+                manpower: 0,
+            });
+            remaining_stockpile = remaining_stockpile.saturating_sub_demand(gap);
+            ready_divisions = ready_divisions.saturating_add(1);
+        }
+
+        if ready_divisions < target_ready {
+            shortfall = shortfall.plus(
+                self.scenario
+                    .force_plan
+                    .template
+                    .per_division_demand()
+                    .without_manpower()
+                    .scale(target_ready.saturating_sub(ready_divisions)),
+            );
+        }
+
+        shortfall
+    }
+
+    fn military_base_covers_readiness_shortfall(&self, runtime: &CountryRuntime) -> bool {
+        let shortfall = self.readiness_shortfall_demand(runtime);
+        if !shortfall.has_equipment() {
+            return true;
+        }
+
+        let days_remaining = u16::try_from(
+            runtime
+                .country
+                .date
+                .days_until(self.scenario.milestones[3].date)
+                .max(1),
+        )
+        .unwrap_or(u16::MAX);
+        let allocation = self.factory_allocation_for_demand(
+            shortfall,
+            runtime.equipment_profiles,
+            days_remaining,
+        );
+        runtime.total_military_factories() >= allocation.total()
+    }
+
+    fn factory_allocation_for_demand(
+        &self,
+        demand: EquipmentDemand,
+        equipment_profiles: crate::domain::ModeledEquipmentProfiles,
+        days_remaining: u16,
+    ) -> EquipmentFactoryAllocation {
+        let factory_capacity_centi = self.estimated_factory_capacity_centi(days_remaining).max(1);
+        let mut allocation = EquipmentFactoryAllocation::default();
+
+        for equipment in [
+            EquipmentKind::InfantryEquipment,
+            EquipmentKind::SupportEquipment,
+            EquipmentKind::Artillery,
+            EquipmentKind::AntiTank,
+            EquipmentKind::AntiAir,
+        ] {
+            let amount = demand.get(equipment);
+            if amount == 0 {
+                continue;
+            }
+            let total_ic = u64::from(amount)
+                * u64::from(equipment_profiles.profile(equipment).unit_cost_centi);
+            allocation.set(
+                equipment,
+                u16::try_from(total_ic.div_ceil(factory_capacity_centi)).unwrap_or(u16::MAX),
+            );
+        }
+
+        allocation
+    }
+
+    fn estimated_factory_capacity_centi(&self, days: u16) -> u64 {
+        let config = self.simulator.config;
+        let mut efficiency = 100_u16;
+        let mut total = 0_u64;
+
+        for _ in 0..days {
+            total += u64::from(config.production_output_centi_per_factory) * u64::from(efficiency)
+                / 1_000;
+            if efficiency < config.production_efficiency_cap_permille {
+                efficiency = (efficiency + config.production_efficiency_gain_permille)
+                    .min(config.production_efficiency_cap_permille);
+            }
+        }
+
+        total
     }
 
     fn next_construction_action(
@@ -846,19 +1119,25 @@ impl FranceBeamPlanner {
                 StrategyTemplateKind::InfraAssisted => self
                     .next_infrastructure_action(node, date, pending_actions)
                     .or_else(|| self.next_civilian_action(node, date, pending_actions)),
-                StrategyTemplateKind::CivFirst | StrategyTemplateKind::EarlyMilitaryPivot => {
+                StrategyTemplateKind::CivFirst => {
                     self.next_civilian_action(node, date, pending_actions)
                 }
+                StrategyTemplateKind::EarlyMilitaryPivot => self
+                    .next_military_action(node, date, pending_actions)
+                    .or_else(|| self.next_civilian_action(node, date, pending_actions)),
             },
             StrategicPhase::PostPivot => {
-                let minimum_force_target_met = node.runtime.supported_divisions(
-                    self.scenario.force_plan.template.per_division_demand(),
-                    &self.scenario.ideas,
-                ) >= self.scenario.force_goal.division_band().min;
-                if minimum_force_target_met
-                    && !node
-                        .runtime
-                        .frontier_forts_complete(&self.scenario.frontier_forts)
+                let minimum_force_target_met =
+                    node.runtime.supported_divisions(
+                        self.scenario.force_plan.template.per_division_demand(),
+                        &self.scenario.ideas,
+                    ) >= self.scenario.force_goal.fort_construction_division_floor();
+                let frontier_fort_priority = date >= self.scenario.milestones[2].date
+                    || self.military_base_covers_readiness_shortfall(&node.runtime);
+                let frontier_forts_complete = node
+                    .runtime
+                    .frontier_forts_complete(&self.scenario.frontier_forts);
+                if !frontier_forts_complete && (minimum_force_target_met || frontier_fort_priority)
                 {
                     self.next_fort_action(node, date, pending_actions)
                 } else if node.runtime.total_military_factories()
@@ -1079,6 +1358,8 @@ impl FranceBeamPlanner {
                 .utilization_bp(available_resources),
         );
         let resource_fulfillment = i64::from(resource_fulfillment_bp);
+        let minimum_ready_gap =
+            (i64::from(self.scenario.force_goal.division_band().min) - ready_divisions).max(0);
         let manpower_headroom = runtime
             .available_manpower(&self.scenario.ideas)
             .saturating_sub(u64::from(force_plan.frontline_demand.manpower));
@@ -1104,8 +1385,10 @@ impl FranceBeamPlanner {
         if runtime.country.date >= self.scenario.milestones[2].date {
             score -= factory_gap.max(0) * 800;
             score -= stockpile_gap * 4;
+            score -= minimum_ready_gap * 25_000;
         }
         if runtime.country.date >= self.scenario.milestones[3].date {
+            score -= minimum_ready_gap * 50_000;
             if runtime.frontier_forts_complete(&self.scenario.frontier_forts) {
                 score += 20_000;
             } else {
@@ -1262,10 +1545,14 @@ fn min_date(left: GameDate, right: GameDate) -> GameDate {
 #[cfg(test)]
 mod tests {
     use crate::domain::{
-        FocusCondition, FocusEffect, GameDate, HardFocusGoal, NationalFocus, StrategicGoalWeights,
+        FieldedDivision, FocusCondition, FocusEffect, GameDate, HardFocusGoal, NationalFocus,
+        StrategicGoalWeights,
     };
     use crate::scenario::France1936Scenario;
-    use crate::sim::{Action, ResearchBranch, SimulationConfig, SimulationEngine, SimulationError};
+    use crate::sim::{
+        Action, ConstructionKind, ResearchBranch, SimulationConfig, SimulationEngine,
+        SimulationError, Stockpile, StrategicPhase,
+    };
 
     use super::{FranceBeamPlanner, StrategyTemplateKind};
 
@@ -1408,6 +1695,51 @@ mod tests {
                 &scenario.ideas,
             ) >= scenario.force_goal.division_band().min
         );
+    }
+
+    #[test]
+    fn post_pivot_construction_switches_to_forts_once_current_military_base_can_close_gap() {
+        let scenario = France1936Scenario::standard();
+        let planner = FranceBeamPlanner::new(
+            scenario.clone(),
+            SimulationEngine::default(),
+            crate::solver::BeamSearchConfig::new(4, 35),
+            crate::solver::PlannerWeights::default(),
+        );
+        let demand = scenario.force_plan.template.per_division_demand();
+        let mut fielded_force = vec![
+            FieldedDivision {
+                target_demand: demand,
+                equipped_demand: demand
+            };
+            72
+        ];
+        fielded_force[0].equipped_demand.infantry_equipment -= 1;
+
+        let mut runtime = scenario
+            .bootstrap_runtime()
+            .with_exact_fielded_force(fielded_force.into_boxed_slice());
+        runtime.country.date = scenario.pivot_window.start.next_day();
+        runtime.stockpile = Stockpile::default();
+
+        let node = super::PlannerNode {
+            template: StrategyTemplateKind::EarlyMilitaryPivot,
+            pivot_date: scenario.pivot_window.start,
+            actions: Vec::new(),
+            runtime,
+            score: 0,
+        };
+
+        let action = planner
+            .next_construction_action(
+                &node,
+                StrategicPhase::PostPivot,
+                node.runtime.country.date,
+                &[],
+            )
+            .expect("planner chooses a post-pivot construction action");
+
+        assert_eq!(action.kind, ConstructionKind::LandFort);
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub struct ConstructionDecisionContext {
     pub military_factory_target_met: bool,
     pub minimum_force_target_met: bool,
     pub frontier_forts_met: bool,
+    pub frontier_fort_priority: bool,
     pub civilian_exception: bool,
     pub infrastructure_is_justified: bool,
 }
@@ -20,6 +21,7 @@ impl ConstructionDecisionContext {
             military_factory_target_met: false,
             minimum_force_target_met: false,
             frontier_forts_met: false,
+            frontier_fort_priority: false,
             civilian_exception: false,
             infrastructure_is_justified,
         }
@@ -127,7 +129,7 @@ impl FranceHeuristicRules {
         kind: ConstructionKind,
     ) -> Result<(), RuleViolation> {
         match kind {
-            ConstructionKind::CivilianFactory => Ok(()),
+            ConstructionKind::CivilianFactory | ConstructionKind::MilitaryFactory => Ok(()),
             ConstructionKind::Infrastructure if context.infrastructure_is_justified => Ok(()),
             ConstructionKind::Infrastructure => {
                 Err(RuleViolation::InfrastructureNeedsJustification)
@@ -140,7 +142,9 @@ impl FranceHeuristicRules {
         context: ConstructionDecisionContext,
         kind: ConstructionKind,
     ) -> Result<(), RuleViolation> {
-        if context.minimum_force_target_met && !context.frontier_forts_met {
+        if (context.minimum_force_target_met || context.frontier_fort_priority)
+            && !context.frontier_forts_met
+        {
             if kind == ConstructionKind::LandFort {
                 return Ok(());
             }
@@ -211,17 +215,12 @@ mod tests {
     }
 
     #[test]
-    fn pre_pivot_construction_disallows_military_factories() {
+    fn pre_pivot_construction_allows_military_factories() {
         let context = ConstructionDecisionContext::pre_pivot(true);
         let result =
             FranceHeuristicRules::validate_construction(context, ConstructionKind::MilitaryFactory);
 
-        assert_eq!(
-            result,
-            Err(RuleViolation::ConstructionKindNotAllowed(
-                ConstructionKind::MilitaryFactory,
-            ))
-        );
+        assert_eq!(result, Ok(()));
     }
 
     #[test]
@@ -231,6 +230,7 @@ mod tests {
             military_factory_target_met: false,
             minimum_force_target_met: false,
             frontier_forts_met: false,
+            frontier_fort_priority: false,
             civilian_exception: false,
             infrastructure_is_justified: false,
         };
@@ -247,6 +247,7 @@ mod tests {
             military_factory_target_met: true,
             minimum_force_target_met: true,
             frontier_forts_met: false,
+            frontier_fort_priority: false,
             civilian_exception: false,
             infrastructure_is_justified: false,
         };
@@ -263,6 +264,7 @@ mod tests {
             military_factory_target_met: false,
             minimum_force_target_met: true,
             frontier_forts_met: false,
+            frontier_fort_priority: false,
             civilian_exception: false,
             infrastructure_is_justified: false,
         };

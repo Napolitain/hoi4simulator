@@ -113,6 +113,13 @@ impl ForceGoalSpec {
             u16::try_from(max).unwrap_or(u16::MAX),
         )
     }
+
+    pub fn fort_construction_division_floor(self) -> u16 {
+        let minimum = self.division_band().min;
+        let buffer = (u32::from(minimum) * u32::from(self.acceptable_stockpile_shortfall_bp))
+            .div_ceil(10_000);
+        minimum.saturating_sub(u16::try_from(buffer).unwrap_or(u16::MAX))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
