@@ -4,7 +4,8 @@ use crate::data::{DataError, StructuredFrance1936Dataset};
 use crate::domain::{
     CountryLaws, DivisionTemplate, EquipmentDemand, EquipmentFactoryAllocation, EquipmentKind,
     ForceGoalSpec, ForcePlan, GameDate, HardFocusGoal, IdeaDefinition, Milestone, MilestoneKind,
-    ModeledEquipmentProfiles, NationalFocus, PivotWindow, ResourceLedger,
+    ModeledEquipmentProfiles, NationalFocus, PivotWindow, ResourceLedger, TechId,
+    TechnologyModifiers, TechnologyNode, TechnologyTree,
 };
 use crate::sim::{
     CountryRuntime, CountryState, ProductionLine, SimulationConfig, StateDefinition, StateId,
@@ -39,6 +40,8 @@ pub struct France1936Scenario {
     pub starting_research_slots: u8,
     pub starting_ideas: Box<[Box<str>]>,
     pub starting_country_flags: Box<[Box<str>]>,
+    pub technology_tree: TechnologyTree,
+    pub starting_technologies: Box<[bool]>,
     pub focuses: Box<[NationalFocus]>,
     pub ideas: Box<[IdeaDefinition]>,
     pub hard_focus_goals: Box<[HardFocusGoal]>,
@@ -358,6 +361,8 @@ impl France1936Scenario {
             starting_research_slots: 2,
             starting_ideas: Vec::new().into_boxed_slice(),
             starting_country_flags: Vec::new().into_boxed_slice(),
+            technology_tree: TechnologyTree::default(),
+            starting_technologies: Vec::new().into_boxed_slice(),
             focuses: Vec::new().into_boxed_slice(),
             ideas: Vec::new().into_boxed_slice(),
             hard_focus_goals: Vec::new().into_boxed_slice(),
@@ -567,6 +572,8 @@ impl France1936Scenario {
             starting_research_slots: 2,
             starting_ideas: Vec::new().into_boxed_slice(),
             starting_country_flags: Vec::new().into_boxed_slice(),
+            technology_tree: TechnologyTree::default(),
+            starting_technologies: Vec::new().into_boxed_slice(),
             focuses: Vec::new().into_boxed_slice(),
             ideas: Vec::new().into_boxed_slice(),
             hard_focus_goals: Vec::new().into_boxed_slice(),
@@ -590,6 +597,7 @@ impl France1936Scenario {
             self.initial_production_lines.clone(),
         )
         .with_research_slots(self.starting_research_slots)
+        .with_equipment_profiles(self.equipment_profiles)
         .with_fielded_force(
             self.starting_fielded_divisions
                 .min(self.force_plan.frontline_divisions),
@@ -602,6 +610,12 @@ impl France1936Scenario {
         for flag in self.starting_country_flags.iter().cloned() {
             runtime.set_country_flag(flag);
         }
+        if !self.technology_tree.is_empty() {
+            runtime.initialize_completed_technologies(
+                &self.technology_tree,
+                self.starting_technologies.clone(),
+            );
+        }
 
         runtime
     }
@@ -612,6 +626,10 @@ impl France1936Scenario {
 
     pub fn idea_by_id(&self, id: &str) -> Option<&IdeaDefinition> {
         self.ideas.iter().find(|idea| idea.id.as_ref() == id)
+    }
+
+    pub fn technology(&self, id: TechId) -> Option<&TechnologyNode> {
+        self.technology_tree.nodes().get(id.index())
     }
 
     pub fn with_exact_focus_data(
@@ -629,7 +647,7 @@ impl France1936Scenario {
         self.focuses = focuses.into_boxed_slice();
         self.ideas = ideas.into_boxed_slice();
         self.hard_focus_goals = hard_focus_goals.into_boxed_slice();
-        self.domestic_resources = self.bootstrap_runtime().domestic_resources(&self.ideas);
+        self.domestic_resources = self.starting_domestic_resources();
         self.force_plan = Self::derive_force_plan(
             self.start_date,
             self.initial_country.population,
@@ -643,6 +661,32 @@ impl France1936Scenario {
 
     pub fn with_hard_focus_goals(mut self, hard_focus_goals: Vec<HardFocusGoal>) -> Self {
         self.hard_focus_goals = hard_focus_goals.into_boxed_slice();
+        self
+    }
+
+    pub fn with_exact_technology_data(
+        mut self,
+        technology_tree: TechnologyTree,
+        starting_technology_tokens: Vec<Box<str>>,
+    ) -> Self {
+        let mut starting_technologies = vec![false; technology_tree.len()];
+        for token in starting_technology_tokens {
+            if let Some(id) = technology_tree.find_by_token(&token) {
+                starting_technologies[id.index()] = true;
+            }
+        }
+        self.technology_tree = technology_tree;
+        self.starting_technologies = starting_technologies.into_boxed_slice();
+        self.equipment_profiles = self.starting_equipment_profiles();
+        self.domestic_resources = self.starting_domestic_resources();
+        self.force_plan = Self::derive_force_plan(
+            self.start_date,
+            self.initial_country.population,
+            self.domestic_resources,
+            self.force_goal,
+            self.equipment_profiles,
+            self.starting_fielded_divisions,
+        );
         self
     }
 
@@ -687,6 +731,60 @@ impl France1936Scenario {
                 target_level: 5,
             },
         ]
+    }
+
+    fn starting_idea_modifiers(&self) -> crate::domain::IdeaModifiers {
+        self.starting_ideas
+            .iter()
+            .filter_map(|active| self.ideas.iter().find(|idea| idea.id == *active))
+            .fold(crate::domain::IdeaModifiers::default(), |total, idea| {
+                total.plus(idea.modifiers)
+            })
+    }
+
+    fn starting_technology_modifiers(&self) -> TechnologyModifiers {
+        self.starting_technologies
+            .iter()
+            .enumerate()
+            .filter(|(_, completed)| **completed)
+            .fold(TechnologyModifiers::default(), |total, (index, _)| {
+                total.plus(
+                    self.technology_tree
+                        .node(TechId(u16::try_from(index).unwrap_or(u16::MAX)))
+                        .modifiers,
+                )
+            })
+    }
+
+    fn starting_equipment_profiles(&self) -> ModeledEquipmentProfiles {
+        let mut profiles = self.equipment_profiles;
+        for (index, completed) in self.starting_technologies.iter().enumerate() {
+            if !*completed {
+                continue;
+            }
+            let node = self
+                .technology_tree
+                .node(TechId(u16::try_from(index).unwrap_or(u16::MAX)));
+            for unlock in node.equipment_unlocks.iter().copied() {
+                profiles.set(unlock.kind, unlock.profile);
+            }
+        }
+        profiles
+    }
+
+    fn starting_domestic_resources(&self) -> ResourceLedger {
+        let base = aggregate_domestic_resources(&self.initial_state_defs);
+        let idea_modifiers = self.starting_idea_modifiers();
+        let technology_modifiers = self.starting_technology_modifiers();
+        let modifier_bp = i32::from(
+            self.initial_country
+                .laws
+                .trade
+                .local_resource_retention_bp(),
+        ) + idea_modifiers.resource_factor_bp
+            + technology_modifiers.local_resources_bp;
+        let modifier_bp = u16::try_from(modifier_bp.clamp(0, i32::from(u16::MAX))).unwrap_or(0);
+        base.scale_bp(modifier_bp)
     }
 
     fn derive_force_plan(

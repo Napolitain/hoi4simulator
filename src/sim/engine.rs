@@ -56,6 +56,7 @@ pub enum SimulationError {
     InsufficientPoliticalPower,
     ResearchSlotBusy(u8),
     InvalidResearchSlot(u8),
+    ResearchUnavailable(ResearchBranch),
     InvalidProductionSlot(u8),
     DuplicateProductionSlot(u8),
     DuplicateResearchBranch(ResearchBranch),
@@ -237,7 +238,7 @@ impl SimulationEngine {
             Action::Focus(action) => self.apply_focus_action(scenario, country, action),
             Action::Law(action) => self.apply_law_action(country, action, pivot_date),
             Action::Advisor(action) => self.apply_advisor_action(country, action, pivot_date),
-            Action::Research(action) => self.apply_research_action(country, action),
+            Action::Research(action) => self.apply_research_action(scenario, country, action),
         }
     }
 
@@ -391,6 +392,7 @@ impl SimulationEngine {
 
     fn apply_research_action(
         &self,
+        scenario: &France1936Scenario,
         country: &mut CountryRuntime,
         action: ResearchAction,
     ) -> Result<(), SimulationError> {
@@ -410,8 +412,26 @@ impl SimulationEngine {
             return Err(SimulationError::DuplicateResearchBranch(action.branch));
         }
 
+        let technology = if scenario.technology_tree.is_empty() {
+            None
+        } else {
+            scenario
+                .technology_tree
+                .next_available(
+                    action.branch,
+                    &country.completed_technologies,
+                    country
+                        .research_slots
+                        .iter()
+                        .filter_map(|slot| slot.technology),
+                )
+                .ok_or(SimulationError::ResearchUnavailable(action.branch))
+                .map(Some)?
+        };
+
         country.research_slots[slot_index].branch = Some(action.branch);
-        country.research_slots[slot_index].days_progress = 0;
+        country.research_slots[slot_index].technology = technology;
+        country.research_slots[slot_index].progress_centi = 0;
 
         Ok(())
     }
@@ -427,6 +447,11 @@ impl SimulationEngine {
             return Err(SimulationError::InvalidProductionSlot(action.slot));
         }
 
+        let unit_cost_centi = country
+            .equipment_profiles
+            .profile(action.equipment)
+            .unit_cost_centi;
+        let efficiency_floor_permille = country.production_efficiency_floor_permille();
         let line = &mut country.production_lines[slot_index];
         let changed_line_assignment =
             line.equipment != action.equipment || line.factories != action.factories;
@@ -442,7 +467,12 @@ impl SimulationEngine {
         })
         .map_err(SimulationError::HeuristicViolation)?;
 
-        line.reassign(action.equipment, action.factories);
+        line.reassign(
+            action.equipment,
+            action.factories,
+            unit_cost_centi,
+            efficiency_floor_permille,
+        );
 
         Ok(())
     }
@@ -477,12 +507,29 @@ impl SimulationEngine {
             let Some(branch) = country.research_slots[slot_index].branch else {
                 continue;
             };
+            let required_progress_centi =
+                if let Some(technology) = country.research_slots[slot_index].technology {
+                    u32::from(scenario.technology_tree.node(technology).base_days) * 10_000
+                } else {
+                    u32::from(self.base_research_days(branch)) * 10_000
+                };
+            let daily_progress_centi = self.daily_research_progress_centi(
+                scenario,
+                country,
+                country.research_slots[slot_index].technology,
+                branch,
+            );
 
-            country.research_slots[slot_index].days_progress += 1;
-            if country.research_slots[slot_index].days_progress
-                >= self.research_days(branch, country.research_speed_bp(&scenario.ideas))
-            {
-                country.apply_research_completion(branch);
+            country.research_slots[slot_index].progress_centi = country.research_slots[slot_index]
+                .progress_centi
+                .saturating_add(daily_progress_centi);
+            if country.research_slots[slot_index].progress_centi >= required_progress_centi {
+                if let Some(technology) = country.research_slots[slot_index].technology {
+                    let node = scenario.technology_tree.node(technology).clone();
+                    country.apply_technology_completion(&node);
+                } else {
+                    country.apply_research_completion(branch);
+                }
                 country.research_slots[slot_index] = super::state::ResearchSlotState::default();
             }
         }
@@ -554,13 +601,17 @@ impl SimulationEngine {
     fn advance_production(&self, scenario: &France1936Scenario, country: &mut CountryRuntime) {
         let output_bonus_bp = u32::from(country.military_output_bp(&scenario.ideas));
         let mut available_resources = country.domestic_resources(&scenario.ideas);
+        let efficiency_cap_permille = country
+            .production_efficiency_cap_permille(self.config.production_efficiency_cap_permille);
+        let efficiency_gain_permille = country
+            .production_efficiency_gain_permille(self.config.production_efficiency_gain_permille);
 
         for line in &mut country.production_lines {
             if line.factories == 0 {
                 continue;
             }
 
-            let resource_demand = line.daily_resource_demand(scenario.equipment_profiles);
+            let resource_demand = line.daily_resource_demand(country.equipment_profiles);
             let resource_fulfillment_bp = resource_demand.fulfillment_bp(available_resources);
             let consumed_resources = resource_demand.scale_bp(resource_fulfillment_bp);
             let prior_efficiency = line.efficiency_permille;
@@ -579,16 +630,13 @@ impl SimulationEngine {
 
             country.stockpile.add(line.equipment, produced_units);
 
-            if line.efficiency_permille < self.config.production_efficiency_cap_permille {
-                line.efficiency_permille = (line.efficiency_permille
-                    + self.config.production_efficiency_gain_permille)
-                    .min(self.config.production_efficiency_cap_permille);
+            if line.efficiency_permille < efficiency_cap_permille {
+                line.efficiency_permille = (line.efficiency_permille + efficiency_gain_permille)
+                    .min(efficiency_cap_permille);
             }
 
             debug_assert!(line.efficiency_permille >= prior_efficiency);
-            debug_assert!(
-                line.efficiency_permille <= self.config.production_efficiency_cap_permille
-            );
+            debug_assert!(line.efficiency_permille <= efficiency_cap_permille);
         }
     }
 
@@ -945,18 +993,46 @@ impl SimulationEngine {
         }
     }
 
-    fn research_days(&self, branch: super::actions::ResearchBranch, research_speed_bp: u16) -> u16 {
-        let base_days = match branch {
-            super::actions::ResearchBranch::Industry => 140_u16,
-            super::actions::ResearchBranch::Construction => 120_u16,
-            super::actions::ResearchBranch::Electronics => 150_u16,
-            super::actions::ResearchBranch::Production => 130_u16,
-        };
-        let speed_bp = u32::from(10_000_u16.saturating_add(research_speed_bp));
-        let days =
-            u16::try_from((u32::from(base_days) * 10_000).div_ceil(speed_bp)).unwrap_or(u16::MAX);
-        debug_assert!(days > 0);
-        days
+    fn base_research_days(&self, branch: ResearchBranch) -> u16 {
+        match branch {
+            ResearchBranch::Industry => 140_u16,
+            ResearchBranch::Construction => 120_u16,
+            ResearchBranch::Electronics => 150_u16,
+            ResearchBranch::Production => 130_u16,
+        }
+    }
+
+    fn daily_research_progress_centi(
+        &self,
+        scenario: &France1936Scenario,
+        country: &CountryRuntime,
+        technology: Option<crate::domain::TechId>,
+        branch: ResearchBranch,
+    ) -> u32 {
+        let research_speed_bp =
+            u32::from(10_000_u16.saturating_add(country.research_speed_bp(&scenario.ideas)));
+        if let Some(technology) = technology {
+            let ahead_penalty_bp = self.ahead_of_time_penalty_bp(
+                country.country.date,
+                scenario.technology_tree.node(technology).start_year,
+            );
+            let progress = (u64::from(research_speed_bp) * 10_000)
+                .div_ceil(u64::from(10_000 + ahead_penalty_bp));
+            return u32::try_from(progress.max(1)).unwrap_or(u32::MAX);
+        }
+
+        let _ = branch;
+        research_speed_bp.max(1)
+    }
+
+    fn ahead_of_time_penalty_bp(&self, current_date: GameDate, start_year: u16) -> u32 {
+        let start_date = GameDate::new(start_year, 1, 1);
+        if current_date >= start_date {
+            return 0;
+        }
+
+        let days_ahead = u32::try_from(current_date.days_until(start_date)).unwrap_or(u32::MAX);
+        days_ahead.saturating_mul(20_000).div_ceil(365)
     }
 
     fn construction_cost(&self, kind: ConstructionKind) -> u32 {
@@ -1062,10 +1138,11 @@ mod tests {
     use proptest::prelude::*;
 
     use crate::domain::{
-        DoctrineCostReduction, EconomyLaw, EquipmentKind, FocusBuildingKind, FocusCondition,
-        FocusEffect, FocusStateScope, GameDate, IdeaDefinition, IdeaModifiers, MobilizationLaw,
-        NationalFocus, ResourceLedger, StateCondition, StateOperation, StateScopedEffects,
-        TradeLaw,
+        DoctrineCostReduction, EconomyLaw, EquipmentKind, EquipmentProfile, EquipmentUnlock,
+        FocusBuildingKind, FocusCondition, FocusEffect, FocusStateScope, GameDate, IdeaDefinition,
+        IdeaModifiers, MobilizationLaw, NationalFocus, ResourceLedger, StateCondition,
+        StateOperation, StateScopedEffects, TechId, TechnologyModifiers, TechnologyNode,
+        TechnologyTree, TradeLaw,
     };
     use crate::scenario::France1936Scenario;
     use crate::sim::{
@@ -1301,6 +1378,105 @@ mod tests {
                 ResearchBranch::Construction,
             ))
         );
+    }
+
+    #[test]
+    fn ahead_of_time_penalty_recedes_as_year_approaches() {
+        let scenario = France1936Scenario::standard().with_exact_technology_data(
+            TechnologyTree::new(vec![TechnologyNode {
+                id: TechId(0),
+                token: "construction2".into(),
+                branch: ResearchBranch::Construction,
+                start_year: 1937,
+                base_days: 100,
+                prerequisites: Vec::new().into_boxed_slice(),
+                exclusive_with: Vec::new().into_boxed_slice(),
+                modifiers: TechnologyModifiers::default(),
+                equipment_unlocks: Vec::new().into_boxed_slice(),
+            }]),
+            Vec::new(),
+        );
+        let engine = SimulationEngine::default();
+        let mut runtime = scenario.bootstrap_runtime();
+
+        runtime.country.date = GameDate::new(1936, 1, 1);
+        let far_ahead = engine.daily_research_progress_centi(
+            &scenario,
+            &runtime,
+            Some(TechId(0)),
+            ResearchBranch::Construction,
+        );
+        runtime.country.date = GameDate::new(1936, 12, 31);
+        let near_ahead = engine.daily_research_progress_centi(
+            &scenario,
+            &runtime,
+            Some(TechId(0)),
+            ResearchBranch::Construction,
+        );
+        runtime.country.date = GameDate::new(1937, 1, 1);
+        let on_time = engine.daily_research_progress_centi(
+            &scenario,
+            &runtime,
+            Some(TechId(0)),
+            ResearchBranch::Construction,
+        );
+
+        assert!(far_ahead < near_ahead);
+        assert!(near_ahead < on_time);
+    }
+
+    #[test]
+    fn exact_research_completion_unlocks_runtime_equipment_profiles() {
+        let upgraded_artillery = EquipmentProfile::new(
+            525,
+            ResourceLedger {
+                steel: 3,
+                tungsten: 2,
+                ..ResourceLedger::default()
+            },
+        );
+        let scenario = France1936Scenario::standard().with_exact_technology_data(
+            TechnologyTree::new(vec![TechnologyNode {
+                id: TechId(0),
+                token: "artillery1".into(),
+                branch: ResearchBranch::Production,
+                start_year: 1936,
+                base_days: 1,
+                prerequisites: Vec::new().into_boxed_slice(),
+                exclusive_with: Vec::new().into_boxed_slice(),
+                modifiers: TechnologyModifiers::default(),
+                equipment_unlocks: vec![EquipmentUnlock {
+                    kind: EquipmentKind::Artillery,
+                    profile: upgraded_artillery,
+                }]
+                .into_boxed_slice(),
+            }]),
+            Vec::new(),
+        );
+        let runtime = scenario.bootstrap_runtime();
+        let engine = SimulationEngine::default();
+        let actions = [Action::Research(ResearchAction {
+            date: GameDate::new(1936, 1, 1),
+            slot: 0,
+            branch: ResearchBranch::Production,
+        })];
+
+        let result = engine
+            .simulate(
+                &scenario,
+                runtime,
+                &actions,
+                GameDate::new(1936, 1, 2),
+                scenario.pivot_window.start,
+            )
+            .unwrap();
+
+        assert!(result.country.completed_technologies[0]);
+        assert_eq!(
+            result.country.equipment_profiles.artillery,
+            upgraded_artillery
+        );
+        assert_eq!(result.country.production_lines[2].unit_cost_centi, 525);
     }
 
     #[test]
@@ -2042,7 +2218,7 @@ mod tests {
         }
 
         #[test]
-        fn research_days_stay_positive_under_large_speed_bonuses(
+        fn research_progress_stays_positive_under_large_speed_bonuses(
             branch in prop_oneof![
                 Just(ResearchBranch::Industry),
                 Just(ResearchBranch::Construction),
@@ -2052,9 +2228,13 @@ mod tests {
             research_speed_bp in 0u16..u16::MAX,
         ) {
             let engine = SimulationEngine::default();
-            let days = engine.research_days(branch, research_speed_bp);
+            let scenario = France1936Scenario::standard();
+            let mut runtime = scenario.bootstrap_runtime();
+            runtime.technology_modifiers.research_speed_bp = i32::from(research_speed_bp);
+            let progress =
+                engine.daily_research_progress_centi(&scenario, &runtime, None, branch);
 
-            prop_assert!(days > 0);
+            prop_assert!(progress > 0);
         }
     }
 

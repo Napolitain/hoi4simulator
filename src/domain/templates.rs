@@ -412,6 +412,17 @@ impl ModeledEquipmentProfiles {
             ),
         }
     }
+
+    pub fn set(&mut self, equipment: EquipmentKind, profile: EquipmentProfile) {
+        match equipment {
+            EquipmentKind::InfantryEquipment => self.infantry_equipment = profile,
+            EquipmentKind::SupportEquipment => self.support_equipment = profile,
+            EquipmentKind::Artillery => self.artillery = profile,
+            EquipmentKind::AntiTank => self.anti_tank = profile,
+            EquipmentKind::AntiAir => self.anti_air = profile,
+            EquipmentKind::Unmodeled => {}
+        }
+    }
 }
 
 #[cfg(test)]

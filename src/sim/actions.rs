@@ -1,3 +1,4 @@
+pub use crate::domain::ResearchBranch;
 use crate::domain::{EconomyLaw, EquipmentKind, GameDate, MobilizationLaw, TradeLaw};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -98,27 +99,6 @@ impl AdvisorKind {
 pub struct AdvisorAction {
     pub date: GameDate,
     pub kind: AdvisorKind,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ResearchBranch {
-    Industry,
-    Construction,
-    Electronics,
-    Production,
-}
-
-impl ResearchBranch {
-    pub const COUNT: usize = 4;
-
-    pub const fn index(self) -> usize {
-        match self {
-            Self::Industry => 0,
-            Self::Construction => 1,
-            Self::Electronics => 2,
-            Self::Production => 3,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

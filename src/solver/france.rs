@@ -607,7 +607,9 @@ impl FranceBeamPlanner {
         priorities
             .into_iter()
             .map(|(branch, _, _)| branch)
-            .find(|branch| !reserved[branch.index()])
+            .find(|branch: &ResearchBranch| {
+                !reserved[branch.index()] && self.research_branch_available(&node.runtime, *branch)
+            })
     }
 
     fn reserved_research_branches(
@@ -623,6 +625,24 @@ impl FranceBeamPlanner {
         }
 
         reserved
+    }
+
+    fn research_branch_available(&self, runtime: &CountryRuntime, branch: ResearchBranch) -> bool {
+        if self.scenario.technology_tree.is_empty() {
+            return true;
+        }
+
+        self.scenario
+            .technology_tree
+            .next_available(
+                branch,
+                &runtime.completed_technologies,
+                runtime
+                    .research_slots
+                    .iter()
+                    .filter_map(|slot| slot.technology),
+            )
+            .is_some()
     }
 
     fn next_law_action(
@@ -1026,7 +1046,7 @@ impl FranceBeamPlanner {
                 .saturating_sub(runtime.total_military_factories()),
         );
         let available_resources = runtime.domestic_resources(&self.scenario.ideas);
-        let current_resource_use = runtime.daily_resource_demand(self.scenario.equipment_profiles);
+        let current_resource_use = runtime.daily_resource_demand(runtime.equipment_profiles);
         let resource_fulfillment_bp = current_resource_use.fulfillment_bp(available_resources);
         let resource_utilization = i64::from(
             current_resource_use

@@ -1,6 +1,7 @@
 use crate::domain::{
     CountryLaws, DoctrineCostReduction, EquipmentDemand, EquipmentKind, FocusBuildingKind,
-    GameDate, IdeaDefinition, IdeaModifiers, ModeledEquipmentProfiles, ResourceLedger,
+    GameDate, IdeaDefinition, IdeaModifiers, ModeledEquipmentProfiles, ResourceLedger, TechId,
+    TechnologyModifiers, TechnologyNode, TechnologyTree,
 };
 use crate::scenario::{Frontier, FrontierFortRequirement};
 
@@ -202,15 +203,21 @@ impl ProductionLine {
         }
     }
 
-    pub fn reassign(&mut self, equipment: EquipmentKind, factories: u8) {
+    pub fn reassign(
+        &mut self,
+        equipment: EquipmentKind,
+        factories: u8,
+        unit_cost_centi: u32,
+        efficiency_floor_permille: u16,
+    ) {
         if self.equipment != equipment {
-            self.efficiency_permille = BASE_PRODUCTION_EFFICIENCY_PERMILLE;
+            self.efficiency_permille = efficiency_floor_permille;
             self.accumulated_ic_centi = 0;
-            self.unit_cost_centi = equipment.default_unit_cost_centi();
         }
 
         self.equipment = equipment;
         self.factories = factories;
+        self.unit_cost_centi = unit_cost_centi;
     }
 
     pub fn daily_resource_demand(
@@ -260,7 +267,8 @@ pub struct ActiveIdea {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct ResearchSlotState {
     pub branch: Option<ResearchBranch>,
-    pub days_progress: u16,
+    pub technology: Option<TechId>,
+    pub progress_centi: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -273,6 +281,9 @@ pub struct CountryRuntime {
     pub stability_weekly_accumulator_bp: i32,
     pub fielded_divisions: u16,
     pub fielded_demand: EquipmentDemand,
+    pub equipment_profiles: ModeledEquipmentProfiles,
+    pub technology_modifiers: TechnologyModifiers,
+    pub completed_technologies: Box<[bool]>,
     pub production_lines: Box<[ProductionLine]>,
     pub construction_queue: Vec<ConstructionProject>,
     pub focus: Option<FocusProgress>,
@@ -306,6 +317,9 @@ impl CountryRuntime {
             stability_weekly_accumulator_bp: 0,
             fielded_divisions: 0,
             fielded_demand: EquipmentDemand::default(),
+            equipment_profiles: ModeledEquipmentProfiles::default_1936(),
+            technology_modifiers: TechnologyModifiers::default(),
+            completed_technologies: Vec::new().into_boxed_slice(),
             production_lines,
             construction_queue: Vec::with_capacity(64),
             focus: None,
@@ -326,6 +340,12 @@ impl CountryRuntime {
     pub fn with_research_slots(mut self, count: u8) -> Self {
         assert!(count > 0);
         self.research_slots = vec![ResearchSlotState::default(); usize::from(count)];
+        self.assert_invariants();
+        self
+    }
+
+    pub fn with_equipment_profiles(mut self, equipment_profiles: ModeledEquipmentProfiles) -> Self {
+        self.equipment_profiles = equipment_profiles;
         self.assert_invariants();
         self
     }
@@ -361,6 +381,12 @@ impl CountryRuntime {
             self.research_slots.iter().filter_map(|slot| slot.branch),
             "active research branch",
         );
+        assert_unique_copy(
+            self.research_slots
+                .iter()
+                .filter_map(|slot| slot.technology),
+            "active research technology",
+        );
         assert_unique_strs(self.country_flags.iter().map(Box::as_ref), "country flag");
         assert_unique_strs(
             self.country_leader_traits.iter().map(Box::as_ref),
@@ -387,7 +413,15 @@ impl CountryRuntime {
 
         for line in &self.production_lines {
             assert!(line.unit_cost_centi > 0);
-            assert!(line.efficiency_permille >= BASE_PRODUCTION_EFFICIENCY_PERMILLE);
+            assert!(line.efficiency_permille >= self.production_efficiency_floor_permille());
+        }
+
+        for slot in &self.research_slots {
+            if self.generic_research_mode() {
+                assert!(slot.technology.is_none());
+            } else {
+                assert_eq!(slot.branch.is_some(), slot.technology.is_some());
+            }
         }
 
         for idea in &self.active_ideas {
@@ -490,8 +524,12 @@ impl CountryRuntime {
         ideas: &[IdeaDefinition],
     ) -> u16 {
         let mut bonus = self.idea_modifiers(ideas).construction_bonus_bp(kind);
-        bonus += i32::from(self.completed_research.construction) * 200;
-        bonus += i32::from(self.completed_research.industry) * 100;
+        if self.generic_research_mode() {
+            bonus += i32::from(self.completed_research.construction) * 200;
+            bonus += i32::from(self.completed_research.industry) * 100;
+        } else {
+            bonus += self.technology_modifiers.construction_speed_bp;
+        }
 
         if self.advisors.industry {
             bonus += 100;
@@ -502,7 +540,11 @@ impl CountryRuntime {
 
     pub fn military_output_bp(&self, ideas: &[IdeaDefinition]) -> u16 {
         let mut bonus = self.idea_modifiers(ideas).factory_output_bp;
-        bonus += i32::from(self.completed_research.production) * 250;
+        if self.generic_research_mode() {
+            bonus += i32::from(self.completed_research.production) * 250;
+        } else {
+            bonus += self.technology_modifiers.factory_output_bp;
+        }
 
         if self.advisors.military_industry {
             bonus += 100;
@@ -623,6 +665,51 @@ impl CountryRuntime {
         }
     }
 
+    pub fn apply_technology_completion(&mut self, node: &TechnologyNode) {
+        if node.id.index() >= self.completed_technologies.len()
+            || self.completed_technologies[node.id.index()]
+        {
+            return;
+        }
+
+        self.completed_technologies[node.id.index()] = true;
+        self.technology_modifiers = self.technology_modifiers.plus(node.modifiers);
+        self.apply_research_completion(node.branch);
+        let efficiency_floor_permille = self.production_efficiency_floor_permille();
+        for line in &mut self.production_lines {
+            line.efficiency_permille = line.efficiency_permille.max(efficiency_floor_permille);
+        }
+        for unlock in node.equipment_unlocks.iter().copied() {
+            self.equipment_profiles.set(unlock.kind, unlock.profile);
+            for line in &mut self.production_lines {
+                if line.equipment == unlock.kind {
+                    line.unit_cost_centi = unlock.profile.unit_cost_centi;
+                }
+            }
+        }
+    }
+
+    pub fn initialize_completed_technologies(
+        &mut self,
+        technology_tree: &TechnologyTree,
+        completed_technologies: Box<[bool]>,
+    ) {
+        assert_eq!(technology_tree.len(), completed_technologies.len());
+        self.completed_technologies = completed_technologies;
+        self.technology_modifiers = TechnologyModifiers::default();
+        self.completed_research = ResearchSummary::default();
+        for (index, completed) in self.completed_technologies.clone().iter().enumerate() {
+            if !*completed {
+                continue;
+            }
+            self.completed_technologies[index] = false;
+            self.apply_technology_completion(
+                technology_tree.node(TechId(u16::try_from(index).unwrap_or(u16::MAX))),
+            );
+        }
+        self.assert_invariants();
+    }
+
     pub fn frontier_forts_complete(&self, requirements: &[FrontierFortRequirement]) -> bool {
         requirements.iter().all(|requirement| {
             self.state_defs
@@ -641,7 +728,8 @@ impl CountryRuntime {
                 total.plus(state.resources)
             });
         let modifier_bp = i32::from(self.country.laws.trade.local_resource_retention_bp())
-            + self.idea_modifiers(ideas).resource_factor_bp;
+            + self.idea_modifiers(ideas).resource_factor_bp
+            + self.technology_modifiers.local_resources_bp;
         let modifier_bp = u16::try_from(modifier_bp.clamp(0, i32::from(u16::MAX))).unwrap_or(0);
         base.scale_bp(modifier_bp)
     }
@@ -734,8 +822,43 @@ impl CountryRuntime {
     }
 
     pub fn research_speed_bp(&self, ideas: &[IdeaDefinition]) -> u16 {
-        let bonus = self.idea_modifiers(ideas).research_speed_bp;
+        let bonus = self.idea_modifiers(ideas).research_speed_bp
+            + self.technology_modifiers.research_speed_bp;
         u16::try_from(bonus.clamp(0, i32::from(u16::MAX))).unwrap_or(u16::MAX)
+    }
+
+    pub fn production_efficiency_floor_permille(&self) -> u16 {
+        let floor = i32::from(BASE_PRODUCTION_EFFICIENCY_PERMILLE)
+            + self
+                .technology_modifiers
+                .production_start_efficiency_permille;
+        u16::try_from(floor.clamp(
+            i32::from(BASE_PRODUCTION_EFFICIENCY_PERMILLE),
+            i32::from(u16::MAX),
+        ))
+        .unwrap_or(u16::MAX)
+    }
+
+    pub fn production_efficiency_cap_permille(&self, base_cap_permille: u16) -> u16 {
+        let floor = i32::from(self.production_efficiency_floor_permille());
+        let cap = i32::from(base_cap_permille)
+            + self.technology_modifiers.production_efficiency_cap_permille;
+        u16::try_from(cap.clamp(floor, i32::from(u16::MAX))).unwrap_or(u16::MAX)
+    }
+
+    pub fn production_efficiency_gain_permille(&self, base_gain_permille: u16) -> u16 {
+        let scaled = (u32::from(base_gain_permille)
+            * u32::try_from(
+                (10_000 + self.technology_modifiers.production_efficiency_gain_bp)
+                    .clamp(0, i32::from(u16::MAX)),
+            )
+            .unwrap_or_default())
+        .div_ceil(10_000);
+        u16::try_from(scaled.max(1)).unwrap_or(u16::MAX)
+    }
+
+    pub fn generic_research_mode(&self) -> bool {
+        self.completed_technologies.is_empty()
     }
 }
 
@@ -1186,7 +1309,12 @@ mod tests {
         line.efficiency_permille = 640;
         line.accumulated_ic_centi = 1_234;
 
-        line.reassign(EquipmentKind::Artillery, 4);
+        line.reassign(
+            EquipmentKind::Artillery,
+            4,
+            EquipmentKind::Artillery.default_unit_cost_centi(),
+            BASE_PRODUCTION_EFFICIENCY_PERMILLE,
+        );
 
         assert_eq!(
             line.efficiency_permille,

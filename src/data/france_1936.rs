@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -10,8 +11,9 @@ use fory_core::StructSerializer;
 use crate::domain::{
     CountryLaws, DoctrineCostReduction, EconomyLaw, EquipmentKind, EquipmentProfile,
     FocusBuildingKind, FocusCondition, FocusEffect, FocusStateScope, IdeaDefinition, IdeaModifiers,
-    MobilizationLaw, ModeledEquipmentProfiles, NationalFocus, ResourceLedger, StateCondition,
-    StateOperation, StateScopedEffects, TradeLaw,
+    MobilizationLaw, ModeledEquipmentProfiles, NationalFocus, ResearchBranch, ResourceLedger,
+    StateCondition, StateOperation, StateScopedEffects, TechId, TechnologyModifiers,
+    TechnologyNode, TechnologyTree, TradeLaw,
 };
 use crate::scenario::{France1936Scenario, Frontier};
 
@@ -178,6 +180,19 @@ struct ExactCountrySetup {
     starting_war_support_bp: u16,
     starting_ideas: Vec<Box<str>>,
     starting_country_flags: Vec<Box<str>>,
+    starting_technologies: Vec<Box<str>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParsedTechnologyNode {
+    token: Box<str>,
+    branch: ResearchBranch,
+    start_year: u16,
+    base_days: u16,
+    leads_to: Vec<Box<str>>,
+    exclusive_with: Vec<Box<str>>,
+    modifiers: TechnologyModifiers,
+    equipment_unlocks: Vec<crate::domain::EquipmentUnlock>,
 }
 
 pub fn ingest_profile(
@@ -252,10 +267,13 @@ pub fn load_france_1936_scenario(
 ) -> Result<France1936Scenario, DataError> {
     let dataset = load_france_1936_dataset(paths)?;
     let mut scenario = France1936Scenario::from_dataset(dataset)?;
+    let equipment_catalog =
+        resolve_equipment_catalog(&parse_equipment_definitions(&paths.raw_root())?)?;
     let setup = extract_exact_country_setup(&parse_country_history(&paths.raw_root(), "FRA")?);
     let focuses = parse_france_focuses(&paths.raw_root())?;
     let idea_ids = referenced_idea_ids(&focuses, &setup.starting_ideas);
     let ideas = parse_idea_definitions(&paths.raw_root(), &idea_ids)?;
+    let technologies = parse_technology_tree(&paths.raw_root(), &equipment_catalog)?;
 
     scenario.initial_country.stability_bp = setup.starting_stability_bp;
     scenario.initial_country.war_support_bp = setup.starting_war_support_bp;
@@ -267,6 +285,7 @@ pub fn load_france_1936_scenario(
         ideas,
         Vec::new(),
     );
+    scenario = scenario.with_exact_technology_data(technologies, setup.starting_technologies);
 
     Ok(scenario)
 }
@@ -352,6 +371,11 @@ fn extract_exact_country_setup(country_history: &ClausewitzBlock) -> ExactCountr
                     push_unique_boxed(&mut setup.starting_country_flags, flag);
                 }
             }
+            "set_technology" => {
+                if let Some(block) = assignment.value.as_block() {
+                    collect_starting_technologies(block, &mut setup.starting_technologies);
+                }
+            }
             _ => {}
         },
     );
@@ -361,6 +385,313 @@ fn extract_exact_country_setup(country_history: &ClausewitzBlock) -> ExactCountr
     }
 
     setup
+}
+
+fn collect_starting_technologies(block: &ClausewitzBlock, output: &mut Vec<Box<str>>) {
+    for item in &block.items {
+        let ClausewitzItem::Assignment(assignment) = item else {
+            continue;
+        };
+        if assignment
+            .value
+            .as_f64()
+            .map(|value| value > 0.0)
+            .unwrap_or(false)
+        {
+            push_unique_boxed(output, assignment.key.as_ref());
+        }
+    }
+}
+
+fn parse_technology_tree(
+    raw_root: &Path,
+    equipment_catalog: &[(String, ResolvedEquipmentDefinition)],
+) -> Result<TechnologyTree, DataError> {
+    let mut files = collect_txt_files(&raw_root.join("common/technologies"))?;
+    files.sort();
+    let mut parsed = Vec::<ParsedTechnologyNode>::new();
+
+    for path in files {
+        let root = parse_clausewitz_file(&path)?;
+        let mut technology_blocks = Vec::new();
+        collect_named_blocks(&root, "technologies", &mut technology_blocks);
+        for technologies in technology_blocks {
+            for item in &technologies.items {
+                let ClausewitzItem::Assignment(assignment) = item else {
+                    continue;
+                };
+                let Some(block) = assignment.value.as_block() else {
+                    continue;
+                };
+                if let Some(node) =
+                    parse_technology_node(assignment.key.as_ref(), block, equipment_catalog)
+                {
+                    parsed.push(node);
+                }
+            }
+        }
+    }
+
+    parsed.sort_by(|left, right| {
+        left.start_year
+            .cmp(&right.start_year)
+            .then_with(|| left.token.cmp(&right.token))
+    });
+
+    let token_to_id = parsed
+        .iter()
+        .enumerate()
+        .map(|(index, node)| {
+            (
+                node.token.to_string(),
+                TechId(u16::try_from(index).unwrap_or(u16::MAX)),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut prerequisites = vec![Vec::new(); parsed.len()];
+    for (index, node) in parsed.iter().enumerate() {
+        let source_id = TechId(u16::try_from(index).unwrap_or(u16::MAX));
+        for target in &node.leads_to {
+            let Some(target_id) = token_to_id.get(target.as_ref()).copied() else {
+                continue;
+            };
+            if prerequisites[target_id.index()]
+                .iter()
+                .all(|existing| existing != &source_id)
+            {
+                prerequisites[target_id.index()].push(source_id);
+            }
+        }
+    }
+
+    let nodes = parsed
+        .into_iter()
+        .enumerate()
+        .map(|(index, node)| TechnologyNode {
+            id: TechId(u16::try_from(index).unwrap_or(u16::MAX)),
+            token: node.token,
+            branch: node.branch,
+            start_year: node.start_year,
+            base_days: node.base_days,
+            prerequisites: prerequisites[index].clone().into_boxed_slice(),
+            exclusive_with: node
+                .exclusive_with
+                .into_iter()
+                .filter_map(|token| token_to_id.get(token.as_ref()).copied())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            modifiers: node.modifiers,
+            equipment_unlocks: node.equipment_unlocks.into_boxed_slice(),
+        })
+        .collect();
+
+    Ok(TechnologyTree::new(nodes))
+}
+
+fn parse_technology_node(
+    token: &str,
+    block: &ClausewitzBlock,
+    equipment_catalog: &[(String, ResolvedEquipmentDefinition)],
+) -> Option<ParsedTechnologyNode> {
+    let folder = technology_folder(block);
+    let categories = block
+        .first_assignment("categories")
+        .map(clausewitz_value_strings)
+        .unwrap_or_default();
+    let modifiers = parse_technology_modifiers(block);
+    let equipment_unlocks = parse_technology_unlocks(block, equipment_catalog);
+    let branch = classify_technology_branch(
+        token,
+        folder.as_deref(),
+        &categories,
+        modifiers,
+        &equipment_unlocks,
+    )?;
+
+    let include = !equipment_unlocks.is_empty()
+        || modifiers != TechnologyModifiers::default()
+        || is_supported_zero_modifier_technology(token, folder.as_deref());
+    if !include {
+        return None;
+    }
+
+    Some(ParsedTechnologyNode {
+        token: token.into(),
+        branch,
+        start_year: block
+            .first_assignment("start_year")
+            .and_then(ClausewitzValue::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .unwrap_or(1936),
+        base_days: block
+            .first_assignment("research_cost")
+            .and_then(clausewitz_amount_centi)
+            .and_then(|value| u16::try_from(value.max(1)).ok())
+            .unwrap_or(100),
+        leads_to: collect_technology_paths(block),
+        exclusive_with: collect_technology_xor(block),
+        modifiers,
+        equipment_unlocks,
+    })
+}
+
+fn technology_folder(block: &ClausewitzBlock) -> Option<String> {
+    block
+        .first_assignment("folder")
+        .and_then(ClausewitzValue::as_block)
+        .and_then(|folder| folder.first_assignment("name"))
+        .and_then(ClausewitzValue::as_str)
+        .map(ToString::to_string)
+}
+
+fn parse_technology_modifiers(block: &ClausewitzBlock) -> TechnologyModifiers {
+    let mut modifiers = TechnologyModifiers::default();
+    for item in &block.items {
+        let ClausewitzItem::Assignment(assignment) = item else {
+            continue;
+        };
+        match assignment.key.as_ref() {
+            "production_speed_buildings_factor" => {
+                modifiers.construction_speed_bp +=
+                    clausewitz_signed_bp(&assignment.value).unwrap_or(0);
+            }
+            "local_resources_factor" => {
+                modifiers.local_resources_bp +=
+                    clausewitz_signed_bp(&assignment.value).unwrap_or(0);
+            }
+            "research_speed_factor" => {
+                modifiers.research_speed_bp += clausewitz_signed_bp(&assignment.value).unwrap_or(0);
+            }
+            "industrial_capacity_factory" => {
+                modifiers.factory_output_bp += clausewitz_signed_bp(&assignment.value).unwrap_or(0);
+            }
+            "production_factory_max_efficiency_factor" => {
+                modifiers.production_efficiency_cap_permille +=
+                    clausewitz_signed_permille(&assignment.value).unwrap_or(0);
+            }
+            "production_factory_efficiency_gain_factor" => {
+                modifiers.production_efficiency_gain_bp +=
+                    clausewitz_signed_bp(&assignment.value).unwrap_or(0);
+            }
+            "production_factory_start_efficiency_factor" => {
+                modifiers.production_start_efficiency_permille +=
+                    clausewitz_signed_permille(&assignment.value).unwrap_or(0);
+            }
+            _ => {}
+        }
+    }
+    modifiers
+}
+
+fn parse_technology_unlocks(
+    block: &ClausewitzBlock,
+    equipment_catalog: &[(String, ResolvedEquipmentDefinition)],
+) -> Vec<crate::domain::EquipmentUnlock> {
+    let Some(unlocks) = block.first_assignment("enable_equipments") else {
+        return Vec::new();
+    };
+    clausewitz_value_strings(unlocks)
+        .into_iter()
+        .filter_map(|token| {
+            let kind = map_equipment_token(&token);
+            if kind == EquipmentKind::Unmodeled {
+                return None;
+            }
+            equipment_catalog
+                .iter()
+                .find(|(name, _)| name == token.as_ref())
+                .map(|(_, definition)| crate::domain::EquipmentUnlock {
+                    kind,
+                    profile: definition.profile,
+                })
+                .or_else(|| {
+                    select_fallback_profile(kind, equipment_catalog)
+                        .map(|profile| crate::domain::EquipmentUnlock { kind, profile })
+                })
+        })
+        .collect()
+}
+
+fn classify_technology_branch(
+    token: &str,
+    folder: Option<&str>,
+    categories: &[Box<str>],
+    modifiers: TechnologyModifiers,
+    equipment_unlocks: &[crate::domain::EquipmentUnlock],
+) -> Option<ResearchBranch> {
+    let in_category = |expected: &str| {
+        categories
+            .iter()
+            .any(|category| category.as_ref() == expected)
+    };
+
+    if !equipment_unlocks.is_empty() {
+        return Some(ResearchBranch::Production);
+    }
+    if modifiers.research_speed_bp != 0 || matches!(folder, Some("electronics_folder")) {
+        return Some(ResearchBranch::Electronics);
+    }
+    if modifiers.construction_speed_bp != 0
+        || token.starts_with("construction")
+        || in_category("construction_tech")
+    {
+        return Some(ResearchBranch::Construction);
+    }
+    if modifiers.factory_output_bp != 0
+        || modifiers.production_efficiency_cap_permille != 0
+        || modifiers.production_efficiency_gain_bp != 0
+        || modifiers.production_start_efficiency_permille != 0
+        || modifiers.local_resources_bp != 0
+        || token.contains("machine_tools")
+        || token.contains("industry")
+        || token.contains("assembly_line")
+        || token.contains("excavation")
+        || token == "synth_oil_experiments"
+    {
+        return Some(ResearchBranch::Industry);
+    }
+    None
+}
+
+fn is_supported_zero_modifier_technology(token: &str, folder: Option<&str>) -> bool {
+    matches!(
+        token,
+        "radio" | "basic_encryption" | "basic_decryption" | "improved_radio"
+    ) || matches!(folder, Some("electronics_folder")) && token.contains("radio")
+}
+
+fn collect_technology_paths(block: &ClausewitzBlock) -> Vec<Box<str>> {
+    let mut paths = Vec::new();
+    for item in &block.items {
+        let ClausewitzItem::Assignment(assignment) = item else {
+            continue;
+        };
+        if assignment.key.as_ref() != "path" {
+            continue;
+        }
+        let Some(path_block) = assignment.value.as_block() else {
+            continue;
+        };
+        let mut targets = Vec::new();
+        collect_string_assignments(path_block, "leads_to_tech", &mut targets);
+        for target in targets {
+            push_unique_boxed(&mut paths, &target);
+        }
+    }
+    paths
+}
+
+fn collect_technology_xor(block: &ClausewitzBlock) -> Vec<Box<str>> {
+    let mut values = Vec::new();
+    if let Some(xor) = block
+        .first_assignment("XOR")
+        .or_else(|| block.first_assignment("xor"))
+    {
+        for value in clausewitz_value_strings(xor) {
+            push_unique_boxed(&mut values, &value);
+        }
+    }
+    values
 }
 
 fn parse_france_focuses(raw_root: &Path) -> Result<Vec<NationalFocus>, DataError> {
@@ -1373,6 +1704,11 @@ fn clausewitz_percent_bp(value: &ClausewitzValue) -> Option<u16> {
 fn clausewitz_signed_bp(value: &ClausewitzValue) -> Option<i32> {
     let numeric = value.as_f64()?;
     Some((numeric * 10_000.0).round() as i32)
+}
+
+fn clausewitz_signed_permille(value: &ClausewitzValue) -> Option<i32> {
+    let numeric = value.as_f64()?;
+    Some((numeric * 1_000.0).round() as i32)
 }
 
 fn clausewitz_amount_centi(value: &ClausewitzValue) -> Option<u32> {
@@ -2404,8 +2740,10 @@ mod tests {
     };
 
     use super::{
-        DataProfilePaths, ingest_profile, load_france_1936_dataset, load_france_1936_scenario,
-        parse_focus_condition_block, parse_focus_effects_block, parse_idea_modifiers,
+        DataProfilePaths, extract_exact_country_setup, ingest_profile, load_france_1936_dataset,
+        load_france_1936_scenario, parse_equipment_definitions, parse_focus_condition_block,
+        parse_focus_effects_block, parse_idea_modifiers, parse_technology_tree,
+        resolve_equipment_catalog,
     };
 
     #[test]
@@ -2515,6 +2853,147 @@ mod tests {
                 stability_weekly_bp: 25,
                 ..IdeaModifiers::default()
             }
+        );
+    }
+
+    #[test]
+    fn country_setup_extracts_default_branch_starting_technologies() {
+        let history = parse_clausewitz(
+            r#"
+            if = {
+                limit = { has_dlc = "La Resistance" }
+                set_technology = { concentrated_industry = 1 }
+                else = {
+                    set_technology = {
+                        basic_machine_tools = 1
+                        construction1 = 1
+                    }
+                }
+            }
+            set_technology = { electronic_mechanical_engineering = 1 }
+            "#,
+        )
+        .unwrap();
+
+        let setup = extract_exact_country_setup(&history);
+
+        assert_eq!(
+            setup.starting_technologies,
+            vec![
+                "basic_machine_tools".into(),
+                "construction1".into(),
+                "electronic_mechanical_engineering".into(),
+            ]
+        );
+    }
+
+    #[test]
+    fn technology_tree_parser_extracts_effects_prerequisites_and_xor() {
+        let repo_root = tempdir().unwrap();
+        write_fixture(
+            repo_root.path(),
+            "common/units/equipment/00_equipment.txt",
+            r#"
+            artillery_equipment_1 = {
+                year = 1936
+                build_cost_ic = 3.5
+                resources = { steel = 2 tungsten = 1 }
+            }
+            "#,
+        );
+        write_fixture(
+            repo_root.path(),
+            "common/technologies/industry.txt",
+            r#"
+            technologies = {
+                basic_machine_tools = {
+                    production_factory_max_efficiency_factor = 0.1
+                    path = { leads_to_tech = improved_machine_tools }
+                    research_cost = 1.5
+                    start_year = 1936
+                    folder = { name = industry_folder }
+                }
+                improved_machine_tools = {
+                    production_factory_max_efficiency_factor = 0.1
+                    research_cost = 2
+                    start_year = 1937
+                    folder = { name = industry_folder }
+                }
+                concentrated_industry = {
+                    industrial_capacity_factory = 0.15
+                    XOR = { dispersed_industry }
+                    research_cost = 2
+                    start_year = 1936
+                    folder = { name = industry_folder }
+                }
+                dispersed_industry = {
+                    industrial_capacity_factory = 0.1
+                    production_factory_start_efficiency_factor = 0.05
+                    XOR = { concentrated_industry }
+                    research_cost = 2
+                    start_year = 1936
+                    folder = { name = industry_folder }
+                }
+                construction1 = {
+                    production_speed_buildings_factor = 0.1
+                    path = { leads_to_tech = construction2 }
+                    research_cost = 1
+                    start_year = 1936
+                    folder = { name = industry_folder }
+                    categories = { construction_tech }
+                }
+                construction2 = {
+                    production_speed_buildings_factor = 0.1
+                    research_cost = 1
+                    start_year = 1937
+                    folder = { name = industry_folder }
+                    categories = { construction_tech }
+                }
+                artillery1 = {
+                    enable_equipments = { artillery_equipment_1 }
+                    research_cost = 1
+                    start_year = 1936
+                    folder = { name = artillery_folder }
+                }
+            }
+            "#,
+        );
+
+        let equipment_catalog =
+            resolve_equipment_catalog(&parse_equipment_definitions(repo_root.path()).unwrap())
+                .unwrap();
+        let tree = parse_technology_tree(repo_root.path(), &equipment_catalog).unwrap();
+
+        let improved = tree
+            .find_by_token("improved_machine_tools")
+            .map(|id| tree.node(id))
+            .unwrap();
+        assert_eq!(improved.prerequisites.len(), 1);
+        assert_eq!(
+            tree.node(improved.prerequisites[0]).token.as_ref(),
+            "basic_machine_tools"
+        );
+
+        let concentrated = tree
+            .find_by_token("concentrated_industry")
+            .map(|id| tree.node(id))
+            .unwrap();
+        assert_eq!(concentrated.exclusive_with.len(), 1);
+        assert_eq!(
+            tree.node(concentrated.exclusive_with[0]).token.as_ref(),
+            "dispersed_industry"
+        );
+        assert_eq!(concentrated.modifiers.factory_output_bp, 1_500);
+
+        let artillery = tree
+            .find_by_token("artillery1")
+            .map(|id| tree.node(id))
+            .unwrap();
+        assert_eq!(artillery.branch, crate::domain::ResearchBranch::Production);
+        assert_eq!(artillery.equipment_unlocks.len(), 1);
+        assert_eq!(
+            artillery.equipment_unlocks[0].kind,
+            EquipmentKind::Artillery
         );
     }
 
