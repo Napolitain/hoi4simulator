@@ -785,7 +785,7 @@ impl CountryRuntime {
         &self,
         kind: FocusBuildingKind,
         ideas: &[IdeaDefinition],
-    ) -> u16 {
+    ) -> i32 {
         let mut bonus = self.idea_modifiers(ideas).construction_bonus_bp(kind)
             + i32::from(self.country.laws.trade.construction_speed_bp());
         bonus += match kind {
@@ -808,7 +808,7 @@ impl CountryRuntime {
             bonus += 100;
         }
 
-        u16::try_from(bonus.clamp(0, i32::from(u16::MAX))).unwrap_or(u16::MAX)
+        bonus.clamp(-10_000, i32::from(u16::MAX))
     }
 
     pub fn military_output_bp(&self, ideas: &[IdeaDefinition]) -> u16 {
@@ -1573,6 +1573,20 @@ mod tests {
         );
         assert_eq!(runtime.military_output_bp(&[]), 1_500);
         assert_eq!(runtime.research_speed_bp(&[]), 1_000);
+    }
+
+    #[test]
+    fn runtime_preserves_negative_economy_law_construction_penalties() {
+        let runtime = test_runtime();
+
+        assert_eq!(
+            runtime.construction_speed_bp_for(FocusBuildingKind::CivilianFactory, &[]),
+            -2_000
+        );
+        assert_eq!(
+            runtime.construction_speed_bp_for(FocusBuildingKind::MilitaryFactory, &[]),
+            -2_000
+        );
     }
 
     #[test]

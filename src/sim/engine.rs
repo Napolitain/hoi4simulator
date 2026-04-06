@@ -634,10 +634,10 @@ impl SimulationEngine {
             let state_index = usize::from(country.construction_queue[index].state.0);
             let infrastructure = u32::from(country.states[state_index].infrastructure);
             let infrastructure_multiplier_bp = 10_000 + infrastructure * 1_000;
-            let construction_speed_bp = u32::from(country.construction_speed_bp_for(
+            let construction_speed_bp = country.construction_speed_bp_for(
                 self.focus_building_kind(country.construction_queue[index].kind),
                 &scenario.ideas,
-            ));
+            );
             let remaining_cost = country.construction_queue[index]
                 .total_cost_centi
                 .saturating_sub(country.construction_queue[index].progress_centi);
@@ -1260,12 +1260,14 @@ impl SimulationEngine {
         &self,
         assigned_civs: usize,
         infrastructure_multiplier_bp: u32,
-        construction_speed_bp: u32,
+        construction_speed_bp: i32,
     ) -> u32 {
+        let construction_speed_multiplier_bp =
+            u32::try_from((10_000 + construction_speed_bp).max(0)).unwrap_or(u32::MAX);
         let daily_progress = u64::try_from(assigned_civs).unwrap_or(u64::MAX)
             * u64::from(self.config.construction_output_centi_per_factory)
             * u64::from(infrastructure_multiplier_bp)
-            * u64::from(10_000 + construction_speed_bp)
+            * u64::from(construction_speed_multiplier_bp)
             / 10_000
             / 10_000;
 
@@ -1554,6 +1556,9 @@ mod tests {
             ..SimulationConfig::default()
         });
         let date = GameDate::new(1936, 1, 1);
+        let initial_civilian_factories = runtime
+            .state(France1936Scenario::ILE_DE_FRANCE)
+            .civilian_factories;
         let actions = [
             Action::Construction(ConstructionAction {
                 date,
@@ -1582,7 +1587,14 @@ mod tests {
                 .country
                 .state(France1936Scenario::ILE_DE_FRANCE)
                 .civilian_factories,
-            10
+            initial_civilian_factories + 1
+        );
+        assert_eq!(
+            result.country.queued_kind_projects(
+                France1936Scenario::ILE_DE_FRANCE,
+                ConstructionKind::CivilianFactory
+            ),
+            1
         );
     }
 
@@ -3233,17 +3245,12 @@ mod tests {
         let closed_expected = engine.construction_daily_progress_centi(
             assigned_civs,
             infrastructure_multiplier_bp,
-            u32::from(
-                closed
-                    .construction_speed_bp_for(FocusBuildingKind::CivilianFactory, &scenario.ideas),
-            ),
+            closed.construction_speed_bp_for(FocusBuildingKind::CivilianFactory, &scenario.ideas),
         );
         let free_expected = engine.construction_daily_progress_centi(
             assigned_civs,
             infrastructure_multiplier_bp,
-            u32::from(
-                free.construction_speed_bp_for(FocusBuildingKind::CivilianFactory, &scenario.ideas),
-            ),
+            free.construction_speed_bp_for(FocusBuildingKind::CivilianFactory, &scenario.ideas),
         );
 
         engine.advance_construction(&scenario, &mut closed);
@@ -3252,6 +3259,15 @@ mod tests {
         assert_eq!(closed.construction_queue[0].progress_centi, closed_expected);
         assert_eq!(free.construction_queue[0].progress_centi, free_expected);
         assert!(free_expected > closed_expected);
+    }
+
+    #[test]
+    fn construction_daily_progress_supports_negative_speed_modifiers() {
+        let engine = SimulationEngine::default();
+        let reduced = engine.construction_daily_progress_centi(15, 10_000, -2_000);
+        let baseline = engine.construction_daily_progress_centi(15, 10_000, 0);
+
+        assert!(reduced < baseline);
     }
 
     #[test]

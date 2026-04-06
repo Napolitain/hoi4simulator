@@ -70,6 +70,17 @@ cargo run --bin france_1936 -- --profile vanilla
 
 The ingest step mirrors selected exact game files into `data/raw/<profile>/` and writes a normalized Apache Fory dataset to `data/structured/<profile>/`. The France scenario runner then loads that binary structured dataset and fails loudly if the required exact data is missing.
 
+To inspect or export the full dated build order from the exact France runner:
+
+```bash
+cargo run --bin france_1936 -- --profile vanilla --full-actions
+cargo run --bin france_1936 -- --profile vanilla --export-actions france-build-order.tsv
+cargo run --bin france_1936 -- --profile vanilla --full-actions --include-state
+cargo run --bin france_1936 -- --profile vanilla --export-actions france-build-order.tsv --include-state
+```
+
+The base export is a tab-separated table with `step`, `date`, `kind`, and `details`. Construction rows include both the dense internal state id and the raw HOI4 state id/name so the order is directly usable outside the simulator. Adding `--include-state` appends end-of-day runtime snapshot columns for each action date, including laws, political power, stability, consumer-goods pressure, usable civs, build/research/output modifiers, manpower, and resource fulfillment.
+
 Because this repository is public, those `data/raw/` and `data/structured/` trees are intentionally gitignored.
 
 ## Linting, tests, and coverage

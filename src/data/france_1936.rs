@@ -917,8 +917,8 @@ fn parse_focus_definition(
         bypass: block
             .first_assignment("bypass")
             .and_then(ClausewitzValue::as_block)
-            .map(parse_focus_condition_block)
-            .unwrap_or(FocusCondition::Always),
+            .map(parse_focus_bypass_condition_block)
+            .unwrap_or_else(never_focus_condition),
         search_filters: block
             .first_assignment("search_filters")
             .map(clausewitz_value_strings)
@@ -959,6 +959,19 @@ fn parse_focus_condition_block(block: &ClausewitzBlock) -> FocusCondition {
     }
 
     combine_focus_conditions(conditions)
+}
+
+fn parse_focus_bypass_condition_block(block: &ClausewitzBlock) -> FocusCondition {
+    let mut conditions = Vec::new();
+
+    for item in &block.items {
+        let ClausewitzItem::Assignment(assignment) = item else {
+            continue;
+        };
+        parse_focus_condition_assignment(assignment, &mut conditions);
+    }
+
+    combine_focus_conditions_or(conditions, never_focus_condition())
 }
 
 fn parse_focus_condition_assignment(
@@ -1184,14 +1197,25 @@ fn parse_focus_condition_list(block: &ClausewitzBlock) -> Vec<FocusCondition> {
 }
 
 fn combine_focus_conditions(conditions: Vec<FocusCondition>) -> FocusCondition {
+    combine_focus_conditions_or(conditions, FocusCondition::Always)
+}
+
+fn combine_focus_conditions_or(
+    conditions: Vec<FocusCondition>,
+    empty_default: FocusCondition,
+) -> FocusCondition {
     match conditions.len() {
-        0 => FocusCondition::Always,
+        0 => empty_default,
         1 => conditions
             .into_iter()
             .next()
             .unwrap_or(FocusCondition::Always),
         _ => FocusCondition::All(conditions),
     }
+}
+
+fn never_focus_condition() -> FocusCondition {
+    FocusCondition::Not(Box::new(FocusCondition::Always))
 }
 
 fn parse_focus_percent_condition(
@@ -3652,6 +3676,28 @@ mod tests {
     }
 
     #[test]
+    fn focus_bypass_parser_treats_empty_block_as_never_bypassed() {
+        let root = parse_clausewitz(
+            r#"
+            bypass = {
+            }
+            "#,
+        )
+        .unwrap();
+        let block = root
+            .first_assignment("bypass")
+            .and_then(|value| value.as_block())
+            .unwrap();
+
+        let condition = super::parse_focus_bypass_condition_block(block);
+
+        assert_eq!(
+            condition,
+            FocusCondition::Not(Box::new(FocusCondition::Always))
+        );
+    }
+
+    #[test]
     fn focus_condition_parser_supports_date_country_and_war_timeline_gates() {
         let root = parse_clausewitz(
             r#"
@@ -4589,6 +4635,17 @@ mod tests {
         );
         assert_eq!(scenario.starting_convoys, 300);
         assert_eq!(scenario.focuses.len(), 2);
+        assert_eq!(
+            scenario.focus_by_id("FRA_devalue_the_franc").unwrap().days,
+            70
+        );
+        assert_eq!(
+            scenario
+                .focus_by_id("FRA_devalue_the_franc")
+                .unwrap()
+                .bypass,
+            FocusCondition::Not(Box::new(FocusCondition::Always))
+        );
         assert!(scenario.focus_by_id("FRA_begin_rearmament").is_some());
         assert!(scenario.idea_by_id("FRA_devalue_the_franc").is_some());
     }
