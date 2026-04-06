@@ -46,6 +46,10 @@ pub struct EquipmentFactoryAllocation {
     pub artillery: u16,
     pub anti_tank: u16,
     pub anti_air: u16,
+    pub motorized_equipment: u16,
+    pub armor: u16,
+    pub fighters: u16,
+    pub bombers: u16,
 }
 
 impl EquipmentFactoryAllocation {
@@ -56,6 +60,10 @@ impl EquipmentFactoryAllocation {
             EquipmentKind::Artillery => self.artillery,
             EquipmentKind::AntiTank => self.anti_tank,
             EquipmentKind::AntiAir => self.anti_air,
+            EquipmentKind::MotorizedEquipment => self.motorized_equipment,
+            EquipmentKind::Armor => self.armor,
+            EquipmentKind::Fighter => self.fighters,
+            EquipmentKind::Bomber => self.bombers,
             EquipmentKind::Unmodeled => 0,
         }
     }
@@ -67,6 +75,10 @@ impl EquipmentFactoryAllocation {
             EquipmentKind::Artillery => self.artillery = factories,
             EquipmentKind::AntiTank => self.anti_tank = factories,
             EquipmentKind::AntiAir => self.anti_air = factories,
+            EquipmentKind::MotorizedEquipment => self.motorized_equipment = factories,
+            EquipmentKind::Armor => self.armor = factories,
+            EquipmentKind::Fighter => self.fighters = factories,
+            EquipmentKind::Bomber => self.bombers = factories,
             EquipmentKind::Unmodeled => {}
         }
     }
@@ -77,6 +89,10 @@ impl EquipmentFactoryAllocation {
             .saturating_add(self.artillery)
             .saturating_add(self.anti_tank)
             .saturating_add(self.anti_air)
+            .saturating_add(self.motorized_equipment)
+            .saturating_add(self.armor)
+            .saturating_add(self.fighters)
+            .saturating_add(self.bombers)
     }
 }
 

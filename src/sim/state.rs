@@ -119,6 +119,10 @@ pub struct Stockpile {
     pub artillery: u32,
     pub anti_tank: u32,
     pub anti_air: u32,
+    pub motorized_equipment: u32,
+    pub armor: u32,
+    pub fighters: u32,
+    pub bombers: u32,
     pub unmodeled_equipment: u32,
 }
 
@@ -130,6 +134,10 @@ impl Stockpile {
             EquipmentKind::Artillery => self.artillery += amount,
             EquipmentKind::AntiTank => self.anti_tank += amount,
             EquipmentKind::AntiAir => self.anti_air += amount,
+            EquipmentKind::MotorizedEquipment => self.motorized_equipment += amount,
+            EquipmentKind::Armor => self.armor += amount,
+            EquipmentKind::Fighter => self.fighters += amount,
+            EquipmentKind::Bomber => self.bombers += amount,
             EquipmentKind::Unmodeled => self.unmodeled_equipment += amount,
         }
     }
@@ -141,6 +149,10 @@ impl Stockpile {
             EquipmentKind::Artillery => self.artillery,
             EquipmentKind::AntiTank => self.anti_tank,
             EquipmentKind::AntiAir => self.anti_air,
+            EquipmentKind::MotorizedEquipment => self.motorized_equipment,
+            EquipmentKind::Armor => self.armor,
+            EquipmentKind::Fighter => self.fighters,
+            EquipmentKind::Bomber => self.bombers,
             EquipmentKind::Unmodeled => self.unmodeled_equipment,
         }
     }
@@ -151,6 +163,10 @@ impl Stockpile {
             && self.artillery >= demand.artillery
             && self.anti_tank >= demand.anti_tank
             && self.anti_air >= demand.anti_air
+            && self.motorized_equipment >= demand.motorized_equipment
+            && self.armor >= demand.armor
+            && self.fighters >= demand.fighters
+            && self.bombers >= demand.bombers
     }
 
     pub fn saturating_sub_demand(self, demand: EquipmentDemand) -> Self {
@@ -164,6 +180,12 @@ impl Stockpile {
             artillery: self.artillery.saturating_sub(demand.artillery),
             anti_tank: self.anti_tank.saturating_sub(demand.anti_tank),
             anti_air: self.anti_air.saturating_sub(demand.anti_air),
+            motorized_equipment: self
+                .motorized_equipment
+                .saturating_sub(demand.motorized_equipment),
+            armor: self.armor.saturating_sub(demand.armor),
+            fighters: self.fighters.saturating_sub(demand.fighters),
+            bombers: self.bombers.saturating_sub(demand.bombers),
             unmodeled_equipment: self.unmodeled_equipment,
         }
     }
@@ -186,6 +208,10 @@ impl Stockpile {
             limit_for(self.artillery, demand.artillery),
             limit_for(self.anti_tank, demand.anti_tank),
             limit_for(self.anti_air, demand.anti_air),
+            limit_for(self.motorized_equipment, demand.motorized_equipment),
+            limit_for(self.armor, demand.armor),
+            limit_for(self.fighters, demand.fighters),
+            limit_for(self.bombers, demand.bombers),
         ];
 
         let equipment_limit = equipment_limits.into_iter().min().unwrap_or(0);
@@ -304,6 +330,7 @@ pub struct ResearchSlotState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CountryRuntime {
     pub country: CountryState,
+    pub enabled_dlcs: Box<[Box<str>]>,
     pub state_defs: Box<[StateDefinition]>,
     pub states: Box<[StateRuntime]>,
     pub stockpile: Stockpile,
@@ -342,6 +369,7 @@ impl CountryRuntime {
 
         let runtime = Self {
             country,
+            enabled_dlcs: Vec::new().into_boxed_slice(),
             state_defs,
             states,
             stockpile: Stockpile::default(),
@@ -378,10 +406,22 @@ impl CountryRuntime {
         self
     }
 
+    pub fn with_enabled_dlcs(mut self, enabled_dlcs: Box<[Box<str>]>) -> Self {
+        self.enabled_dlcs = enabled_dlcs;
+        self.assert_invariants();
+        self
+    }
+
     pub fn with_equipment_profiles(mut self, equipment_profiles: ModeledEquipmentProfiles) -> Self {
         self.equipment_profiles = equipment_profiles;
         self.assert_invariants();
         self
+    }
+
+    pub fn has_dlc(&self, dlc: &str) -> bool {
+        self.enabled_dlcs
+            .iter()
+            .any(|current| current.as_ref() == dlc)
     }
 
     pub fn with_fielded_force(
@@ -602,7 +642,8 @@ impl CountryRuntime {
         kind: FocusBuildingKind,
         ideas: &[IdeaDefinition],
     ) -> u16 {
-        let mut bonus = self.idea_modifiers(ideas).construction_bonus_bp(kind);
+        let mut bonus = self.idea_modifiers(ideas).construction_bonus_bp(kind)
+            + i32::from(self.country.laws.trade.construction_speed_bp());
         if self.generic_research_mode() {
             bonus += i32::from(self.completed_research.construction) * 200;
             bonus += i32::from(self.completed_research.industry) * 100;
@@ -618,7 +659,8 @@ impl CountryRuntime {
     }
 
     pub fn military_output_bp(&self, ideas: &[IdeaDefinition]) -> u16 {
-        let mut bonus = self.idea_modifiers(ideas).factory_output_bp;
+        let mut bonus = self.idea_modifiers(ideas).factory_output_bp
+            + i32::from(self.country.laws.trade.factory_output_bp());
         if self.generic_research_mode() {
             bonus += i32::from(self.completed_research.production) * 250;
         } else {
@@ -947,6 +989,7 @@ impl CountryRuntime {
 
     pub fn research_speed_bp(&self, ideas: &[IdeaDefinition]) -> u16 {
         let bonus = self.idea_modifiers(ideas).research_speed_bp
+            + i32::from(self.country.laws.trade.research_speed_bp())
             + self.technology_modifiers.research_speed_bp;
         u16::try_from(bonus.clamp(0, i32::from(u16::MAX))).unwrap_or(u16::MAX)
     }
@@ -1044,9 +1087,9 @@ mod tests {
     use proptest::prelude::*;
 
     use crate::domain::{
-        CountryLaws, DivisionTemplate, EquipmentDemand, EquipmentKind, FieldedDivision, GameDate,
-        IdeaDefinition, IdeaModifiers, ModeledEquipmentProfiles, ResourceLedger, TimelineEvent,
-        TradeLaw,
+        CountryLaws, DivisionTemplate, EquipmentDemand, EquipmentKind, FieldedDivision,
+        FocusBuildingKind, GameDate, IdeaDefinition, IdeaModifiers, ModeledEquipmentProfiles,
+        ResourceLedger, TechnologyModifiers, TimelineEvent, TradeLaw,
     };
     use crate::scenario::{France1936Scenario, Frontier};
     use crate::sim::actions::{ConstructionKind, StateId};
@@ -1127,6 +1170,7 @@ mod tests {
             anti_tank: u32::from(anti_tank),
             anti_air: u32::from(anti_air),
             manpower: u32::from(manpower.max(1)),
+            ..EquipmentDemand::default()
         }
     }
 
@@ -1294,6 +1338,7 @@ mod tests {
             anti_tank: demand.anti_tank * 3,
             anti_air: demand.anti_air * 3,
             unmodeled_equipment: 0,
+            ..Stockpile::default()
         };
 
         assert_eq!(stockpile.ready_divisions(demand, 500_000), 3);
@@ -1355,6 +1400,47 @@ mod tests {
     }
 
     #[test]
+    fn runtime_free_trade_applies_raw_trade_law_bonuses() {
+        let mut runtime = test_runtime();
+        runtime.country.laws.trade = TradeLaw::FreeTrade;
+
+        assert_eq!(
+            runtime.domestic_resources(&[]),
+            ResourceLedger {
+                steel: 2,
+                tungsten: 0,
+                ..ResourceLedger::default()
+            }
+        );
+        assert_eq!(
+            runtime.construction_speed_bp_for(FocusBuildingKind::CivilianFactory, &[]),
+            1_500
+        );
+        assert_eq!(runtime.military_output_bp(&[]), 1_500);
+        assert_eq!(runtime.research_speed_bp(&[]), 1_000);
+    }
+
+    #[test]
+    fn runtime_exact_technology_modifiers_affect_construction_research_and_output() {
+        let mut runtime = test_runtime();
+        runtime.country.laws.trade = TradeLaw::ClosedEconomy;
+        runtime.completed_technologies = vec![false].into_boxed_slice();
+        runtime.technology_modifiers = TechnologyModifiers {
+            construction_speed_bp: 600,
+            research_speed_bp: 350,
+            factory_output_bp: 450,
+            ..TechnologyModifiers::default()
+        };
+
+        assert_eq!(
+            runtime.construction_speed_bp_for(FocusBuildingKind::MilitaryFactory, &[]),
+            600
+        );
+        assert_eq!(runtime.military_output_bp(&[]), 450);
+        assert_eq!(runtime.research_speed_bp(&[]), 350);
+    }
+
+    #[test]
     fn runtime_domestic_resources_apply_trade_law_and_local_resource_bonus() {
         let mut runtime = test_runtime();
         runtime.country.laws.trade = TradeLaw::LimitedExports;
@@ -1404,6 +1490,7 @@ mod tests {
             anti_tank: demand.anti_tank * 2,
             anti_air: demand.anti_air * 2,
             unmodeled_equipment: 0,
+            ..Stockpile::default()
         };
 
         assert_eq!(stocked_runtime.supported_divisions(demand, &[]), 26);
@@ -1418,6 +1505,7 @@ mod tests {
             anti_tank: 0,
             anti_air: 0,
             manpower: 1_000,
+            ..EquipmentDemand::default()
         };
         let runtime = test_runtime().with_exact_fielded_force(
             vec![
@@ -1442,6 +1530,7 @@ mod tests {
             anti_tank: 0,
             anti_air: 0,
             manpower: 1_000,
+            ..EquipmentDemand::default()
         };
         let armor_only = EquipmentDemand {
             manpower: 500,
@@ -1612,6 +1701,7 @@ mod tests {
                 anti_tank: u32::from(stock.3),
                 anti_air: u32::from(stock.4),
                 unmodeled_equipment: 0,
+                ..Stockpile::default()
             };
             let improved = Stockpile {
                 infantry_equipment: base.infantry_equipment + u32::from(deltas.0),
@@ -1620,6 +1710,7 @@ mod tests {
                 anti_tank: base.anti_tank + u32::from(deltas.3),
                 anti_air: base.anti_air + u32::from(deltas.4),
                 unmodeled_equipment: 0,
+                ..Stockpile::default()
             };
 
             let base_ready = base.ready_divisions(demand, u64::from(manpower));

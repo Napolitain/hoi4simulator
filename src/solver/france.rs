@@ -874,6 +874,7 @@ impl FranceBeamPlanner {
                 self.factory_allocation_for_demand(
                     shortfall,
                     node.runtime.equipment_profiles,
+                    node.runtime.military_output_bp(&self.scenario.ideas),
                     days_remaining,
                 ),
             )
@@ -888,6 +889,10 @@ impl FranceBeamPlanner {
                         artillery: node.runtime.stockpile.artillery,
                         anti_tank: node.runtime.stockpile.anti_tank,
                         anti_air: node.runtime.stockpile.anti_air,
+                        motorized_equipment: node.runtime.stockpile.motorized_equipment,
+                        armor: node.runtime.stockpile.armor,
+                        fighters: node.runtime.stockpile.fighters,
+                        bombers: node.runtime.stockpile.bombers,
                         manpower: 0,
                     }),
                 self.scenario.force_plan.factory_allocation,
@@ -907,6 +912,10 @@ impl FranceBeamPlanner {
             EquipmentKind::Artillery,
             EquipmentKind::AntiTank,
             EquipmentKind::AntiAir,
+            EquipmentKind::MotorizedEquipment,
+            EquipmentKind::Armor,
+            EquipmentKind::Fighter,
+            EquipmentKind::Bomber,
         ]
         .into_iter()
         .filter(|equipment| demand_gap.get(*equipment) > 0)
@@ -1059,6 +1068,12 @@ impl FranceBeamPlanner {
                 artillery: gap.artillery.saturating_sub(remaining_stockpile.artillery),
                 anti_tank: gap.anti_tank.saturating_sub(remaining_stockpile.anti_tank),
                 anti_air: gap.anti_air.saturating_sub(remaining_stockpile.anti_air),
+                motorized_equipment: gap
+                    .motorized_equipment
+                    .saturating_sub(remaining_stockpile.motorized_equipment),
+                armor: gap.armor.saturating_sub(remaining_stockpile.armor),
+                fighters: gap.fighters.saturating_sub(remaining_stockpile.fighters),
+                bombers: gap.bombers.saturating_sub(remaining_stockpile.bombers),
                 manpower: 0,
             });
             remaining_stockpile = remaining_stockpile.saturating_sub_demand(gap);
@@ -1096,6 +1111,7 @@ impl FranceBeamPlanner {
         let allocation = self.factory_allocation_for_demand(
             shortfall,
             runtime.equipment_profiles,
+            runtime.military_output_bp(&self.scenario.ideas),
             days_remaining,
         );
         runtime.total_military_factories() >= allocation.total()
@@ -1105,9 +1121,12 @@ impl FranceBeamPlanner {
         &self,
         demand: EquipmentDemand,
         equipment_profiles: crate::domain::ModeledEquipmentProfiles,
+        output_bonus_bp: u16,
         days_remaining: u16,
     ) -> EquipmentFactoryAllocation {
-        let factory_capacity_centi = self.estimated_factory_capacity_centi(days_remaining).max(1);
+        let factory_capacity_centi = self
+            .estimated_factory_capacity_centi(days_remaining, output_bonus_bp)
+            .max(1);
         let mut allocation = EquipmentFactoryAllocation::default();
 
         for equipment in [
@@ -1116,6 +1135,10 @@ impl FranceBeamPlanner {
             EquipmentKind::Artillery,
             EquipmentKind::AntiTank,
             EquipmentKind::AntiAir,
+            EquipmentKind::MotorizedEquipment,
+            EquipmentKind::Armor,
+            EquipmentKind::Fighter,
+            EquipmentKind::Bomber,
         ] {
             let amount = demand.get(equipment);
             if amount == 0 {
@@ -1132,14 +1155,17 @@ impl FranceBeamPlanner {
         allocation
     }
 
-    fn estimated_factory_capacity_centi(&self, days: u16) -> u64 {
+    fn estimated_factory_capacity_centi(&self, days: u16, output_bonus_bp: u16) -> u64 {
         let config = self.simulator.config;
         let mut efficiency = 100_u16;
         let mut total = 0_u64;
+        let output_multiplier_bp = 10_000_u64 + u64::from(output_bonus_bp);
 
         for _ in 0..days {
-            total += u64::from(config.production_output_centi_per_factory) * u64::from(efficiency)
+            let daily_output = u64::from(config.production_output_centi_per_factory)
+                * u64::from(efficiency)
                 / 1_000;
+            total += daily_output * output_multiplier_bp / 10_000;
             if efficiency < config.production_efficiency_cap_permille {
                 efficiency = (efficiency + config.production_efficiency_gain_permille)
                     .min(config.production_efficiency_cap_permille);
@@ -1375,6 +1401,10 @@ impl FranceBeamPlanner {
             EquipmentKind::Artillery,
             EquipmentKind::AntiTank,
             EquipmentKind::AntiAir,
+            EquipmentKind::MotorizedEquipment,
+            EquipmentKind::Armor,
+            EquipmentKind::Fighter,
+            EquipmentKind::Bomber,
         ]
         .into_iter()
         .map(|equipment| {

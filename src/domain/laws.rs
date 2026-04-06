@@ -13,6 +13,7 @@ pub enum TradeLaw {
     ExportFocus,
     LimitedExports,
     ClosedEconomy,
+    FreeTrade,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ForyObject)]
@@ -39,11 +40,43 @@ impl MobilizationLaw {
 }
 
 impl TradeLaw {
-    pub fn local_resource_retention_bp(self) -> u16 {
+    pub fn resources_to_market_bp(self) -> u16 {
         match self {
             Self::ExportFocus => 5_000,
-            Self::LimitedExports => 7_500,
-            Self::ClosedEconomy => 10_000,
+            Self::LimitedExports => 2_500,
+            Self::ClosedEconomy => 0,
+            Self::FreeTrade => 8_000,
+        }
+    }
+
+    pub fn local_resource_retention_bp(self) -> u16 {
+        10_000 - self.resources_to_market_bp()
+    }
+
+    pub fn research_speed_bp(self) -> u16 {
+        match self {
+            Self::ExportFocus => 500,
+            Self::LimitedExports => 100,
+            Self::ClosedEconomy => 0,
+            Self::FreeTrade => 1_000,
+        }
+    }
+
+    pub fn construction_speed_bp(self) -> u16 {
+        match self {
+            Self::ExportFocus => 1_000,
+            Self::LimitedExports => 500,
+            Self::ClosedEconomy => 0,
+            Self::FreeTrade => 1_500,
+        }
+    }
+
+    pub fn factory_output_bp(self) -> u16 {
+        match self {
+            Self::ExportFocus => 1_000,
+            Self::LimitedExports => 500,
+            Self::ClosedEconomy => 0,
+            Self::FreeTrade => 1_500,
         }
     }
 }
@@ -88,7 +121,13 @@ mod tests {
     }
 
     #[test]
-    fn trade_law_scales_local_resource_retention() {
+    fn trade_law_matches_market_and_bonus_values() {
+        assert_eq!(TradeLaw::FreeTrade.resources_to_market_bp(), 8_000);
+        assert_eq!(TradeLaw::ExportFocus.resources_to_market_bp(), 5_000);
+        assert_eq!(TradeLaw::LimitedExports.resources_to_market_bp(), 2_500);
+        assert_eq!(TradeLaw::ClosedEconomy.resources_to_market_bp(), 0);
+
+        assert_eq!(TradeLaw::FreeTrade.local_resource_retention_bp(), 2_000);
         assert_eq!(TradeLaw::ExportFocus.local_resource_retention_bp(), 5_000);
         assert_eq!(
             TradeLaw::LimitedExports.local_resource_retention_bp(),
@@ -98,5 +137,20 @@ mod tests {
             TradeLaw::ClosedEconomy.local_resource_retention_bp(),
             10_000
         );
+
+        assert_eq!(TradeLaw::FreeTrade.research_speed_bp(), 1_000);
+        assert_eq!(TradeLaw::ExportFocus.research_speed_bp(), 500);
+        assert_eq!(TradeLaw::LimitedExports.research_speed_bp(), 100);
+        assert_eq!(TradeLaw::ClosedEconomy.research_speed_bp(), 0);
+
+        assert_eq!(TradeLaw::FreeTrade.construction_speed_bp(), 1_500);
+        assert_eq!(TradeLaw::ExportFocus.construction_speed_bp(), 1_000);
+        assert_eq!(TradeLaw::LimitedExports.construction_speed_bp(), 500);
+        assert_eq!(TradeLaw::ClosedEconomy.construction_speed_bp(), 0);
+
+        assert_eq!(TradeLaw::FreeTrade.factory_output_bp(), 1_500);
+        assert_eq!(TradeLaw::ExportFocus.factory_output_bp(), 1_000);
+        assert_eq!(TradeLaw::LimitedExports.factory_output_bp(), 500);
+        assert_eq!(TradeLaw::ClosedEconomy.factory_output_bp(), 0);
     }
 }

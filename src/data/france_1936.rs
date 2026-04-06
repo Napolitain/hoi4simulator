@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs;
 use std::io;
@@ -23,7 +23,7 @@ use super::clausewitz::{
     parse_clausewitz,
 };
 
-const DATA_LAYOUT_VERSION: u32 = 3;
+const DATA_LAYOUT_VERSION: u32 = 4;
 const REQUIRED_RAW_DIRS: &[&str] = &[
     "common/country_tags",
     "common/ideas",
@@ -75,6 +75,7 @@ impl DataProfilePaths {
 #[derive(Clone, Debug, PartialEq, Eq, ForyObject)]
 pub struct MirroredFile {
     pub relative_path: String,
+    pub source_path: String,
     pub size_bytes: u64,
 }
 
@@ -83,6 +84,7 @@ pub struct StructuredDataManifest {
     pub version: u32,
     pub profile: String,
     pub source_game_dir: String,
+    pub enabled_dlcs: Vec<String>,
     pub generated_at_unix: u64,
     pub mirrored_files: Vec<MirroredFile>,
     pub warnings: Vec<String>,
@@ -94,6 +96,7 @@ pub struct StructuredFrance1936Dataset {
     pub profile: String,
     pub tag: String,
     pub start_date: String,
+    pub enabled_dlcs: Vec<String>,
     pub laws: CountryLaws,
     pub population: u64,
     pub starting_fielded_divisions: u16,
@@ -176,12 +179,22 @@ impl std::error::Error for DataError {}
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 struct ExactCountrySetup {
+    laws: CountryLaws,
     starting_research_slots: u8,
     starting_stability_bp: u16,
     starting_war_support_bp: u16,
+    land_oob: Option<Box<str>>,
+    air_oob: Option<Box<str>>,
     starting_ideas: Vec<Box<str>>,
     starting_country_flags: Vec<Box<str>>,
     starting_technologies: Vec<Box<str>>,
+    starting_train_buffer: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InstalledDlc {
+    name: Box<str>,
+    roots: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -202,6 +215,11 @@ pub fn ingest_profile(
 ) -> Result<StructuredDataManifest, DataError> {
     let raw_root = paths.raw_root();
     let structured_root = paths.structured_root();
+    let enabled_dlcs = discover_installed_dlcs(game_dir)?;
+    let enabled_dlc_names = enabled_dlcs
+        .iter()
+        .map(|dlc| dlc.name.to_string())
+        .collect::<Vec<_>>();
 
     if raw_root.exists() {
         fs::remove_dir_all(&raw_root).map_err(|source| DataError::Io {
@@ -225,14 +243,15 @@ pub fn ingest_profile(
         source,
     })?;
 
-    let mirrored_files = mirror_required_directories(game_dir, &raw_root)?;
+    let mirrored_files = mirror_required_directories(game_dir, &raw_root, &enabled_dlcs)?;
     let mut warnings = Vec::new();
-    let dataset = build_france_1936_dataset(paths, &mut warnings)?;
+    let dataset = build_france_1936_dataset(paths, &enabled_dlc_names, &mut warnings)?;
 
     let manifest = StructuredDataManifest {
         version: DATA_LAYOUT_VERSION,
         profile: paths.profile.to_string(),
         source_game_dir: game_dir.display().to_string(),
+        enabled_dlcs: enabled_dlc_names,
         generated_at_unix: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -269,18 +288,41 @@ pub fn load_france_1936_scenario(
     let dataset = load_france_1936_dataset(paths)?;
     let mut scenario = France1936Scenario::from_dataset(dataset)?;
     let raw_root = paths.raw_root();
+    let enabled_dlcs = scenario.enabled_dlcs.to_vec();
     let equipment_catalog = resolve_equipment_catalog(&parse_equipment_definitions(&raw_root)?)?;
     let country_history = parse_country_history(&raw_root, "FRA")?;
-    let setup = extract_exact_country_setup(&country_history);
-    let focuses = parse_france_focuses(&raw_root)?;
+    let setup = extract_exact_country_setup(&country_history, scenario.start_date, &enabled_dlcs);
+    let target_setup = extract_exact_country_setup(
+        &country_history,
+        scenario.force_goal.target_date,
+        &enabled_dlcs,
+    );
+    let focuses = parse_france_focuses(&raw_root, &enabled_dlcs)?;
     let idea_ids = referenced_idea_ids(&focuses, &setup.starting_ideas);
     let ideas = parse_idea_definitions(&raw_root, &idea_ids)?;
     let technologies = parse_technology_tree(&raw_root, &equipment_catalog)?;
     let mut oob_warnings = Vec::new();
-    if let Some(oob) = load_france_1936_oob(&raw_root, &country_history, &mut oob_warnings)? {
+    if let Some(oob) = load_country_oob(&raw_root, setup.land_oob.as_deref(), &mut oob_warnings)? {
         scenario = scenario.with_exact_fielded_force_data(extract_exact_fielded_force(&oob)?);
     }
+    let current_air_demand =
+        load_country_oob(&raw_root, setup.air_oob.as_deref(), &mut oob_warnings)?
+            .map(|oob| extract_air_equipment_demand(&oob))
+            .unwrap_or_default();
+    let target_air_demand = load_country_oob(
+        &raw_root,
+        target_setup.air_oob.as_deref(),
+        &mut oob_warnings,
+    )?
+    .map(|oob| extract_air_equipment_demand(&oob))
+    .unwrap_or_default();
+    scenario = scenario.with_supplemental_stockpile_target_demand(
+        target_air_demand
+            .saturating_sub(current_air_demand)
+            .without_manpower(),
+    );
 
+    scenario.initial_country.laws = setup.laws;
     scenario.initial_country.stability_bp = setup.starting_stability_bp;
     scenario.initial_country.war_support_bp = setup.starting_war_support_bp;
     scenario = scenario.with_exact_focus_data(
@@ -298,6 +340,7 @@ pub fn load_france_1936_scenario(
 
 fn build_france_1936_dataset(
     paths: &DataProfilePaths,
+    enabled_dlcs: &[String],
     warnings: &mut Vec<String>,
 ) -> Result<StructuredFrance1936Dataset, DataError> {
     let raw_root = paths.raw_root();
@@ -305,8 +348,14 @@ fn build_france_1936_dataset(
     let equipment_definitions = parse_equipment_definitions(&raw_root)?;
     let equipment_catalog = resolve_equipment_catalog(&equipment_definitions)?;
     let country_history = parse_country_history(&raw_root, "FRA")?;
-    let oob = load_france_1936_oob(&raw_root, &country_history, warnings)?;
-    let laws = extract_country_laws(&country_history, warnings);
+    let enabled_dlc_boxes = enabled_dlcs
+        .iter()
+        .cloned()
+        .map(String::into_boxed_str)
+        .collect::<Vec<_>>();
+    let start_date = GameDate::new(1936, 1, 1);
+    let setup = extract_exact_country_setup(&country_history, start_date, &enabled_dlc_boxes);
+    let oob = load_country_oob(&raw_root, setup.land_oob.as_deref(), warnings)?;
     let production_lines =
         extract_production_lines(&country_history, oob.as_ref(), &equipment_catalog, warnings)?;
     let equipment_profiles =
@@ -331,7 +380,8 @@ fn build_france_1936_dataset(
         profile: paths.profile.to_string(),
         tag: "FRA".to_string(),
         start_date: "1936-01-01".to_string(),
-        laws,
+        enabled_dlcs: enabled_dlcs.to_vec(),
+        laws: setup.laws,
         population,
         starting_fielded_divisions,
         equipment_profiles,
@@ -341,16 +391,24 @@ fn build_france_1936_dataset(
     })
 }
 
-fn extract_exact_country_setup(country_history: &ClausewitzBlock) -> ExactCountrySetup {
+fn extract_exact_country_setup(
+    country_history: &ClausewitzBlock,
+    current_date: GameDate,
+    enabled_dlcs: &[Box<str>],
+) -> ExactCountrySetup {
     let mut setup = ExactCountrySetup {
+        laws: CountryLaws::default(),
         starting_research_slots: 2,
         starting_stability_bp: 5_000,
         starting_war_support_bp: 5_000,
         ..ExactCountrySetup::default()
     };
+    let mut law_tokens = Vec::new();
 
-    visit_default_country_history(
+    visit_country_history_until(
         country_history,
+        current_date,
+        enabled_dlcs,
         &mut |assignment| match assignment.key.as_ref() {
             "set_research_slots" => {
                 if let Some(value) = assignment
@@ -371,6 +429,25 @@ fn extract_exact_country_setup(country_history: &ClausewitzBlock) -> ExactCountr
                     setup.starting_war_support_bp = value;
                 }
             }
+            "set_oob" => {
+                if let Some(value) = assignment.value.as_str() {
+                    setup.land_oob = Some(value.into());
+                }
+            }
+            "set_air_oob" => {
+                if let Some(value) = assignment.value.as_str() {
+                    setup.air_oob = Some(value.into());
+                }
+            }
+            "starting_train_buffer" => {
+                if let Some(value) = assignment
+                    .value
+                    .as_u64()
+                    .and_then(|value| u16::try_from(value).ok())
+                {
+                    setup.starting_train_buffer = value;
+                }
+            }
             "add_ideas" => collect_boxed_strings(&assignment.value, &mut setup.starting_ideas),
             "set_country_flag" => {
                 if let Some(flag) = assignment.value.as_str() {
@@ -385,6 +462,15 @@ fn extract_exact_country_setup(country_history: &ClausewitzBlock) -> ExactCountr
             _ => {}
         },
     );
+    visit_country_history_until(
+        country_history,
+        current_date,
+        enabled_dlcs,
+        &mut |assignment| {
+            collect_value_strings(&assignment.value, &mut law_tokens);
+        },
+    );
+    setup.laws = extract_country_laws_from_tokens(&law_tokens);
 
     if setup.starting_research_slots == 0 {
         setup.starting_research_slots = 2;
@@ -700,7 +786,10 @@ fn collect_technology_xor(block: &ClausewitzBlock) -> Vec<Box<str>> {
     values
 }
 
-fn parse_france_focuses(raw_root: &Path) -> Result<Vec<NationalFocus>, DataError> {
+fn parse_france_focuses(
+    raw_root: &Path,
+    enabled_dlcs: &[Box<str>],
+) -> Result<Vec<NationalFocus>, DataError> {
     let mut files = collect_txt_files(&raw_root.join("common/national_focus"))?;
     files.sort();
     let path = files
@@ -738,13 +827,16 @@ fn parse_france_focuses(raw_root: &Path) -> Result<Vec<NationalFocus>, DataError
         let Some(block) = assignment.value.as_block() else {
             continue;
         };
-        focuses.push(parse_focus_definition(block)?);
+        focuses.push(parse_focus_definition(block, enabled_dlcs)?);
     }
 
     Ok(focuses)
 }
 
-fn parse_focus_definition(block: &ClausewitzBlock) -> Result<NationalFocus, DataError> {
+fn parse_focus_definition(
+    block: &ClausewitzBlock,
+    enabled_dlcs: &[Box<str>],
+) -> Result<NationalFocus, DataError> {
     let id = block
         .first_assignment("id")
         .and_then(ClausewitzValue::as_str)
@@ -785,7 +877,7 @@ fn parse_focus_definition(block: &ClausewitzBlock) -> Result<NationalFocus, Data
         effects: block
             .first_assignment("completion_reward")
             .and_then(ClausewitzValue::as_block)
-            .map(parse_focus_effects_block)
+            .map(|reward| parse_focus_effects_block_with_dlcs(reward, enabled_dlcs))
             .unwrap_or_default(),
     })
 }
@@ -1262,14 +1354,22 @@ fn parse_free_building_slots_condition(block: &ClausewitzBlock) -> Option<StateC
     None
 }
 
+#[cfg(test)]
 fn parse_focus_effects_block(block: &ClausewitzBlock) -> Vec<FocusEffect> {
+    parse_focus_effects_block_with_dlcs(block, &[])
+}
+
+fn parse_focus_effects_block_with_dlcs(
+    block: &ClausewitzBlock,
+    enabled_dlcs: &[Box<str>],
+) -> Vec<FocusEffect> {
     let mut effects = Vec::new();
 
     for item in &block.items {
         let ClausewitzItem::Assignment(assignment) = item else {
             continue;
         };
-        parse_focus_effect_assignment(assignment, &mut effects);
+        parse_focus_effect_assignment(assignment, &mut effects, enabled_dlcs);
     }
 
     effects
@@ -1278,6 +1378,7 @@ fn parse_focus_effects_block(block: &ClausewitzBlock) -> Vec<FocusEffect> {
 fn parse_focus_effect_assignment(
     assignment: &ClausewitzAssignment,
     effects: &mut Vec<FocusEffect>,
+    enabled_dlcs: &[Box<str>],
 ) {
     match assignment.key.as_ref() {
         "add_ideas" | "remove_ideas" | "remove_idea" | "add_timed_idea" | "swap_ideas" => {
@@ -1345,12 +1446,15 @@ fn parse_focus_effect_assignment(
         }
         "if" | "IF" => {
             if let Some(child) = assignment.value.as_block() {
-                effects.extend(parse_default_conditional_effect_block(child));
+                effects.extend(parse_conditional_effect_block_with_dlcs(
+                    child,
+                    enabled_dlcs,
+                ));
             }
         }
         "hidden_effect" => {
             if let Some(child) = assignment.value.as_block() {
-                effects.extend(parse_focus_effects_block(child));
+                effects.extend(parse_focus_effects_block_with_dlcs(child, enabled_dlcs));
             }
         }
         "custom_effect_tooltip"
@@ -1472,12 +1576,17 @@ fn parse_focus_effect_state_scoped(
     }
 }
 
-fn parse_default_conditional_effect_block(block: &ClausewitzBlock) -> Vec<FocusEffect> {
+fn parse_conditional_effect_block_with_dlcs(
+    block: &ClausewitzBlock,
+    enabled_dlcs: &[Box<str>],
+) -> Vec<FocusEffect> {
     let limit = block
         .first_assignment("limit")
         .or_else(|| block.first_assignment("LIMIT"))
         .and_then(ClausewitzValue::as_block);
-    let prefer_body = limit.map(condition_prefers_default_branch).unwrap_or(true);
+    let prefer_body = limit
+        .map(|limit| condition_prefers_enabled_branch(limit, enabled_dlcs))
+        .unwrap_or(true);
 
     if prefer_body {
         let mut effects = Vec::new();
@@ -1488,7 +1597,7 @@ fn parse_default_conditional_effect_block(block: &ClausewitzBlock) -> Vec<FocusE
             if matches!(assignment.key.as_ref(), "limit" | "LIMIT" | "else" | "ELSE") {
                 continue;
             }
-            parse_focus_effect_assignment(assignment, &mut effects);
+            parse_focus_effect_assignment(assignment, &mut effects, enabled_dlcs);
         }
         effects
     } else {
@@ -1496,7 +1605,7 @@ fn parse_default_conditional_effect_block(block: &ClausewitzBlock) -> Vec<FocusE
             .first_assignment("else")
             .or_else(|| block.first_assignment("ELSE"))
             .and_then(ClausewitzValue::as_block)
-            .map(parse_focus_effects_block)
+            .map(|else_block| parse_focus_effects_block_with_dlcs(else_block, enabled_dlcs))
             .unwrap_or_default()
     }
 }
@@ -1730,8 +1839,10 @@ fn parse_idea_modifiers(block: &ClausewitzBlock) -> IdeaModifiers {
     modifiers
 }
 
-fn visit_default_country_history(
+fn visit_country_history_until(
     block: &ClausewitzBlock,
+    current_date: GameDate,
+    enabled_dlcs: &[Box<str>],
     visit: &mut dyn FnMut(&super::clausewitz::ClausewitzAssignment),
 ) {
     for item in &block.items {
@@ -1741,26 +1852,38 @@ fn visit_default_country_history(
         if matches!(assignment.key.as_ref(), "if" | "IF")
             && let Some(if_block) = assignment.value.as_block()
         {
-            visit_default_if_block(if_block, visit);
+            visit_country_history_if_block(if_block, current_date, enabled_dlcs, visit);
+            continue;
+        }
+        if let Some(date) = parse_dot_game_date(assignment.key.as_ref()) {
+            if let Some(value_block) = assignment.value.as_block()
+                && date <= current_date
+            {
+                visit_country_history_until(value_block, current_date, enabled_dlcs, visit);
+            }
             continue;
         }
 
         visit(assignment);
         if let Some(value_block) = assignment.value.as_block() {
-            visit_default_country_history(value_block, visit);
+            visit_country_history_until(value_block, current_date, enabled_dlcs, visit);
         }
     }
 }
 
-fn visit_default_if_block(
+fn visit_country_history_if_block(
     block: &ClausewitzBlock,
+    current_date: GameDate,
+    enabled_dlcs: &[Box<str>],
     visit: &mut dyn FnMut(&super::clausewitz::ClausewitzAssignment),
 ) {
     let limit = block
         .first_assignment("limit")
         .or_else(|| block.first_assignment("LIMIT"))
         .and_then(ClausewitzValue::as_block);
-    let prefer_body = limit.map(condition_prefers_default_branch).unwrap_or(true);
+    let prefer_body = limit
+        .map(|limit| condition_prefers_enabled_branch(limit, enabled_dlcs))
+        .unwrap_or(true);
 
     if prefer_body {
         for item in &block.items {
@@ -1772,7 +1895,7 @@ fn visit_default_if_block(
             }
             visit(assignment);
             if let Some(child) = assignment.value.as_block() {
-                visit_default_country_history(child, visit);
+                visit_country_history_until(child, current_date, enabled_dlcs, visit);
             }
         }
     } else if let Some(else_block) = block
@@ -1780,50 +1903,90 @@ fn visit_default_if_block(
         .or_else(|| block.first_assignment("ELSE"))
         .and_then(ClausewitzValue::as_block)
     {
-        visit_default_country_history(else_block, visit);
+        visit_country_history_until(else_block, current_date, enabled_dlcs, visit);
     }
 }
 
-fn condition_prefers_default_branch(block: &ClausewitzBlock) -> bool {
-    if block_contains_explicit_no_dlc(block) {
-        return true;
-    }
-    if block_contains_has_dlc(block) {
-        return false;
-    }
-    true
+fn condition_prefers_enabled_branch(block: &ClausewitzBlock, enabled_dlcs: &[Box<str>]) -> bool {
+    evaluate_clausewitz_dlc_condition(block, enabled_dlcs).unwrap_or(true)
 }
 
-fn block_contains_has_dlc(block: &ClausewitzBlock) -> bool {
-    block.items.iter().any(|item| match item {
-        ClausewitzItem::Assignment(assignment) if assignment.key.as_ref() == "has_dlc" => true,
-        ClausewitzItem::Assignment(assignment) => assignment
-            .value
-            .as_block()
-            .map(block_contains_has_dlc)
-            .unwrap_or(false),
-        ClausewitzItem::Value(_) => false,
-    })
-}
+fn evaluate_clausewitz_dlc_condition(
+    block: &ClausewitzBlock,
+    enabled_dlcs: &[Box<str>],
+) -> Option<bool> {
+    let mut conditions = Vec::new();
 
-fn block_contains_explicit_no_dlc(block: &ClausewitzBlock) -> bool {
-    block.items.iter().any(|item| match item {
-        ClausewitzItem::Assignment(assignment)
-            if matches!(assignment.key.as_ref(), "NOT" | "not") =>
-        {
-            assignment
-                .value
-                .as_block()
-                .map(block_contains_has_dlc)
-                .unwrap_or(false)
+    for item in &block.items {
+        let ClausewitzItem::Assignment(assignment) = item else {
+            continue;
+        };
+        match assignment.key.as_ref() {
+            "has_dlc" => {
+                let dlc = assignment.value.as_str()?;
+                conditions.push(enabled_dlcs.iter().any(|current| current.as_ref() == dlc));
+            }
+            "AND" => {
+                let child = assignment.value.as_block()?;
+                conditions.push(evaluate_clausewitz_dlc_condition(child, enabled_dlcs)?);
+            }
+            "OR" => {
+                let child = assignment.value.as_block()?;
+                conditions.push(evaluate_clausewitz_dlc_condition_any(child, enabled_dlcs)?);
+            }
+            "NOT" | "not" => {
+                let child = assignment.value.as_block()?;
+                conditions.push(!evaluate_clausewitz_dlc_condition(child, enabled_dlcs)?);
+            }
+            _ => {}
         }
-        ClausewitzItem::Assignment(assignment) => assignment
-            .value
-            .as_block()
-            .map(block_contains_explicit_no_dlc)
-            .unwrap_or(false),
-        ClausewitzItem::Value(_) => false,
-    })
+    }
+
+    if conditions.is_empty() {
+        None
+    } else {
+        Some(conditions.into_iter().all(|condition| condition))
+    }
+}
+
+fn evaluate_clausewitz_dlc_condition_any(
+    block: &ClausewitzBlock,
+    enabled_dlcs: &[Box<str>],
+) -> Option<bool> {
+    let mut saw_condition = false;
+    let mut matched = false;
+
+    for item in &block.items {
+        let ClausewitzItem::Assignment(assignment) = item else {
+            continue;
+        };
+        let value = match assignment.key.as_ref() {
+            "has_dlc" => {
+                saw_condition = true;
+                let dlc = assignment.value.as_str()?;
+                enabled_dlcs.iter().any(|current| current.as_ref() == dlc)
+            }
+            "AND" => {
+                saw_condition = true;
+                let child = assignment.value.as_block()?;
+                evaluate_clausewitz_dlc_condition(child, enabled_dlcs)?
+            }
+            "OR" => {
+                saw_condition = true;
+                let child = assignment.value.as_block()?;
+                evaluate_clausewitz_dlc_condition_any(child, enabled_dlcs)?
+            }
+            "NOT" | "not" => {
+                saw_condition = true;
+                let child = assignment.value.as_block()?;
+                !evaluate_clausewitz_dlc_condition(child, enabled_dlcs)?
+            }
+            _ => continue,
+        };
+        matched |= value;
+    }
+
+    if saw_condition { Some(matched) } else { None }
 }
 
 fn clausewitz_percent_bp(value: &ClausewitzValue) -> Option<u16> {
@@ -1891,6 +2054,7 @@ fn focus_building_kind_from_token(token: &str) -> Option<FocusBuildingKind> {
 fn mirror_required_directories(
     game_dir: &Path,
     raw_root: &Path,
+    enabled_dlcs: &[InstalledDlc],
 ) -> Result<Vec<MirroredFile>, DataError> {
     let mut mirrored = Vec::new();
 
@@ -1908,7 +2072,24 @@ fn mirror_required_directories(
             &raw_root.join(relative_dir),
             raw_root,
             &mut mirrored,
+            game_dir,
         )?;
+
+        for dlc in enabled_dlcs {
+            for root in &dlc.roots {
+                let overlay_dir = root.join(relative_dir);
+                if !overlay_dir.exists() {
+                    continue;
+                }
+                mirror_tree(
+                    &overlay_dir,
+                    &raw_root.join(relative_dir),
+                    raw_root,
+                    &mut mirrored,
+                    game_dir,
+                )?;
+            }
+        }
     }
 
     mirrored.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
@@ -1920,6 +2101,7 @@ fn mirror_tree(
     destination: &Path,
     raw_root: &Path,
     mirrored: &mut Vec<MirroredFile>,
+    source_root: &Path,
 ) -> Result<(), DataError> {
     fs::create_dir_all(destination).map_err(|source_err| DataError::Io {
         path: destination.to_path_buf(),
@@ -1942,7 +2124,13 @@ fn mirror_tree(
         })?;
 
         if file_type.is_dir() {
-            mirror_tree(&source_path, &destination_path, raw_root, mirrored)?;
+            mirror_tree(
+                &source_path,
+                &destination_path,
+                raw_root,
+                mirrored,
+                source_root,
+            )?;
             continue;
         }
         if !file_type.is_file() {
@@ -1973,11 +2161,69 @@ fn mirror_tree(
 
         mirrored.push(MirroredFile {
             relative_path,
+            source_path: source_path
+                .strip_prefix(source_root)
+                .unwrap_or(&source_path)
+                .to_string_lossy()
+                .replace('\\', "/"),
             size_bytes,
         });
     }
 
     Ok(())
+}
+
+fn discover_installed_dlcs(game_dir: &Path) -> Result<Vec<InstalledDlc>, DataError> {
+    let mut descriptors = Vec::new();
+
+    for relative_root in ["dlc", "integrated_dlc"] {
+        let root = game_dir.join(relative_root);
+        if !root.exists() {
+            continue;
+        }
+        descriptors.extend(collect_files_with_extension(&root, "dlc")?);
+    }
+
+    let mut by_name = BTreeMap::<Box<str>, Vec<PathBuf>>::new();
+    for descriptor_path in descriptors {
+        let descriptor = parse_clausewitz_file(&descriptor_path)?;
+        let Some(name) = descriptor
+            .first_assignment("name")
+            .and_then(ClausewitzValue::as_str)
+        else {
+            continue;
+        };
+        let affects_checksum = descriptor
+            .first_assignment("affects_checksum")
+            .and_then(ClausewitzValue::as_bool)
+            .unwrap_or(true);
+        if !affects_checksum {
+            continue;
+        }
+
+        let roots = by_name.entry(name.into()).or_default();
+        if let Some(relative_path) = descriptor
+            .first_assignment("path")
+            .and_then(ClausewitzValue::as_str)
+        {
+            let resolved_root = game_dir.join(relative_path);
+            if resolved_root.exists() && roots.iter().all(|root| root != &resolved_root) {
+                roots.push(resolved_root);
+            }
+        }
+
+        if let Some(descriptor_root) = descriptor_path.parent()
+            && descriptor_root.exists()
+            && roots.iter().all(|root| root != descriptor_root)
+        {
+            roots.push(descriptor_root.to_path_buf());
+        }
+    }
+
+    Ok(by_name
+        .into_iter()
+        .map(|(name, roots)| InstalledDlc { name, roots })
+        .collect())
 }
 
 fn parse_state_categories(raw_root: &Path) -> Result<Vec<(String, u8)>, DataError> {
@@ -2189,12 +2435,8 @@ fn parse_country_history(raw_root: &Path, tag: &str) -> Result<ClausewitzBlock, 
     parse_clausewitz_file(&path)
 }
 
-fn extract_country_laws(
-    country_history: &ClausewitzBlock,
-    warnings: &mut Vec<String>,
-) -> CountryLaws {
-    let mut tokens = Vec::new();
-    collect_string_tokens(country_history, &mut tokens);
+fn extract_country_laws_from_tokens(tokens: &[String]) -> CountryLaws {
+    let defaults = CountryLaws::default();
 
     let economy = tokens
         .iter()
@@ -2202,33 +2444,24 @@ fn extract_country_laws(
         .find_map(|token| match token.as_str() {
             "civilian_economy" => Some(EconomyLaw::CivilianEconomy),
             "early_mobilization" => Some(EconomyLaw::EarlyMobilization),
-            "partial_mobilization" => Some(EconomyLaw::PartialMobilization),
+            "partial_economic_mobilisation" | "partial_mobilization" => {
+                Some(EconomyLaw::PartialMobilization)
+            }
             "war_economy" => Some(EconomyLaw::WarEconomy),
             _ => None,
         })
-        .unwrap_or_else(|| {
-            warnings.push(
-                "economy law was not explicit in country history; defaulted to CivilianEconomy"
-                    .to_string(),
-            );
-            EconomyLaw::CivilianEconomy
-        });
+        .unwrap_or(defaults.economy);
     let trade = tokens
         .iter()
         .rev()
         .find_map(|token| match token.as_str() {
+            "free_trade" => Some(TradeLaw::FreeTrade),
             "export_focus" => Some(TradeLaw::ExportFocus),
             "limited_exports" => Some(TradeLaw::LimitedExports),
             "closed_economy" => Some(TradeLaw::ClosedEconomy),
             _ => None,
         })
-        .unwrap_or_else(|| {
-            warnings.push(
-                "trade law was not explicit in country history; defaulted to ExportFocus"
-                    .to_string(),
-            );
-            TradeLaw::ExportFocus
-        });
+        .unwrap_or(defaults.trade);
     let mobilization = tokens
         .iter()
         .rev()
@@ -2238,19 +2471,23 @@ fn extract_country_laws(
             "extensive_conscription" => Some(MobilizationLaw::ExtensiveConscription),
             _ => None,
         })
-        .unwrap_or_else(|| {
-            warnings.push(
-                "mobilization law was not explicit in country history; defaulted to LimitedConscription"
-                    .to_string(),
-            );
-            MobilizationLaw::LimitedConscription
-        });
+        .unwrap_or(defaults.mobilization);
 
     CountryLaws {
         economy,
         trade,
         mobilization,
     }
+}
+
+#[cfg(test)]
+fn country_laws_from_tokens(tokens: &[&str]) -> CountryLaws {
+    extract_country_laws_from_tokens(
+        &tokens
+            .iter()
+            .map(|token| (*token).to_string())
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn extract_production_lines(
@@ -2386,6 +2623,23 @@ fn derive_modeled_equipment_profiles(
             );
             defaults.anti_air
         }),
+        motorized_equipment: find_for_kind(EquipmentKind::MotorizedEquipment).unwrap_or_else(
+            || {
+                warnings.push(
+                    "motorized equipment profile was missing from exact data; using normalized default"
+                        .to_string(),
+                );
+                defaults.motorized_equipment
+            },
+        ),
+        armor: find_for_kind(EquipmentKind::Armor).unwrap_or_else(|| {
+            warnings.push(
+                "armor profile was missing from exact data; using normalized default".to_string(),
+            );
+            defaults.armor
+        }),
+        fighter: find_for_kind(EquipmentKind::Fighter).unwrap_or(defaults.fighter),
+        bomber: find_for_kind(EquipmentKind::Bomber).unwrap_or(defaults.bomber),
     }
 }
 
@@ -2409,28 +2663,14 @@ fn select_fallback_profile(
         .map(|(_, definition)| definition.profile)
 }
 
-fn load_france_1936_oob(
+fn load_country_oob(
     raw_root: &Path,
-    country_history: &ClausewitzBlock,
-    warnings: &mut Vec<String>,
+    oob_name: Option<&str>,
+    _warnings: &mut Vec<String>,
 ) -> Result<Option<ClausewitzBlock>, DataError> {
-    let mut oob_names = Vec::new();
-    collect_string_assignments(country_history, "set_oob", &mut oob_names);
-
-    let opening_names: Vec<&str> = oob_names
-        .iter()
-        .map(String::as_str)
-        .filter(|name| name.contains("_1936"))
-        .collect();
-    let Some(selected) = opening_names.first() else {
+    let Some(selected) = oob_name else {
         return Ok(None);
     };
-    if opening_names.len() > 1 {
-        warnings.push(format!(
-            "multiple 1936 land OOB references were present ({:?}); using {}",
-            opening_names, selected
-        ));
-    }
 
     parse_clausewitz_file(
         &raw_root
@@ -2538,8 +2778,12 @@ fn apply_template_section_demand(
 
 fn add_regiment_demand(token: &str, demand: &mut EquipmentDemand) -> Result<(), DataError> {
     match token {
-        "infantry" | "mountaineers" | "cavalry" | "motorized" => {
+        "infantry" | "mountaineers" | "cavalry" => {
             demand.infantry_equipment += 1_000;
+            demand.manpower += 1_000;
+        }
+        "motorized" => {
+            demand.motorized_equipment += 120;
             demand.manpower += 1_000;
         }
         "artillery" => {
@@ -2554,7 +2798,8 @@ fn add_regiment_demand(token: &str, demand: &mut EquipmentDemand) -> Result<(), 
             demand.anti_air += 36;
             demand.manpower += 500;
         }
-        "light_armor" => {
+        "light_armor" | "medium_armor" | "heavy_armor" => {
+            demand.armor += 50;
             demand.manpower += 500;
         }
         _ => {
@@ -2569,8 +2814,13 @@ fn add_regiment_demand(token: &str, demand: &mut EquipmentDemand) -> Result<(), 
 
 fn add_support_demand(token: &str, demand: &mut EquipmentDemand) -> Result<(), DataError> {
     match token {
-        "engineer" | "recon" | "mot_recon" => {
+        "engineer" | "recon" => {
             demand.support_equipment += 30;
+            demand.manpower += 300;
+        }
+        "mot_recon" => {
+            demand.support_equipment += 20;
+            demand.motorized_equipment += 30;
             demand.manpower += 300;
         }
         "artillery" => {
@@ -2593,6 +2843,37 @@ fn add_support_demand(token: &str, demand: &mut EquipmentDemand) -> Result<(), D
     }
 
     Ok(())
+}
+
+fn extract_air_equipment_demand(block: &ClausewitzBlock) -> EquipmentDemand {
+    let mut demand = EquipmentDemand::default();
+    collect_air_equipment_demand(block, &mut demand);
+    demand
+}
+
+fn collect_air_equipment_demand(block: &ClausewitzBlock, demand: &mut EquipmentDemand) {
+    for item in &block.items {
+        let ClausewitzItem::Assignment(assignment) = item else {
+            continue;
+        };
+        let Some(child) = assignment.value.as_block() else {
+            continue;
+        };
+
+        if let Some(amount) = child
+            .first_assignment("amount")
+            .and_then(ClausewitzValue::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+        {
+            match map_equipment_token(assignment.key.as_ref()) {
+                EquipmentKind::Fighter => demand.fighters = demand.fighters.saturating_add(amount),
+                EquipmentKind::Bomber => demand.bombers = demand.bombers.saturating_add(amount),
+                _ => {}
+            }
+        }
+
+        collect_air_equipment_demand(child, demand);
+    }
 }
 
 fn extract_production_equipment_token(block: &ClausewitzBlock) -> Option<String> {
@@ -2796,12 +3077,20 @@ fn parse_clausewitz_file(path: &Path) -> Result<ClausewitzBlock, DataError> {
 }
 
 fn collect_txt_files(root: &Path) -> Result<Vec<PathBuf>, DataError> {
+    collect_files_with_extension(root, "txt")
+}
+
+fn collect_files_with_extension(root: &Path, extension: &str) -> Result<Vec<PathBuf>, DataError> {
     let mut files = Vec::new();
-    collect_txt_files_recursive(root, &mut files)?;
+    collect_files_with_extension_recursive(root, extension, &mut files)?;
     Ok(files)
 }
 
-fn collect_txt_files_recursive(root: &Path, files: &mut Vec<PathBuf>) -> Result<(), DataError> {
+fn collect_files_with_extension_recursive(
+    root: &Path,
+    extension: &str,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), DataError> {
     for entry in fs::read_dir(root).map_err(|source| DataError::Io {
         path: root.to_path_buf(),
         source,
@@ -2817,9 +3106,9 @@ fn collect_txt_files_recursive(root: &Path, files: &mut Vec<PathBuf>) -> Result<
         })?;
 
         if file_type.is_dir() {
-            collect_txt_files_recursive(&path, files)?;
+            collect_files_with_extension_recursive(&path, extension, files)?;
         } else if file_type.is_file()
-            && path.extension().and_then(|extension| extension.to_str()) == Some("txt")
+            && path.extension().and_then(|current| current.to_str()) == Some(extension)
         {
             files.push(path);
         }
@@ -2900,6 +3189,34 @@ fn map_equipment_token(token: &str) -> EquipmentKind {
         EquipmentKind::AntiTank
     } else if token.starts_with("anti_air_equipment") {
         EquipmentKind::AntiAir
+    } else if token.starts_with("motorized_equipment") {
+        EquipmentKind::MotorizedEquipment
+    } else if token.starts_with("light_tank_equipment")
+        || token.starts_with("medium_tank_equipment")
+        || token.starts_with("heavy_tank_equipment")
+    {
+        EquipmentKind::Armor
+    } else if token.starts_with("fighter_equipment")
+        || token.starts_with("heavy_fighter_equipment")
+        || token.starts_with("cv_fighter_equipment")
+        || token.starts_with("small_plane_airframe")
+        || token.starts_with("cv_small_plane_airframe")
+    {
+        EquipmentKind::Fighter
+    } else if token.starts_with("CAS_equipment")
+        || token.starts_with("tac_bomber_equipment")
+        || token.starts_with("nav_bomber_equipment")
+        || token.starts_with("strat_bomber_equipment")
+        || token.starts_with("cv_nav_bomber_equipment")
+        || token.starts_with("cv_CAS_equipment")
+        || token.starts_with("small_plane_cas_airframe")
+        || token.starts_with("cv_small_plane_cas_airframe")
+        || token.starts_with("small_plane_naval_bomber_airframe")
+        || token.starts_with("cv_small_plane_naval_bomber_airframe")
+        || token.starts_with("medium_plane_airframe")
+        || token.starts_with("large_plane_airframe")
+    {
+        EquipmentKind::Bomber
     } else {
         EquipmentKind::Unmodeled
     }
@@ -3020,16 +3337,18 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::data::clausewitz::parse_clausewitz;
+    use crate::domain::GameDate;
     use crate::domain::{
         CountryLaws, DoctrineCostReduction, EconomyLaw, EquipmentDemand, EquipmentKind,
         FocusCondition, FocusEffect, IdeaModifiers, MobilizationLaw, TimelineCondition, TradeLaw,
     };
 
     use super::{
-        DataProfilePaths, extract_exact_country_setup, extract_exact_fielded_force, ingest_profile,
-        load_france_1936_dataset, load_france_1936_scenario, parse_dot_game_date,
-        parse_equipment_definitions, parse_focus_condition_block, parse_focus_effects_block,
-        parse_idea_modifiers, parse_technology_tree, resolve_equipment_catalog,
+        DataProfilePaths, extract_air_equipment_demand, extract_exact_country_setup,
+        extract_exact_fielded_force, ingest_profile, load_france_1936_dataset,
+        load_france_1936_scenario, parse_dot_game_date, parse_equipment_definitions,
+        parse_focus_condition_block, parse_focus_effects_block, parse_idea_modifiers,
+        parse_technology_tree, resolve_equipment_catalog,
     };
 
     #[test]
@@ -3233,7 +3552,7 @@ mod tests {
         )
         .unwrap();
 
-        let setup = extract_exact_country_setup(&history);
+        let setup = extract_exact_country_setup(&history, GameDate::new(1936, 1, 1), &[]);
 
         assert_eq!(
             setup.starting_technologies,
@@ -3243,6 +3562,57 @@ mod tests {
                 "electronic_mechanical_engineering".into(),
             ]
         );
+    }
+
+    #[test]
+    fn country_setup_skips_future_dated_history_blocks() {
+        let history = parse_clausewitz(
+            r#"
+            add_ideas = { limited_conscription }
+            set_technology = { basic_machine_tools = 1 }
+            1939.1.1 = {
+                add_ideas = { war_economy }
+                set_technology = { concentrated_industry = 1 }
+                set_oob = "FRA_1939"
+            }
+            "#,
+        )
+        .unwrap();
+
+        let setup = extract_exact_country_setup(&history, GameDate::new(1936, 1, 1), &[]);
+
+        assert_eq!(
+            setup.laws.mobilization,
+            MobilizationLaw::LimitedConscription
+        );
+        assert_eq!(setup.laws.economy, EconomyLaw::CivilianEconomy);
+        assert_eq!(
+            setup.starting_technologies,
+            vec!["basic_machine_tools".into()]
+        );
+        assert!(setup.land_oob.is_none());
+    }
+
+    #[test]
+    fn air_oob_parser_counts_legacy_and_bba_aircraft() {
+        let root = parse_clausewitz(
+            r#"
+            air_wings = {
+                29 = {
+                    fighter_equipment_0 = { owner = "FRA" amount = 96 }
+                    small_plane_airframe_0 = { owner = "FRA" amount = 48 }
+                    medium_plane_airframe_1 = { owner = "FRA" amount = 24 }
+                    cv_small_plane_cas_airframe_1 = { owner = "FRA" amount = 12 }
+                }
+            }
+            "#,
+        )
+        .unwrap();
+
+        let demand = extract_air_equipment_demand(&root);
+
+        assert_eq!(demand.fighters, 144);
+        assert_eq!(demand.bombers, 36);
     }
 
     #[test]
@@ -3402,6 +3772,7 @@ mod tests {
                 anti_tank: 0,
                 anti_air: 0,
                 manpower: 2_800,
+                ..EquipmentDemand::default()
             }
         );
         assert_eq!(
@@ -3413,10 +3784,18 @@ mod tests {
                 anti_tank: 0,
                 anti_air: 0,
                 manpower: 2_800,
+                ..EquipmentDemand::default()
             }
         );
-        assert!(!divisions[1].target_demand.has_equipment());
-        assert_eq!(divisions[1].target_demand.manpower, 1_000);
+        assert_eq!(
+            divisions[1].target_demand,
+            EquipmentDemand {
+                armor: 100,
+                manpower: 1_000,
+                ..EquipmentDemand::default()
+            }
+        );
+        assert_eq!(divisions[1].equipped_demand, divisions[1].target_demand);
     }
 
     #[test]
@@ -3615,9 +3994,10 @@ mod tests {
         let manifest = ingest_profile(&paths, game_root.path()).unwrap();
         let dataset = load_france_1936_dataset(&paths).unwrap();
 
-        assert_eq!(manifest.version, 3);
+        assert_eq!(manifest.version, 4);
         assert!(!manifest.mirrored_files.is_empty());
         assert_eq!(dataset.tag, "FRA");
+        assert!(dataset.enabled_dlcs.is_empty());
         assert_eq!(
             dataset.laws,
             CountryLaws {
@@ -3645,7 +4025,7 @@ mod tests {
         );
         assert_eq!(
             dataset.production_lines[5].equipment,
-            EquipmentKind::Unmodeled
+            EquipmentKind::Fighter
         );
 
         assert!(paths.manifest_path().exists());
@@ -3831,6 +4211,24 @@ mod tests {
         assert_eq!(scenario.focuses.len(), 2);
         assert!(scenario.focus_by_id("FRA_begin_rearmament").is_some());
         assert!(scenario.idea_by_id("FRA_devalue_the_franc").is_some());
+    }
+
+    #[test]
+    fn country_law_extraction_recognizes_free_trade() {
+        let laws = super::country_laws_from_tokens(&[
+            "civilian_economy",
+            "free_trade",
+            "extensive_conscription",
+        ]);
+
+        assert_eq!(
+            laws,
+            CountryLaws {
+                economy: EconomyLaw::CivilianEconomy,
+                trade: TradeLaw::FreeTrade,
+                mobilization: MobilizationLaw::ExtensiveConscription,
+            }
+        );
     }
 
     fn write_fixture(root: &Path, relative: &str, content: &str) {

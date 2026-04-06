@@ -30,6 +30,7 @@ pub struct FrontierFortRequirement {
 pub struct France1936Scenario {
     pub reference_tag: &'static str,
     pub start_date: GameDate,
+    pub enabled_dlcs: Box<[Box<str>]>,
     pub pivot_window: PivotWindow,
     pub milestones: [Milestone; 4],
     pub force_goal: ForceGoalSpec,
@@ -39,6 +40,7 @@ pub struct France1936Scenario {
     pub starting_fielded_divisions: u16,
     pub starting_fielded_target_demand: Option<EquipmentDemand>,
     pub starting_fielded_equipped_demand: Option<EquipmentDemand>,
+    pub supplemental_stockpile_target_demand: EquipmentDemand,
     pub starting_fielded_force: Box<[FieldedDivision]>,
     pub starting_research_slots: u8,
     pub starting_ideas: Box<[Box<str>]>,
@@ -65,11 +67,13 @@ struct ForcePlanInputs {
     start_date: GameDate,
     population: u64,
     domestic_resources: ResourceLedger,
+    starting_military_output_bp: u16,
     force_goal: ForceGoalSpec,
     equipment_profiles: ModeledEquipmentProfiles,
     starting_fielded_divisions: u16,
     exact_starting_fielded_target_demand: Option<EquipmentDemand>,
     exact_starting_fielded_equipped_demand: Option<EquipmentDemand>,
+    supplemental_stockpile_target_demand: EquipmentDemand,
 }
 
 impl France1936Scenario {
@@ -103,16 +107,19 @@ impl France1936Scenario {
             start_date,
             population: initial_country.population,
             domestic_resources,
+            starting_military_output_bp: initial_country.laws.trade.factory_output_bp(),
             force_goal,
             equipment_profiles,
             starting_fielded_divisions,
             exact_starting_fielded_target_demand: None,
             exact_starting_fielded_equipped_demand: None,
+            supplemental_stockpile_target_demand: EquipmentDemand::default(),
         });
 
         let scenario = Self {
             reference_tag: "FRA",
             start_date,
+            enabled_dlcs: Vec::new().into_boxed_slice(),
             pivot_window: PivotWindow::new(GameDate::new(1937, 1, 1), GameDate::new(1939, 1, 1)),
             milestones: Self::default_milestones(),
             force_goal,
@@ -122,6 +129,7 @@ impl France1936Scenario {
             starting_fielded_divisions,
             starting_fielded_target_demand: None,
             starting_fielded_equipped_demand: None,
+            supplemental_stockpile_target_demand: EquipmentDemand::default(),
             starting_fielded_force: Vec::new().into_boxed_slice(),
             starting_research_slots: 2,
             starting_ideas: Vec::new().into_boxed_slice(),
@@ -255,6 +263,7 @@ impl France1936Scenario {
             start_date,
             population: initial_country.population,
             domestic_resources,
+            starting_military_output_bp: initial_country.laws.trade.factory_output_bp(),
             force_goal,
             equipment_profiles: dataset.equipment_profiles,
             starting_fielded_divisions: dataset
@@ -262,6 +271,7 @@ impl France1936Scenario {
                 .max(force_goal.division_band().min),
             exact_starting_fielded_target_demand: None,
             exact_starting_fielded_equipped_demand: None,
+            supplemental_stockpile_target_demand: EquipmentDemand::default(),
         });
 
         let economic_construction_order = sorted_state_ids(
@@ -335,6 +345,12 @@ impl France1936Scenario {
         let scenario = Self {
             reference_tag: "FRA",
             start_date,
+            enabled_dlcs: dataset
+                .enabled_dlcs
+                .into_iter()
+                .map(String::into_boxed_str)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             pivot_window: PivotWindow::new(GameDate::new(1937, 1, 1), GameDate::new(1939, 1, 1)),
             milestones: Self::default_milestones(),
             force_goal,
@@ -344,6 +360,7 @@ impl France1936Scenario {
             starting_fielded_divisions: dataset.starting_fielded_divisions,
             starting_fielded_target_demand: None,
             starting_fielded_equipped_demand: None,
+            supplemental_stockpile_target_demand: EquipmentDemand::default(),
             starting_fielded_force: Vec::new().into_boxed_slice(),
             starting_research_slots: 2,
             starting_ideas: Vec::new().into_boxed_slice(),
@@ -376,6 +393,7 @@ impl France1936Scenario {
             self.initial_states.clone(),
             self.initial_production_lines.clone(),
         )
+        .with_enabled_dlcs(self.enabled_dlcs.clone())
         .with_research_slots(self.starting_research_slots)
         .with_equipment_profiles(self.equipment_profiles);
         runtime.world_state = self.initial_world_state.clone();
@@ -437,11 +455,13 @@ impl France1936Scenario {
             start_date: self.start_date,
             population: self.initial_country.population,
             domestic_resources: self.domestic_resources,
+            starting_military_output_bp: self.starting_military_output_bp(),
             force_goal: self.force_goal,
             equipment_profiles: self.equipment_profiles,
             starting_fielded_divisions: self.starting_fielded_divisions,
             exact_starting_fielded_target_demand: self.starting_fielded_target_demand,
             exact_starting_fielded_equipped_demand: self.starting_fielded_equipped_demand,
+            supplemental_stockpile_target_demand: self.supplemental_stockpile_target_demand,
         });
         self
     }
@@ -470,11 +490,13 @@ impl France1936Scenario {
             start_date: self.start_date,
             population: self.initial_country.population,
             domestic_resources: self.domestic_resources,
+            starting_military_output_bp: self.starting_military_output_bp(),
             force_goal: self.force_goal,
             equipment_profiles: self.equipment_profiles,
             starting_fielded_divisions: self.starting_fielded_divisions,
             exact_starting_fielded_target_demand: self.starting_fielded_target_demand,
             exact_starting_fielded_equipped_demand: self.starting_fielded_equipped_demand,
+            supplemental_stockpile_target_demand: self.supplemental_stockpile_target_demand,
         });
         self
     }
@@ -505,11 +527,33 @@ impl France1936Scenario {
             start_date: self.start_date,
             population: self.initial_country.population,
             domestic_resources: self.domestic_resources,
+            starting_military_output_bp: self.starting_military_output_bp(),
             force_goal: self.force_goal,
             equipment_profiles: self.equipment_profiles,
             starting_fielded_divisions: self.starting_fielded_divisions,
             exact_starting_fielded_target_demand: self.starting_fielded_target_demand,
             exact_starting_fielded_equipped_demand: self.starting_fielded_equipped_demand,
+            supplemental_stockpile_target_demand: self.supplemental_stockpile_target_demand,
+        });
+        self
+    }
+
+    pub fn with_supplemental_stockpile_target_demand(
+        mut self,
+        supplemental_stockpile_target_demand: EquipmentDemand,
+    ) -> Self {
+        self.supplemental_stockpile_target_demand = supplemental_stockpile_target_demand;
+        self.force_plan = Self::derive_force_plan(ForcePlanInputs {
+            start_date: self.start_date,
+            population: self.initial_country.population,
+            domestic_resources: self.domestic_resources,
+            starting_military_output_bp: self.starting_military_output_bp(),
+            force_goal: self.force_goal,
+            equipment_profiles: self.equipment_profiles,
+            starting_fielded_divisions: self.starting_fielded_divisions,
+            exact_starting_fielded_target_demand: self.starting_fielded_target_demand,
+            exact_starting_fielded_equipped_demand: self.starting_fielded_equipped_demand,
+            supplemental_stockpile_target_demand: self.supplemental_stockpile_target_demand,
         });
         self
     }
@@ -941,16 +985,27 @@ impl France1936Scenario {
         base.scale_bp(modifier_bp)
     }
 
+    fn starting_military_output_bp(&self) -> u16 {
+        let idea_modifiers = self.starting_idea_modifiers();
+        let technology_modifiers = self.starting_technology_modifiers();
+        let bonus = i32::from(self.initial_country.laws.trade.factory_output_bp())
+            + idea_modifiers.factory_output_bp
+            + technology_modifiers.factory_output_bp;
+        u16::try_from(bonus.clamp(0, i32::from(u16::MAX))).unwrap_or(u16::MAX)
+    }
+
     fn derive_force_plan(inputs: ForcePlanInputs) -> ForcePlan {
         let ForcePlanInputs {
             start_date,
             population,
             domestic_resources,
+            starting_military_output_bp,
             force_goal,
             equipment_profiles,
             starting_fielded_divisions,
             exact_starting_fielded_target_demand,
             exact_starting_fielded_equipped_demand,
+            supplemental_stockpile_target_demand,
         } = inputs;
         let division_band = force_goal.division_band();
         let min_divisions = division_band
@@ -958,7 +1013,8 @@ impl France1936Scenario {
             .max(starting_fielded_divisions.min(division_band.max));
         let days_to_target =
             u16::try_from(start_date.days_until(force_goal.target_date).max(1)).unwrap_or(u16::MAX);
-        let factory_capacity_centi = estimated_factory_capacity_centi(days_to_target).max(1);
+        let factory_capacity_centi =
+            estimated_factory_capacity_centi(days_to_target, starting_military_output_bp).max(1);
         let available_manpower = force_goal
             .target_mobilization_law
             .available_manpower(population);
@@ -986,8 +1042,11 @@ impl France1936Scenario {
             let reserve_demand = frontline_demand.reserve_buffer(force_goal.reserve_ratios);
             let stockpile_target_demand = frontline_demand
                 .saturating_sub(starting_fielded_equipped_demand.without_manpower())
-                .plus(reserve_demand);
-            let total_demand = frontline_demand.plus(reserve_demand);
+                .plus(reserve_demand)
+                .plus(supplemental_stockpile_target_demand);
+            let total_demand = frontline_demand
+                .plus(reserve_demand)
+                .plus(supplemental_stockpile_target_demand);
             let factory_allocation = derive_factory_allocation(
                 stockpile_target_demand,
                 equipment_profiles,
@@ -1043,8 +1102,11 @@ impl France1936Scenario {
             let reserve_demand = frontline_demand.reserve_buffer(force_goal.reserve_ratios);
             let stockpile_target_demand = frontline_demand
                 .saturating_sub(starting_fielded_equipped_demand.without_manpower())
-                .plus(reserve_demand);
-            let total_demand = frontline_demand.plus(reserve_demand);
+                .plus(reserve_demand)
+                .plus(supplemental_stockpile_target_demand);
+            let total_demand = frontline_demand
+                .plus(reserve_demand)
+                .plus(supplemental_stockpile_target_demand);
             let factory_allocation = derive_factory_allocation(
                 stockpile_target_demand,
                 equipment_profiles,
@@ -1128,14 +1190,16 @@ fn aggregate_domestic_resources(definitions: &[StateDefinition]) -> ResourceLedg
         })
 }
 
-fn estimated_factory_capacity_centi(days: u16) -> u64 {
+fn estimated_factory_capacity_centi(days: u16, output_bonus_bp: u16) -> u64 {
     let config = SimulationConfig::default();
     let mut efficiency = 100_u16;
     let mut total = 0_u64;
+    let output_multiplier_bp = 10_000_u64 + u64::from(output_bonus_bp);
 
     for _ in 0..days {
-        total +=
+        let daily_output =
             u64::from(config.production_output_centi_per_factory) * u64::from(efficiency) / 1_000;
+        total += daily_output * output_multiplier_bp / 10_000;
         if efficiency < config.production_efficiency_cap_permille {
             efficiency = (efficiency + config.production_efficiency_gain_permille)
                 .min(config.production_efficiency_cap_permille);
@@ -1158,6 +1222,10 @@ fn derive_factory_allocation(
         EquipmentKind::Artillery,
         EquipmentKind::AntiTank,
         EquipmentKind::AntiAir,
+        EquipmentKind::MotorizedEquipment,
+        EquipmentKind::Armor,
+        EquipmentKind::Fighter,
+        EquipmentKind::Bomber,
     ] {
         let demand = total_demand.get(equipment);
         if demand == 0 {
@@ -1183,6 +1251,10 @@ fn derive_daily_resource_use(
         EquipmentKind::Artillery,
         EquipmentKind::AntiTank,
         EquipmentKind::AntiAir,
+        EquipmentKind::MotorizedEquipment,
+        EquipmentKind::Armor,
+        EquipmentKind::Fighter,
+        EquipmentKind::Bomber,
     ]
     .into_iter()
     .fold(
@@ -1332,6 +1404,7 @@ mod tests {
             profile: "fixture".to_string(),
             tag: "FRA".to_string(),
             start_date: "1936-01-01".to_string(),
+            enabled_dlcs: Vec::new(),
             laws: CountryLaws::default(),
             population: 15_000_000,
             starting_fielded_divisions: 72,
@@ -1459,6 +1532,7 @@ mod tests {
             anti_tank: 0,
             anti_air: 0,
             manpower: 1_000,
+            ..EquipmentDemand::default()
         };
         let exact = scenario.with_exact_fielded_force_data(vec![
             FieldedDivision::new(
@@ -1500,6 +1574,7 @@ mod tests {
             anti_tank: 0,
             anti_air: 0,
             manpower: 1_200,
+            ..EquipmentDemand::default()
         };
         let exact =
             scenario.with_exact_fielded_force_data(vec![FieldedDivision::new(demand, demand); 74]);

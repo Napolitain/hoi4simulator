@@ -734,7 +734,7 @@ impl SimulationEngine {
             }
             FocusCondition::HasCompletedFocus(id) => Ok(country.has_completed_focus(id)),
             FocusCondition::HasCountryFlag(flag) => Ok(country.has_country_flag(flag)),
-            FocusCondition::HasDlc(_) => Ok(false),
+            FocusCondition::HasDlc(id) => Ok(country.has_dlc(id)),
             FocusCondition::HasGameRule { .. } => Ok(false),
             FocusCondition::HasIdea(id) => Ok(country.has_idea(id)),
             FocusCondition::Timeline(condition) => {
@@ -1266,6 +1266,12 @@ impl SimulationEngine {
                 artillery: gap.artillery.saturating_sub(remaining_stockpile.artillery),
                 anti_tank: gap.anti_tank.saturating_sub(remaining_stockpile.anti_tank),
                 anti_air: gap.anti_air.saturating_sub(remaining_stockpile.anti_air),
+                motorized_equipment: gap
+                    .motorized_equipment
+                    .saturating_sub(remaining_stockpile.motorized_equipment),
+                armor: gap.armor.saturating_sub(remaining_stockpile.armor),
+                fighters: gap.fighters.saturating_sub(remaining_stockpile.fighters),
+                bombers: gap.bombers.saturating_sub(remaining_stockpile.bombers),
                 manpower: 0,
             });
             remaining_stockpile = remaining_stockpile.saturating_sub_demand(gap);
@@ -1301,6 +1307,10 @@ impl SimulationEngine {
             EquipmentKind::Artillery,
             EquipmentKind::AntiTank,
             EquipmentKind::AntiAir,
+            EquipmentKind::MotorizedEquipment,
+            EquipmentKind::Armor,
+            EquipmentKind::Fighter,
+            EquipmentKind::Bomber,
         ] {
             let amount = demand.get(equipment);
             if amount == 0 {
@@ -2031,6 +2041,48 @@ mod tests {
     }
 
     #[test]
+    fn focus_availability_respects_enabled_dlc_gates() {
+        let scenario = France1936Scenario::standard();
+        let engine = SimulationEngine::default();
+        let focus = NationalFocus {
+            id: "FRA_dlc_gate".into(),
+            days: 1,
+            prerequisites: Vec::new(),
+            mutually_exclusive: Vec::new(),
+            available: FocusCondition::HasDlc("La Resistance".into()),
+            bypass: FocusCondition::Not(Box::new(FocusCondition::Always)),
+            search_filters: Vec::new(),
+            effects: Vec::new(),
+        };
+
+        let runtime_without_dlc = scenario.bootstrap_runtime();
+        assert!(
+            !engine
+                .focus_is_available(
+                    &runtime_without_dlc,
+                    scenario.reference_tag,
+                    &scenario.ideas,
+                    &focus,
+                )
+                .unwrap()
+        );
+
+        let runtime_with_dlc = scenario
+            .bootstrap_runtime()
+            .with_enabled_dlcs(vec!["La Resistance".into()].into_boxed_slice());
+        assert!(
+            engine
+                .focus_is_available(
+                    &runtime_with_dlc,
+                    scenario.reference_tag,
+                    &scenario.ideas,
+                    &focus
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn simulator_applies_timeline_events_during_daily_progression() {
         let scenario = France1936Scenario::standard();
         let mut runtime = scenario.bootstrap_runtime();
@@ -2407,13 +2459,15 @@ mod tests {
             }),
             2 => Action::Law(LawAction {
                 date,
-                target: match a % 7 {
+                target: match a % 9 {
                     0 => LawTarget::Economy(EconomyLaw::CivilianEconomy),
                     1 => LawTarget::Economy(EconomyLaw::EarlyMobilization),
                     2 => LawTarget::Economy(EconomyLaw::PartialMobilization),
                     3 => LawTarget::Economy(EconomyLaw::WarEconomy),
-                    4 => LawTarget::Trade(TradeLaw::ExportFocus),
-                    5 => LawTarget::Trade(TradeLaw::LimitedExports),
+                    4 => LawTarget::Trade(TradeLaw::FreeTrade),
+                    5 => LawTarget::Trade(TradeLaw::ExportFocus),
+                    6 => LawTarget::Trade(TradeLaw::LimitedExports),
+                    7 => LawTarget::Trade(TradeLaw::ClosedEconomy),
                     _ => LawTarget::Mobilization(match b % 3 {
                         0 => MobilizationLaw::VolunteerOnly,
                         1 => MobilizationLaw::LimitedConscription,
@@ -2742,6 +2796,89 @@ mod tests {
     }
 
     #[test]
+    fn advance_production_applies_trade_law_factory_output_bonus() {
+        let mut scenario = France1936Scenario::standard();
+        for state in scenario.initial_state_defs.iter_mut() {
+            state.resources = ResourceLedger::default();
+        }
+        scenario.initial_state_defs[0].resources = ResourceLedger {
+            steel: 1_000,
+            ..ResourceLedger::default()
+        };
+        let mut closed = scenario.bootstrap_runtime();
+        let mut free = scenario.bootstrap_runtime();
+        closed.country.laws.trade = TradeLaw::ClosedEconomy;
+        free.country.laws.trade = TradeLaw::FreeTrade;
+        closed.production_lines = vec![ProductionLine::new_with_cost(
+            EquipmentKind::InfantryEquipment,
+            5,
+            1_000_000,
+        )]
+        .into_boxed_slice();
+        free.production_lines = closed.production_lines.clone();
+        let engine = SimulationEngine::new(SimulationConfig {
+            production_efficiency_gain_permille: 0,
+            ..SimulationConfig::default()
+        });
+
+        let closed_expected = engine.production_daily_ic_centi(
+            5,
+            100,
+            u32::from(closed.military_output_bp(&scenario.ideas)),
+        );
+        let free_expected = engine.production_daily_ic_centi(
+            5,
+            100,
+            u32::from(free.military_output_bp(&scenario.ideas)),
+        );
+
+        engine.advance_production(&scenario, &mut closed);
+        engine.advance_production(&scenario, &mut free);
+
+        assert_eq!(
+            closed.production_lines[0].accumulated_ic_centi,
+            closed_expected
+        );
+        assert_eq!(free.production_lines[0].accumulated_ic_centi, free_expected);
+        assert!(free_expected > closed_expected);
+    }
+
+    #[test]
+    fn daily_research_progress_uses_trade_law_and_exact_technology_bonuses() {
+        let engine = SimulationEngine::default();
+        let scenario = France1936Scenario::standard();
+        let mut baseline = scenario.bootstrap_runtime();
+        baseline.country.laws.trade = TradeLaw::ClosedEconomy;
+        baseline.completed_technologies = vec![false].into_boxed_slice();
+
+        let mut boosted = baseline.clone();
+        boosted.country.laws.trade = TradeLaw::FreeTrade;
+        boosted.technology_modifiers = TechnologyModifiers {
+            research_speed_bp: 500,
+            ..TechnologyModifiers::default()
+        };
+
+        assert_eq!(
+            engine.daily_research_progress_centi(
+                &scenario,
+                &baseline,
+                None,
+                ResearchBranch::Electronics,
+            ),
+            10_000
+        );
+        assert_eq!(
+            engine.daily_research_progress_centi(
+                &scenario,
+                &boosted,
+                None,
+                ResearchBranch::Electronics,
+            ),
+            11_500
+        );
+    }
+
+    #[test]
     fn construction_speed_scales_with_infrastructure_level() {
         let engine = SimulationEngine::default();
         let assigned_civs = 10;
@@ -2778,6 +2915,55 @@ mod tests {
                 .civilian_factories,
             initial_civs + 1,
         );
+    }
+
+    #[test]
+    fn advance_construction_applies_trade_law_construction_speed_bonus() {
+        let scenario = France1936Scenario::standard();
+        let mut closed = scenario.bootstrap_runtime();
+        let mut free = scenario.bootstrap_runtime();
+        closed.country.laws.trade = TradeLaw::ClosedEconomy;
+        free.country.laws.trade = TradeLaw::FreeTrade;
+        let project = ConstructionProject {
+            state: France1936Scenario::ILE_DE_FRANCE,
+            kind: ConstructionKind::CivilianFactory,
+            total_cost_centi: 500_000,
+            progress_centi: 0,
+        };
+        closed.construction_queue = vec![project];
+        free.construction_queue = vec![project];
+        let engine = SimulationEngine::default();
+        let assigned_civs =
+            usize::from(closed.available_civilian_factories(&scenario.ideas).min(15));
+        let infrastructure_multiplier_bp = 10_000
+            + u32::from(
+                closed
+                    .state(France1936Scenario::ILE_DE_FRANCE)
+                    .infrastructure,
+            ) * 1_000;
+
+        let closed_expected = engine.construction_daily_progress_centi(
+            assigned_civs,
+            infrastructure_multiplier_bp,
+            u32::from(
+                closed
+                    .construction_speed_bp_for(FocusBuildingKind::CivilianFactory, &scenario.ideas),
+            ),
+        );
+        let free_expected = engine.construction_daily_progress_centi(
+            assigned_civs,
+            infrastructure_multiplier_bp,
+            u32::from(
+                free.construction_speed_bp_for(FocusBuildingKind::CivilianFactory, &scenario.ideas),
+            ),
+        );
+
+        engine.advance_construction(&scenario, &mut closed);
+        engine.advance_construction(&scenario, &mut free);
+
+        assert_eq!(closed.construction_queue[0].progress_centi, closed_expected);
+        assert_eq!(free.construction_queue[0].progress_centi, free_expected);
+        assert!(free_expected > closed_expected);
     }
 
     #[test]
