@@ -45,6 +45,8 @@ pub struct France1936Scenario {
     pub starting_research_slots: u8,
     pub starting_ideas: Box<[Box<str>]>,
     pub starting_country_flags: Box<[Box<str>]>,
+    pub starting_naval_oob: Option<Box<str>>,
+    pub starting_convoys: u16,
     pub technology_tree: TechnologyTree,
     pub starting_technologies: Box<[bool]>,
     pub focuses: Box<[NationalFocus]>,
@@ -134,6 +136,8 @@ impl France1936Scenario {
             starting_research_slots: 2,
             starting_ideas: Vec::new().into_boxed_slice(),
             starting_country_flags: Vec::new().into_boxed_slice(),
+            starting_naval_oob: None,
+            starting_convoys: 0,
             technology_tree: TechnologyTree::default(),
             starting_technologies: Vec::new().into_boxed_slice(),
             focuses: Vec::new().into_boxed_slice(),
@@ -365,6 +369,8 @@ impl France1936Scenario {
             starting_research_slots: 2,
             starting_ideas: Vec::new().into_boxed_slice(),
             starting_country_flags: Vec::new().into_boxed_slice(),
+            starting_naval_oob: None,
+            starting_convoys: 0,
             technology_tree: TechnologyTree::default(),
             starting_technologies: Vec::new().into_boxed_slice(),
             focuses: Vec::new().into_boxed_slice(),
@@ -394,6 +400,8 @@ impl France1936Scenario {
             self.initial_production_lines.clone(),
         )
         .with_enabled_dlcs(self.enabled_dlcs.clone())
+        .with_identity(self.reference_tag)
+        .with_naval_setup(self.starting_naval_oob.clone(), self.starting_convoys)
         .with_research_slots(self.starting_research_slots)
         .with_equipment_profiles(self.equipment_profiles);
         runtime.world_state = self.initial_world_state.clone();
@@ -589,7 +597,10 @@ impl France1936Scenario {
     }
 
     fn default_world_state() -> WorldState {
-        WorldState::default()
+        let mut world = WorldState::default();
+        world.set_country_faction("FRA", "allies");
+        world.set_country_faction("ENG", "allies");
+        world
     }
 
     fn default_timeline_events() -> Box<[TimelineEvent]> {

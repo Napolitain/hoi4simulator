@@ -85,3 +85,17 @@ cargo llvm-cov --workspace --all-features --all-targets --summary-only
 ```
 
 Property tests run through `cargo test`. Fuzzing expectations and assertion guidance are documented in `AGENTS.md`.
+
+## Targeted mutation testing
+
+Mutation testing is configured through `.cargo/mutants.toml` for the invariant-heavy modules that already have strong `proptest` coverage. This is intentionally narrower than the full crate so solver and exact-scenario runs do not become an always-on bottleneck.
+
+Run it locally with:
+
+```bash
+cargo install cargo-mutants --locked
+cargo mutants --list-files
+cargo mutants
+```
+
+The repository also includes a manual GitHub Actions workflow, `mutation`, that runs the same targeted configuration and uploads the `mutants.out/` results as an artifact.

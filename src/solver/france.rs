@@ -392,7 +392,12 @@ impl FranceBeamPlanner {
             | crate::domain::FocusCondition::HasCountryFlag(_)
             | crate::domain::FocusCondition::HasDlc(_)
             | crate::domain::FocusCondition::HasGameRule { .. }
+            | crate::domain::FocusCondition::HasGovernment(_)
             | crate::domain::FocusCondition::HasIdea(_)
+            | crate::domain::FocusCondition::IsInFaction(_)
+            | crate::domain::FocusCondition::IsPuppet(_)
+            | crate::domain::FocusCondition::IsSubject(_)
+            | crate::domain::FocusCondition::OriginalTag(_)
             | crate::domain::FocusCondition::Timeline(_)
             | crate::domain::FocusCondition::HasWarSupportAtLeast(_)
             | crate::domain::FocusCondition::NumOfFactoriesAtLeast(_)
@@ -450,8 +455,15 @@ impl FranceBeamPlanner {
             | crate::domain::FocusEffect::AddResearchSlot(_)
             | crate::domain::FocusEffect::AddStability(_)
             | crate::domain::FocusEffect::AddWarSupport(_)
+            | crate::domain::FocusEffect::AddTechnologyBonus(_)
             | crate::domain::FocusEffect::AddEquipmentToStockpile { .. }
-            | crate::domain::FocusEffect::SetCountryFlag { .. } => true,
+            | crate::domain::FocusEffect::CreateFaction(_)
+            | crate::domain::FocusEffect::CreateWarGoal { .. }
+            | crate::domain::FocusEffect::JoinFaction(_)
+            | crate::domain::FocusEffect::SetCountryRule { .. }
+            | crate::domain::FocusEffect::SetCountryFlag { .. }
+            | crate::domain::FocusEffect::SetPolitics { .. }
+            | crate::domain::FocusEffect::TransferState(_) => true,
         }
     }
 
@@ -527,7 +539,21 @@ impl FranceBeamPlanner {
                     crate::domain::FocusEffect::AddEquipmentToStockpile { amount, .. } => {
                         i64::from(*amount / 10)
                     }
+                    crate::domain::FocusEffect::AddTechnologyBonus(bonus) => {
+                        i64::from(bonus.bonus_bp) * i64::from(bonus.uses) / 5
+                    }
+                    crate::domain::FocusEffect::CreateFaction(_) => 1_500,
+                    crate::domain::FocusEffect::CreateWarGoal { .. } => 2_000,
+                    crate::domain::FocusEffect::JoinFaction(_) => 1_000,
+                    crate::domain::FocusEffect::SetCountryRule { enabled, .. } => {
+                        if *enabled {
+                            1_000
+                        } else {
+                            -500
+                        }
+                    }
                     crate::domain::FocusEffect::SetCountryFlag { .. } => 500,
+                    crate::domain::FocusEffect::SetPolitics { .. } => 1_500,
                     crate::domain::FocusEffect::SwapIdea { remove, add } => {
                         self.idea_effect_score(add) - self.idea_effect_score(remove)
                     }
@@ -580,6 +606,7 @@ impl FranceBeamPlanner {
                             crate::domain::StateOperation::SetStateFlag(_) => 100,
                         })
                         .sum::<i64>(),
+                    crate::domain::FocusEffect::TransferState(_) => 4_000,
                     crate::domain::FocusEffect::Unsupported(_) => -100_000,
                 }
         })

@@ -2,6 +2,7 @@ pub mod calendar;
 pub mod focus;
 pub mod laws;
 pub mod planning;
+pub mod politics;
 pub mod research;
 pub mod resources;
 pub mod templates;
@@ -18,8 +19,10 @@ pub use planning::{
     EquipmentFactoryAllocation, ForceGoalSpec, ForcePlan, Milestone, MilestoneKind,
     StrategicGoalWeights, TargetBand,
 };
+pub use politics::GovernmentIdeology;
 pub use research::{
-    EquipmentUnlock, ResearchBranch, TechId, TechnologyModifiers, TechnologyNode, TechnologyTree,
+    EquipmentUnlock, ResearchBranch, TechId, TechnologyBonus, TechnologyModifiers, TechnologyNode,
+    TechnologyTree,
 };
 pub use resources::{ResourceKind, ResourceLedger};
 pub use templates::{

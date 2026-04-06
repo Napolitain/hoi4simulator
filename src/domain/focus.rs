@@ -1,4 +1,4 @@
-use super::{EquipmentKind, GameDate, TimelineCondition};
+use super::{EquipmentKind, GameDate, GovernmentIdeology, TechnologyBonus, TimelineCondition};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FocusBuildingKind {
@@ -44,7 +44,12 @@ pub enum FocusCondition {
     HasCountryFlag(Box<str>),
     HasDlc(Box<str>),
     HasGameRule { rule: Box<str>, option: Box<str> },
+    HasGovernment(GovernmentIdeology),
     HasIdea(Box<str>),
+    IsInFaction(bool),
+    IsPuppet(bool),
+    IsSubject(bool),
+    OriginalTag(Box<str>),
     Timeline(Box<TimelineCondition>),
     HasWarSupportAtLeast(u16),
     NumOfFactoriesAtLeast(u16),
@@ -163,16 +168,33 @@ pub enum FocusEffect {
         equipment: EquipmentKind,
         amount: u32,
     },
+    AddTechnologyBonus(TechnologyBonus),
+    CreateFaction(Box<str>),
+    CreateWarGoal {
+        target: Box<str>,
+        kind: Box<str>,
+    },
+    JoinFaction(Box<str>),
     RemoveIdea(Box<str>),
+    SetCountryRule {
+        rule: Box<str>,
+        enabled: bool,
+    },
     SetCountryFlag {
         flag: Box<str>,
         days: Option<u16>,
+    },
+    SetPolitics {
+        government: GovernmentIdeology,
+        elections_allowed: Option<bool>,
+        last_election: Option<GameDate>,
     },
     StateScoped(StateScopedEffects),
     SwapIdea {
         remove: Box<str>,
         add: Box<str>,
     },
+    TransferState(u32),
     Unsupported(Box<str>),
 }
 

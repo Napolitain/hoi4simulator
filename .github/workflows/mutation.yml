@@ -1,0 +1,32 @@
+name: mutation
+
+on:
+  workflow_dispatch:
+
+jobs:
+  invariants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+
+      - name: Run targeted mutation tests
+        run: cargo mutants --jobs 2
+
+      - name: Upload cargo-mutants results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-mutants-results
+          path: mutants.out

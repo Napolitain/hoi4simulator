@@ -166,6 +166,32 @@ mod tests {
         assert!(!window.contains(GameDate::new(1938, 5, 31)));
     }
 
+    fn gregorian_is_leap_year(year: u16) -> bool {
+        (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+    }
+
+    fn gregorian_days_in_month(year: u16, month: u8) -> u8 {
+        match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if gregorian_is_leap_year(year) => 29,
+            2 => 28,
+            _ => unreachable!("invalid month in test strategy"),
+        }
+    }
+
+    fn valid_date() -> impl Strategy<Value = GameDate> {
+        (0u16..2401, 1u8..13)
+            .prop_flat_map(|(year, month)| {
+                (
+                    Just(year),
+                    Just(month),
+                    1u8..=gregorian_days_in_month(year, month),
+                )
+            })
+            .prop_map(|(year, month, day)| GameDate::new(year, month, day))
+    }
+
     proptest! {
         #[test]
         fn next_day_is_strictly_monotone(
@@ -212,6 +238,79 @@ mod tests {
             let via_one_step = start.add_days(a + b);
 
             prop_assert_eq!(via_two_steps, via_one_step);
+        }
+
+        #[test]
+        fn previous_day_round_trips_with_next_day(
+            date in valid_date().prop_filter(
+                "date must have a representable previous day",
+                |date| date.year > 0 || date.month > 1 || date.day > 1,
+            ),
+        ) {
+            let previous = date.previous_day();
+
+            prop_assert_eq!(previous.next_day(), date);
+            prop_assert_eq!(date.days_until(previous), -1);
+            prop_assert_eq!(previous.days_until(date), 1);
+        }
+
+        #[test]
+        fn previous_day_decrements_non_boundary_dates(
+            year in 0u16..2401,
+            month in 1u8..13,
+            day in 2u8..32,
+        ) {
+            let max_day = gregorian_days_in_month(year, month);
+            prop_assume!(day <= max_day);
+
+            let date = GameDate::new(year, month, day);
+
+            prop_assert_eq!(date.previous_day(), GameDate::new(year, month, day - 1));
+        }
+
+        #[test]
+        fn previous_day_moves_month_starts_to_the_prior_month(
+            year in 0u16..2401,
+            month in 2u8..13,
+        ) {
+            let date = GameDate::new(year, month, 1);
+            let previous_month = month - 1;
+
+            prop_assert_eq!(
+                date.previous_day(),
+                GameDate::new(year, previous_month, gregorian_days_in_month(year, previous_month)),
+            );
+        }
+
+        #[test]
+        fn previous_day_moves_january_first_to_the_prior_year(
+            year in 1u16..2401,
+        ) {
+            let date = GameDate::new(year, 1, 1);
+
+            prop_assert_eq!(date.previous_day(), GameDate::new(year - 1, 12, 31));
+        }
+
+        #[test]
+        fn leap_year_and_month_lengths_match_gregorian_rules(
+            year in 0u16..2401,
+            month in 1u8..13,
+        ) {
+            prop_assert_eq!(GameDate::is_leap_year(year), gregorian_is_leap_year(year));
+            prop_assert_eq!(
+                GameDate::days_in_month(year, month),
+                gregorian_days_in_month(year, month),
+            );
+        }
+
+        #[test]
+        fn display_is_zero_padded_iso8601(
+            date in valid_date(),
+        ) {
+            prop_assert_eq!(
+                date.to_string(),
+                format!("{:04}-{:02}-{:02}", date.year, date.month, date.day),
+            );
         }
     }
 }

@@ -58,6 +58,32 @@ impl TechnologyModifiers {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TechnologyBonus {
+    pub name: Box<str>,
+    pub categories: Box<[Box<str>]>,
+    pub bonus_bp: u16,
+    pub uses: u8,
+}
+
+impl TechnologyBonus {
+    pub fn matches(&self, node: &TechnologyNode) -> bool {
+        self.categories
+            .iter()
+            .any(|category| technology_bonus_category_matches(category, node))
+    }
+}
+
+fn technology_bonus_category_matches(category: &str, node: &TechnologyNode) -> bool {
+    node.categories
+        .iter()
+        .any(|current| current.as_ref() == category)
+        || matches!(
+            (category, node.branch),
+            ("industry", ResearchBranch::Industry) | ("electronics", ResearchBranch::Electronics)
+        )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EquipmentUnlock {
     pub kind: EquipmentKind,
@@ -69,6 +95,7 @@ pub struct TechnologyNode {
     pub id: TechId,
     pub token: Box<str>,
     pub branch: ResearchBranch,
+    pub categories: Box<[Box<str>]>,
     pub start_year: u16,
     pub base_days: u16,
     pub prerequisites: Box<[TechId]>,
@@ -154,7 +181,10 @@ impl TechnologyTree {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResearchBranch, TechId, TechnologyModifiers, TechnologyNode, TechnologyTree};
+    use super::{
+        ResearchBranch, TechId, TechnologyBonus, TechnologyModifiers, TechnologyNode,
+        TechnologyTree,
+    };
 
     fn test_tree() -> TechnologyTree {
         TechnologyTree::new(vec![
@@ -162,6 +192,7 @@ mod tests {
                 id: TechId(0),
                 token: "construction1".into(),
                 branch: ResearchBranch::Construction,
+                categories: vec!["construction_tech".into()].into_boxed_slice(),
                 start_year: 1936,
                 base_days: 100,
                 prerequisites: Vec::new().into_boxed_slice(),
@@ -173,6 +204,7 @@ mod tests {
                 id: TechId(1),
                 token: "construction2".into(),
                 branch: ResearchBranch::Construction,
+                categories: vec!["construction_tech".into()].into_boxed_slice(),
                 start_year: 1937,
                 base_days: 100,
                 prerequisites: vec![TechId(0)].into_boxed_slice(),
@@ -184,6 +216,7 @@ mod tests {
                 id: TechId(2),
                 token: "basic_machine_tools".into(),
                 branch: ResearchBranch::Industry,
+                categories: vec!["industry".into()].into_boxed_slice(),
                 start_year: 1936,
                 base_days: 100,
                 prerequisites: Vec::new().into_boxed_slice(),
@@ -231,6 +264,7 @@ mod tests {
                 id: TechId(0),
                 token: "concentrated_industry".into(),
                 branch: ResearchBranch::Industry,
+                categories: vec!["industry".into()].into_boxed_slice(),
                 start_year: 1936,
                 base_days: 100,
                 prerequisites: Vec::new().into_boxed_slice(),
@@ -242,6 +276,7 @@ mod tests {
                 id: TechId(1),
                 token: "dispersed_industry".into(),
                 branch: ResearchBranch::Industry,
+                categories: vec!["industry".into()].into_boxed_slice(),
                 start_year: 1936,
                 base_days: 100,
                 prerequisites: Vec::new().into_boxed_slice(),
@@ -255,5 +290,50 @@ mod tests {
             tree.next_available(ResearchBranch::Industry, &[true, false], []),
             None
         );
+    }
+
+    #[test]
+    fn technology_bonus_matches_exact_categories_and_industry_branch() {
+        let artillery = TechnologyNode {
+            id: TechId(0),
+            token: "improved_artillery_upgrade".into(),
+            branch: ResearchBranch::Production,
+            categories: vec!["artillery".into()].into_boxed_slice(),
+            start_year: 1936,
+            base_days: 100,
+            prerequisites: Vec::new().into_boxed_slice(),
+            exclusive_with: Vec::new().into_boxed_slice(),
+            modifiers: TechnologyModifiers::default(),
+            equipment_unlocks: Vec::new().into_boxed_slice(),
+        };
+        let industry = TechnologyNode {
+            id: TechId(1),
+            token: "basic_machine_tools".into(),
+            branch: ResearchBranch::Industry,
+            categories: Vec::new().into_boxed_slice(),
+            start_year: 1936,
+            base_days: 100,
+            prerequisites: Vec::new().into_boxed_slice(),
+            exclusive_with: Vec::new().into_boxed_slice(),
+            modifiers: TechnologyModifiers::default(),
+            equipment_unlocks: Vec::new().into_boxed_slice(),
+        };
+        let artillery_bonus = TechnologyBonus {
+            name: "FRA_artillery_focus".into(),
+            categories: vec!["artillery".into()].into_boxed_slice(),
+            bonus_bp: 10_000,
+            uses: 1,
+        };
+        let industry_bonus = TechnologyBonus {
+            name: "FRA_laissez_faire".into(),
+            categories: vec!["industry".into()].into_boxed_slice(),
+            bonus_bp: 15_000,
+            uses: 3,
+        };
+
+        assert!(artillery_bonus.matches(&artillery));
+        assert!(!artillery_bonus.matches(&industry));
+        assert!(industry_bonus.matches(&industry));
+        assert!(!industry_bonus.matches(&artillery));
     }
 }

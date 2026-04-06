@@ -449,16 +449,7 @@ impl SimulationEngine {
         let technology = if scenario.technology_tree.is_empty() {
             None
         } else {
-            scenario
-                .technology_tree
-                .next_available(
-                    action.branch,
-                    &country.completed_technologies,
-                    country
-                        .research_slots
-                        .iter()
-                        .filter_map(|slot| slot.technology),
-                )
+            self.select_next_technology(scenario, country, action.branch)
                 .ok_or(SimulationError::ResearchUnavailable(action.branch))
                 .map(Some)?
         };
@@ -468,6 +459,60 @@ impl SimulationEngine {
         country.research_slots[slot_index].progress_centi = 0;
 
         Ok(())
+    }
+
+    fn select_next_technology(
+        &self,
+        scenario: &France1936Scenario,
+        country: &CountryRuntime,
+        branch: ResearchBranch,
+    ) -> Option<crate::domain::TechId> {
+        if scenario.technology_tree.is_empty()
+            || scenario.technology_tree.len() != country.completed_technologies.len()
+        {
+            return None;
+        }
+
+        let mut reserved = vec![false; scenario.technology_tree.len()];
+        for tech_id in country
+            .research_slots
+            .iter()
+            .filter_map(|slot| slot.technology)
+        {
+            if tech_id.index() < reserved.len() {
+                reserved[tech_id.index()] = true;
+            }
+        }
+
+        let mut best = None::<(u32, u16, u16, u16)>;
+        for node in scenario.technology_tree.nodes().iter() {
+            if node.branch != branch
+                || country.completed_technologies[node.id.index()]
+                || reserved[node.id.index()]
+                || !node
+                    .prerequisites
+                    .iter()
+                    .all(|prerequisite| country.completed_technologies[prerequisite.index()])
+                || !node.exclusive_with.iter().all(|exclusive| {
+                    !country.completed_technologies[exclusive.index()]
+                        && !reserved[exclusive.index()]
+                })
+            {
+                continue;
+            }
+
+            let candidate = (
+                country.technology_bonus_bp(node),
+                u16::MAX - node.start_year,
+                u16::MAX - node.id.0,
+                node.id.0,
+            );
+            if best.as_ref().is_none_or(|current| &candidate > current) {
+                best = Some(candidate);
+            }
+        }
+
+        best.map(|(_, _, _, id)| crate::domain::TechId(id))
     }
 
     fn apply_production_action(
@@ -736,7 +781,15 @@ impl SimulationEngine {
             FocusCondition::HasCountryFlag(flag) => Ok(country.has_country_flag(flag)),
             FocusCondition::HasDlc(id) => Ok(country.has_dlc(id)),
             FocusCondition::HasGameRule { .. } => Ok(false),
+            FocusCondition::HasGovernment(government) => {
+                Ok(country.country.government == *government)
+            }
             FocusCondition::HasIdea(id) => Ok(country.has_idea(id)),
+            FocusCondition::IsInFaction(expected) => Ok(country.in_faction() == *expected),
+            FocusCondition::IsPuppet(expected) | FocusCondition::IsSubject(expected) => {
+                Ok(country.is_subject() == *expected)
+            }
+            FocusCondition::OriginalTag(tag) => Ok(country.original_tag.as_ref() == tag.as_ref()),
             FocusCondition::Timeline(condition) => {
                 Ok(condition.evaluate(country.country.date, &country.world_state, root_tag))
             }
@@ -897,6 +950,21 @@ impl SimulationEngine {
             FocusEffect::AddEquipmentToStockpile { equipment, amount } => {
                 country.stockpile.add(*equipment, *amount);
             }
+            FocusEffect::AddTechnologyBonus(bonus) => {
+                country.add_technology_bonus(bonus.clone());
+            }
+            FocusEffect::CreateFaction(faction) => {
+                country.create_faction(faction.clone());
+            }
+            FocusEffect::CreateWarGoal { target, kind } => {
+                country.add_war_goal(target.clone(), kind.clone());
+            }
+            FocusEffect::JoinFaction(target) => {
+                country.join_faction(target);
+            }
+            FocusEffect::SetCountryRule { rule, enabled } => {
+                country.set_country_rule(rule.clone(), *enabled);
+            }
             FocusEffect::StateScoped(scope_effects) => {
                 let indices = self.select_focus_state_indices(
                     country,
@@ -909,6 +977,22 @@ impl SimulationEngine {
                         self.apply_focus_state_operation(country, index, operation, 0)?;
                     }
                 }
+            }
+            FocusEffect::SetPolitics {
+                government,
+                elections_allowed,
+                last_election,
+            } => {
+                country.country.government = *government;
+                if let Some(elections_allowed) = elections_allowed {
+                    country.country.elections_allowed = *elections_allowed;
+                }
+                if last_election.is_some() {
+                    country.country.last_election = *last_election;
+                }
+            }
+            FocusEffect::TransferState(raw_state_id) => {
+                country.transfer_state_to_root(*raw_state_id);
             }
             FocusEffect::Unsupported(name) => {
                 return Err(SimulationError::UnsupportedFocusEffect(name.clone()));
@@ -1110,9 +1194,12 @@ impl SimulationEngine {
         technology: Option<crate::domain::TechId>,
         branch: ResearchBranch,
     ) -> u32 {
-        let research_speed_bp =
-            u32::from(10_000_u16.saturating_add(country.research_speed_bp(&scenario.ideas)));
+        let mut research_speed_bp =
+            10_000_u32.saturating_add(u32::from(country.research_speed_bp(&scenario.ideas)));
         if let Some(technology) = technology {
+            research_speed_bp = research_speed_bp.saturating_add(
+                country.technology_bonus_bp(scenario.technology_tree.node(technology)),
+            );
             let ahead_penalty_bp = self.ahead_of_time_penalty_bp(
                 country.country.date,
                 scenario.technology_tree.node(technology).start_year,
@@ -1383,10 +1470,11 @@ mod tests {
 
     use crate::domain::{
         DoctrineCostReduction, EconomyLaw, EquipmentKind, EquipmentProfile, EquipmentUnlock,
-        FocusBuildingKind, FocusCondition, FocusEffect, FocusStateScope, GameDate, IdeaDefinition,
-        IdeaModifiers, MobilizationLaw, NationalFocus, ResourceLedger, StateCondition,
-        StateOperation, StateScopedEffects, TechId, TechnologyModifiers, TechnologyNode,
-        TechnologyTree, TimelineCondition, TradeLaw,
+        FocusBuildingKind, FocusCondition, FocusEffect, FocusStateScope, GameDate,
+        GovernmentIdeology, IdeaDefinition, IdeaModifiers, MobilizationLaw, NationalFocus,
+        ResourceLedger, StateCondition, StateOperation, StateScopedEffects, TechId,
+        TechnologyBonus, TechnologyModifiers, TechnologyNode, TechnologyTree, TimelineCondition,
+        TradeLaw,
     };
     use crate::scenario::France1936Scenario;
     use crate::sim::{
@@ -1693,6 +1781,7 @@ mod tests {
                 id: TechId(0),
                 token: "construction2".into(),
                 branch: ResearchBranch::Construction,
+                categories: vec!["construction_tech".into()].into_boxed_slice(),
                 start_year: 1937,
                 base_days: 100,
                 prerequisites: Vec::new().into_boxed_slice(),
@@ -1746,6 +1835,7 @@ mod tests {
                 id: TechId(0),
                 token: "artillery1".into(),
                 branch: ResearchBranch::Production,
+                categories: vec!["artillery".into()].into_boxed_slice(),
                 start_year: 1936,
                 base_days: 1,
                 prerequisites: Vec::new().into_boxed_slice(),
@@ -1992,6 +2082,201 @@ mod tests {
                 .any(|flag| flag.as_ref() == "FRA_rearmed")
         );
         assert!(result.country.has_completed_focus("FRA_begin_rearmament"));
+    }
+
+    #[test]
+    fn focus_availability_supports_politics_faction_and_original_tag_checks() {
+        let scenario = France1936Scenario::standard().with_exact_focus_data(
+            2,
+            Vec::new(),
+            Vec::new(),
+            vec![NationalFocus {
+                id: "FRA_political_gate".into(),
+                days: 1,
+                prerequisites: Vec::new(),
+                mutually_exclusive: Vec::new(),
+                available: FocusCondition::All(vec![
+                    FocusCondition::HasGovernment(GovernmentIdeology::Democratic),
+                    FocusCondition::IsInFaction(true),
+                    FocusCondition::IsSubject(false),
+                    FocusCondition::IsPuppet(false),
+                    FocusCondition::OriginalTag("FRA".into()),
+                ]),
+                bypass: FocusCondition::Not(Box::new(FocusCondition::Always)),
+                search_filters: vec!["FOCUS_FILTER_POLITICAL".into()],
+                effects: vec![FocusEffect::SetCountryFlag {
+                    flag: "FRA_political_gate_completed".into(),
+                    days: None,
+                }],
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let runtime = scenario.bootstrap_runtime();
+        let engine = SimulationEngine::default();
+        let actions = [Action::Focus(FocusAction {
+            date: GameDate::new(1936, 1, 1),
+            focus_id: "FRA_political_gate".into(),
+        })];
+
+        let result = engine
+            .simulate(
+                &scenario,
+                runtime,
+                &actions,
+                GameDate::new(1936, 1, 1),
+                scenario.pivot_window.start,
+            )
+            .unwrap();
+
+        assert!(
+            result
+                .country
+                .has_country_flag("FRA_political_gate_completed")
+        );
+    }
+
+    #[test]
+    fn simulator_applies_political_diplomatic_and_territorial_focus_effects() {
+        let scenario = France1936Scenario::standard().with_exact_focus_data(
+            2,
+            Vec::new(),
+            Vec::new(),
+            vec![NationalFocus {
+                id: "FRA_political_realignment".into(),
+                days: 1,
+                prerequisites: Vec::new(),
+                mutually_exclusive: Vec::new(),
+                available: FocusCondition::Always,
+                bypass: FocusCondition::Not(Box::new(FocusCondition::Always)),
+                search_filters: vec!["FOCUS_FILTER_POLITICAL".into()],
+                effects: vec![
+                    FocusEffect::SetPolitics {
+                        government: GovernmentIdeology::Communism,
+                        elections_allowed: Some(false),
+                        last_election: Some(GameDate::new(1932, 5, 1)),
+                    },
+                    FocusEffect::SetCountryRule {
+                        rule: "can_create_factions".into(),
+                        enabled: true,
+                    },
+                    FocusEffect::CreateFaction("FRA_popular_front".into()),
+                    FocusEffect::CreateWarGoal {
+                        target: "GER".into(),
+                        kind: "topple_government".into(),
+                    },
+                    FocusEffect::TransferState(17),
+                    FocusEffect::AddTechnologyBonus(TechnologyBonus {
+                        name: "FRA_artillery_focus".into(),
+                        categories: vec!["artillery".into()].into_boxed_slice(),
+                        bonus_bp: 10_000,
+                        uses: 1,
+                    }),
+                ],
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let runtime = scenario.bootstrap_runtime();
+        let engine = SimulationEngine::default();
+        let actions = [Action::Focus(FocusAction {
+            date: GameDate::new(1936, 1, 1),
+            focus_id: "FRA_political_realignment".into(),
+        })];
+
+        let result = engine
+            .simulate(
+                &scenario,
+                runtime,
+                &actions,
+                GameDate::new(1936, 1, 1),
+                scenario.pivot_window.start,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result.country.country.government,
+            GovernmentIdeology::Communism
+        );
+        assert!(!result.country.country.elections_allowed);
+        assert_eq!(
+            result.country.country.last_election,
+            Some(GameDate::new(1932, 5, 1))
+        );
+        assert!(result.country.has_country_rule("can_create_factions"));
+        assert_eq!(
+            result.country.world_state.country_faction("FRA"),
+            Some("FRA_popular_front")
+        );
+        assert_eq!(result.country.war_goals[0].target.as_ref(), "GER");
+        assert_eq!(
+            result.country.war_goals[0].kind.as_ref(),
+            "topple_government"
+        );
+        assert_eq!(result.country.transferred_states, vec![17]);
+        assert_eq!(result.country.technology_bonuses.len(), 1);
+    }
+
+    #[test]
+    fn technology_bonus_prefers_matching_research_and_is_consumed_on_completion() {
+        let scenario = France1936Scenario::standard().with_exact_technology_data(
+            TechnologyTree::new(vec![
+                TechnologyNode {
+                    id: TechId(0),
+                    token: "support_tech".into(),
+                    branch: ResearchBranch::Production,
+                    categories: vec!["support".into()].into_boxed_slice(),
+                    start_year: 1936,
+                    base_days: 1,
+                    prerequisites: Vec::new().into_boxed_slice(),
+                    exclusive_with: Vec::new().into_boxed_slice(),
+                    modifiers: TechnologyModifiers::default(),
+                    equipment_unlocks: Vec::new().into_boxed_slice(),
+                },
+                TechnologyNode {
+                    id: TechId(1),
+                    token: "artillery1".into(),
+                    branch: ResearchBranch::Production,
+                    categories: vec!["artillery".into()].into_boxed_slice(),
+                    start_year: 1936,
+                    base_days: 1,
+                    prerequisites: Vec::new().into_boxed_slice(),
+                    exclusive_with: Vec::new().into_boxed_slice(),
+                    modifiers: TechnologyModifiers::default(),
+                    equipment_unlocks: Vec::new().into_boxed_slice(),
+                },
+            ]),
+            Vec::new(),
+        );
+        let mut runtime = scenario.bootstrap_runtime();
+        runtime.add_technology_bonus(TechnologyBonus {
+            name: "FRA_artillery_focus".into(),
+            categories: vec!["artillery".into()].into_boxed_slice(),
+            bonus_bp: 10_000,
+            uses: 1,
+        });
+        let engine = SimulationEngine::default();
+        let actions = [Action::Research(ResearchAction {
+            date: GameDate::new(1936, 1, 1),
+            slot: 0,
+            branch: ResearchBranch::Production,
+        })];
+
+        let result = engine
+            .simulate(
+                &scenario,
+                runtime,
+                &actions,
+                GameDate::new(1936, 1, 1),
+                scenario.pivot_window.start,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result.country.completed_technologies.as_ref(),
+            &[false, true]
+        );
+        assert!(result.country.technology_bonuses.is_empty());
     }
 
     #[test]
@@ -2459,15 +2744,16 @@ mod tests {
             }),
             2 => Action::Law(LawAction {
                 date,
-                target: match a % 9 {
+                target: match a % 10 {
                     0 => LawTarget::Economy(EconomyLaw::CivilianEconomy),
                     1 => LawTarget::Economy(EconomyLaw::EarlyMobilization),
                     2 => LawTarget::Economy(EconomyLaw::PartialMobilization),
                     3 => LawTarget::Economy(EconomyLaw::WarEconomy),
-                    4 => LawTarget::Trade(TradeLaw::FreeTrade),
-                    5 => LawTarget::Trade(TradeLaw::ExportFocus),
-                    6 => LawTarget::Trade(TradeLaw::LimitedExports),
-                    7 => LawTarget::Trade(TradeLaw::ClosedEconomy),
+                    4 => LawTarget::Economy(EconomyLaw::TotalMobilization),
+                    5 => LawTarget::Trade(TradeLaw::FreeTrade),
+                    6 => LawTarget::Trade(TradeLaw::ExportFocus),
+                    7 => LawTarget::Trade(TradeLaw::LimitedExports),
+                    8 => LawTarget::Trade(TradeLaw::ClosedEconomy),
                     _ => LawTarget::Mobilization(match b % 3 {
                         0 => MobilizationLaw::VolunteerOnly,
                         1 => MobilizationLaw::LimitedConscription,
@@ -2924,6 +3210,8 @@ mod tests {
         let mut free = scenario.bootstrap_runtime();
         closed.country.laws.trade = TradeLaw::ClosedEconomy;
         free.country.laws.trade = TradeLaw::FreeTrade;
+        closed.country.laws.economy = EconomyLaw::WarEconomy;
+        free.country.laws.economy = EconomyLaw::WarEconomy;
         let project = ConstructionProject {
             state: France1936Scenario::ILE_DE_FRANCE,
             kind: ConstructionKind::CivilianFactory,

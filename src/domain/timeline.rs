@@ -34,10 +34,17 @@ impl WarState {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FactionMembership {
+    pub country: Box<str>,
+    pub faction: Box<str>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct WorldState {
     pub dissolved_countries: Vec<Box<str>>,
     pub active_wars: Vec<WarState>,
+    pub country_factions: Vec<FactionMembership>,
 }
 
 impl WorldState {
@@ -50,6 +57,32 @@ impl WorldState {
 
     pub fn countries_at_war(&self, left: &str, right: &str) -> bool {
         self.active_wars.iter().any(|war| war.matches(left, right))
+    }
+
+    pub fn country_faction(&self, tag: &str) -> Option<&str> {
+        self.country_factions
+            .iter()
+            .find(|membership| membership.country.as_ref() == tag)
+            .map(|membership| membership.faction.as_ref())
+    }
+
+    pub fn country_in_faction(&self, tag: &str) -> bool {
+        self.country_faction(tag).is_some()
+    }
+
+    pub fn set_country_faction(&mut self, tag: impl Into<Box<str>>, faction: impl Into<Box<str>>) {
+        let tag = tag.into();
+        self.country_factions
+            .retain(|membership| membership.country != tag);
+        self.country_factions.push(FactionMembership {
+            country: tag,
+            faction: faction.into(),
+        });
+    }
+
+    pub fn clear_country_faction(&mut self, tag: &str) {
+        self.country_factions
+            .retain(|membership| membership.country.as_ref() != tag);
     }
 
     pub fn dissolve_country(&mut self, tag: impl Into<Box<str>>) {
@@ -102,6 +135,16 @@ impl WorldState {
                 .iter()
                 .all(|war| war.first.as_ref() != war.second.as_ref()),
             "war pair cannot target the same country"
+        );
+        let factions = self
+            .country_factions
+            .iter()
+            .map(|membership| membership.country.as_ref())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            factions.len(),
+            self.country_factions.len(),
+            "duplicate country faction membership"
         );
     }
 }
@@ -169,10 +212,13 @@ mod tests {
         let mut state = WorldState::default();
         state.dissolve_country("AUS");
         state.start_war("FRA", "GER");
+        state.set_country_faction("FRA", "allies");
 
         assert!(!state.country_exists("AUS"));
         assert!(state.country_exists("CZE"));
         assert!(state.countries_at_war("GER", "FRA"));
+        assert_eq!(state.country_faction("FRA"), Some("allies"));
+        assert!(state.country_in_faction("FRA"));
     }
 
     #[test]

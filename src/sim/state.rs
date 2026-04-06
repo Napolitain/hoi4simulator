@@ -1,8 +1,8 @@
 use crate::domain::{
     CountryLaws, DoctrineCostReduction, EquipmentDemand, EquipmentKind, FieldedDivision,
-    FocusBuildingKind, GameDate, IdeaDefinition, IdeaModifiers, ModeledEquipmentProfiles,
-    ResourceLedger, TechId, TechnologyModifiers, TechnologyNode, TechnologyTree, TimelineEvent,
-    WorldState,
+    FocusBuildingKind, GameDate, GovernmentIdeology, IdeaDefinition, IdeaModifiers,
+    ModeledEquipmentProfiles, ResourceLedger, TechId, TechnologyBonus, TechnologyModifiers,
+    TechnologyNode, TechnologyTree, TimelineEvent, WorldState,
 };
 use crate::scenario::{Frontier, FrontierFortRequirement};
 
@@ -25,6 +25,9 @@ pub struct CountryState {
     pub political_power_daily_centi: u16,
     pub stability_bp: u16,
     pub war_support_bp: u16,
+    pub government: GovernmentIdeology,
+    pub elections_allowed: bool,
+    pub last_election: Option<GameDate>,
     pub laws: CountryLaws,
 }
 
@@ -51,6 +54,9 @@ impl CountryState {
             political_power_daily_centi: 2 * POLITICAL_POWER_UNIT as u16,
             stability_bp,
             war_support_bp,
+            government: GovernmentIdeology::Democratic,
+            elections_allowed: true,
+            last_election: None,
             laws,
         }
     }
@@ -320,6 +326,12 @@ pub struct ActiveCountryFlag {
     pub expires_on: Option<GameDate>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RootWarGoal {
+    pub target: Box<str>,
+    pub kind: Box<str>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct ResearchSlotState {
     pub branch: Option<ResearchBranch>,
@@ -330,6 +342,9 @@ pub struct ResearchSlotState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CountryRuntime {
     pub country: CountryState,
+    pub tag: Box<str>,
+    pub original_tag: Box<str>,
+    pub subject_of: Option<Box<str>>,
     pub enabled_dlcs: Box<[Box<str>]>,
     pub state_defs: Box<[StateDefinition]>,
     pub states: Box<[StateRuntime]>,
@@ -348,13 +363,19 @@ pub struct CountryRuntime {
     pub completed_focuses: Vec<CompletedFocus>,
     pub active_ideas: Vec<ActiveIdea>,
     pub doctrine_cost_reductions: Vec<DoctrineCostReduction>,
+    pub technology_bonuses: Vec<TechnologyBonus>,
     pub country_flags: Vec<ActiveCountryFlag>,
     pub country_leader_traits: Vec<Box<str>>,
+    pub country_rules: Vec<Box<str>>,
+    pub war_goals: Vec<RootWarGoal>,
     pub world_state: WorldState,
     pub state_flags: Box<[Vec<Box<str>>]>,
+    pub transferred_states: Vec<u32>,
     pub research_slots: Vec<ResearchSlotState>,
     pub completed_research: ResearchSummary,
     pub advisors: AdvisorRoster,
+    pub convoys: u16,
+    pub selected_naval_oob: Option<Box<str>>,
 }
 
 impl CountryRuntime {
@@ -369,6 +390,9 @@ impl CountryRuntime {
 
         let runtime = Self {
             country,
+            tag: "FRA".into(),
+            original_tag: "FRA".into(),
+            subject_of: None,
             enabled_dlcs: Vec::new().into_boxed_slice(),
             state_defs,
             states,
@@ -387,13 +411,19 @@ impl CountryRuntime {
             completed_focuses: Vec::with_capacity(64),
             active_ideas: Vec::with_capacity(32),
             doctrine_cost_reductions: Vec::with_capacity(8),
+            technology_bonuses: Vec::with_capacity(16),
             country_flags: Vec::with_capacity(32),
             country_leader_traits: Vec::with_capacity(8),
+            country_rules: Vec::with_capacity(8),
+            war_goals: Vec::with_capacity(16),
             world_state: WorldState::default(),
             state_flags: vec![Vec::new(); state_count].into_boxed_slice(),
+            transferred_states: Vec::with_capacity(32),
             research_slots: vec![ResearchSlotState::default(), ResearchSlotState::default()],
             completed_research: ResearchSummary::default(),
             advisors: AdvisorRoster::default(),
+            convoys: 0,
+            selected_naval_oob: None,
         };
         runtime.assert_invariants();
         runtime
@@ -412,6 +442,21 @@ impl CountryRuntime {
         self
     }
 
+    pub fn with_identity(mut self, tag: impl Into<Box<str>>) -> Self {
+        let tag = tag.into();
+        self.original_tag = tag.clone();
+        self.tag = tag;
+        self.assert_invariants();
+        self
+    }
+
+    pub fn with_naval_setup(mut self, selected_naval_oob: Option<Box<str>>, convoys: u16) -> Self {
+        self.selected_naval_oob = selected_naval_oob;
+        self.convoys = convoys;
+        self.assert_invariants();
+        self
+    }
+
     pub fn with_equipment_profiles(mut self, equipment_profiles: ModeledEquipmentProfiles) -> Self {
         self.equipment_profiles = equipment_profiles;
         self.assert_invariants();
@@ -422,6 +467,96 @@ impl CountryRuntime {
         self.enabled_dlcs
             .iter()
             .any(|current| current.as_ref() == dlc)
+    }
+
+    pub fn is_subject(&self) -> bool {
+        self.subject_of.is_some()
+    }
+
+    pub fn in_faction(&self) -> bool {
+        self.world_state.country_in_faction(self.tag.as_ref())
+    }
+
+    pub fn set_country_rule(&mut self, rule: impl Into<Box<str>>, enabled: bool) {
+        let rule = rule.into();
+        self.country_rules.retain(|current| current != &rule);
+        if enabled {
+            self.country_rules.push(rule);
+        }
+        self.assert_invariants();
+    }
+
+    pub fn has_country_rule(&self, rule: &str) -> bool {
+        self.country_rules
+            .iter()
+            .any(|current| current.as_ref() == rule)
+    }
+
+    pub fn create_faction(&mut self, faction: impl Into<Box<str>>) {
+        self.world_state
+            .set_country_faction(self.tag.clone(), faction.into());
+        self.assert_invariants();
+    }
+
+    pub fn join_faction(&mut self, target: &str) {
+        let faction = self
+            .world_state
+            .country_faction(target)
+            .map(|faction| faction.to_string())
+            .unwrap_or_else(|| target.to_string());
+        self.world_state
+            .set_country_faction(self.tag.clone(), faction);
+        self.assert_invariants();
+    }
+
+    pub fn add_war_goal(&mut self, target: impl Into<Box<str>>, kind: impl Into<Box<str>>) {
+        let war_goal = RootWarGoal {
+            target: target.into(),
+            kind: kind.into(),
+        };
+        if self.war_goals.iter().any(|current| current == &war_goal) {
+            return;
+        }
+        self.war_goals.push(war_goal);
+        self.assert_invariants();
+    }
+
+    pub fn transfer_state_to_root(&mut self, raw_state_id: u32) {
+        if self
+            .transferred_states
+            .iter()
+            .any(|state| state == &raw_state_id)
+        {
+            return;
+        }
+        self.transferred_states.push(raw_state_id);
+        self.assert_invariants();
+    }
+
+    pub fn add_technology_bonus(&mut self, bonus: TechnologyBonus) {
+        if bonus.uses == 0 {
+            return;
+        }
+        self.technology_bonuses.push(bonus);
+        self.assert_invariants();
+    }
+
+    pub fn technology_bonus_bp(&self, technology: &TechnologyNode) -> u32 {
+        self.technology_bonuses
+            .iter()
+            .filter(|bonus| bonus.matches(technology))
+            .map(|bonus| u32::from(bonus.bonus_bp))
+            .sum()
+    }
+
+    pub fn consume_technology_bonuses(&mut self, technology: &TechnologyNode) {
+        for bonus in &mut self.technology_bonuses {
+            if bonus.uses > 0 && bonus.matches(technology) {
+                bonus.uses = bonus.uses.saturating_sub(1);
+            }
+        }
+        self.technology_bonuses.retain(|bonus| bonus.uses > 0);
+        self.assert_invariants();
     }
 
     pub fn with_fielded_force(
@@ -456,6 +591,8 @@ impl CountryRuntime {
         assert_eq!(self.state_defs.len(), self.states.len());
         assert_eq!(self.state_defs.len(), self.state_flags.len());
         assert!(!self.research_slots.is_empty());
+        assert!(!self.tag.is_empty());
+        assert!(!self.original_tag.is_empty());
         assert!(self.country.stability_bp <= 10_000);
         assert!(self.country.war_support_bp <= 10_000);
         assert!(self.stability_weekly_accumulator_bp.abs() < 7);
@@ -491,6 +628,18 @@ impl CountryRuntime {
                 .iter()
                 .map(|reduction| (reduction.name.as_ref(), reduction.category.as_ref())),
             "doctrine cost reduction",
+        );
+        assert_unique_strs(self.country_rules.iter().map(Box::as_ref), "country rule");
+        assert_unique_pairs(
+            self.war_goals
+                .iter()
+                .map(|war_goal| (war_goal.target.as_ref(), war_goal.kind.as_ref())),
+            "war goal",
+        );
+        assert_unique_copy(self.transferred_states.iter().copied(), "transferred state");
+        assert!(
+            self.technology_bonuses.iter().all(|bonus| bonus.uses > 0),
+            "technology bonus must retain at least one use"
         );
         self.world_state.assert_invariants();
 
@@ -615,12 +764,7 @@ impl CountryRuntime {
     }
 
     pub fn consumer_goods_factories(&self, ideas: &[IdeaDefinition]) -> u16 {
-        let mut ratio_bp = i32::from(match self.country.laws.economy {
-            crate::domain::EconomyLaw::CivilianEconomy => 3_000_u16,
-            crate::domain::EconomyLaw::EarlyMobilization => 2_500_u16,
-            crate::domain::EconomyLaw::PartialMobilization => 2_000_u16,
-            crate::domain::EconomyLaw::WarEconomy => 1_500_u16,
-        });
+        let mut ratio_bp = i32::from(self.country.laws.economy.consumer_goods_ratio_bp());
         ratio_bp += self.idea_modifiers(ideas).consumer_goods_bp;
         ratio_bp = ratio_bp.clamp(0, 10_000);
 
@@ -644,6 +788,15 @@ impl CountryRuntime {
     ) -> u16 {
         let mut bonus = self.idea_modifiers(ideas).construction_bonus_bp(kind)
             + i32::from(self.country.laws.trade.construction_speed_bp());
+        bonus += match kind {
+            FocusBuildingKind::CivilianFactory => {
+                i32::from(self.country.laws.economy.civilian_factory_construction_bp())
+            }
+            FocusBuildingKind::MilitaryFactory => {
+                i32::from(self.country.laws.economy.military_factory_construction_bp())
+            }
+            FocusBuildingKind::Infrastructure | FocusBuildingKind::LandFort => 0,
+        };
         if self.generic_research_mode() {
             bonus += i32::from(self.completed_research.construction) * 200;
             bonus += i32::from(self.completed_research.industry) * 100;
@@ -816,6 +969,7 @@ impl CountryRuntime {
         }
 
         self.completed_technologies[node.id.index()] = true;
+        self.consume_technology_bonuses(node);
         self.technology_modifiers = self.technology_modifiers.plus(node.modifiers);
         self.apply_research_completion(node.branch);
         let efficiency_floor_permille = self.production_efficiency_floor_permille();
@@ -1217,8 +1371,8 @@ mod tests {
 
         assert_eq!(runtime.total_civilian_factories(), 14);
         assert_eq!(runtime.total_military_factories(), 6);
-        assert_eq!(runtime.consumer_goods_factories(ideas), 6);
-        assert_eq!(runtime.available_civilian_factories(ideas), 8);
+        assert_eq!(runtime.consumer_goods_factories(ideas), 7);
+        assert_eq!(runtime.available_civilian_factories(ideas), 7);
     }
 
     #[test]
@@ -1403,6 +1557,7 @@ mod tests {
     fn runtime_free_trade_applies_raw_trade_law_bonuses() {
         let mut runtime = test_runtime();
         runtime.country.laws.trade = TradeLaw::FreeTrade;
+        runtime.country.laws.economy = crate::domain::EconomyLaw::WarEconomy;
 
         assert_eq!(
             runtime.domestic_resources(&[]),
@@ -1433,7 +1588,7 @@ mod tests {
         };
 
         assert_eq!(
-            runtime.construction_speed_bp_for(FocusBuildingKind::MilitaryFactory, &[]),
+            runtime.construction_speed_bp_for(FocusBuildingKind::Infrastructure, &[]),
             600
         );
         assert_eq!(runtime.military_output_bp(&[]), 450);

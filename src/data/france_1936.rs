@@ -11,10 +11,10 @@ use fory_core::StructSerializer;
 use crate::domain::{
     CountryLaws, DoctrineCostReduction, EconomyLaw, EquipmentDemand, EquipmentKind,
     EquipmentProfile, FieldedDivision, FocusBuildingKind, FocusCondition, FocusEffect,
-    FocusStateScope, GameDate, IdeaDefinition, IdeaModifiers, MobilizationLaw,
+    FocusStateScope, GameDate, GovernmentIdeology, IdeaDefinition, IdeaModifiers, MobilizationLaw,
     ModeledEquipmentProfiles, NationalFocus, ResearchBranch, ResourceLedger, StateCondition,
-    StateOperation, StateScopedEffects, TechId, TechnologyModifiers, TechnologyNode,
-    TechnologyTree, TimelineCondition, TradeLaw,
+    StateOperation, StateScopedEffects, TechId, TechnologyBonus, TechnologyModifiers,
+    TechnologyNode, TechnologyTree, TimelineCondition, TradeLaw,
 };
 use crate::scenario::{France1936Scenario, Frontier};
 
@@ -183,12 +183,17 @@ struct ExactCountrySetup {
     starting_research_slots: u8,
     starting_stability_bp: u16,
     starting_war_support_bp: u16,
+    starting_government: GovernmentIdeology,
+    starting_elections_allowed: bool,
+    starting_last_election: Option<GameDate>,
     land_oob: Option<Box<str>>,
     air_oob: Option<Box<str>>,
+    naval_oob: Option<Box<str>>,
     starting_ideas: Vec<Box<str>>,
     starting_country_flags: Vec<Box<str>>,
     starting_technologies: Vec<Box<str>>,
     starting_train_buffer: u16,
+    starting_convoys: u16,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -201,12 +206,20 @@ struct InstalledDlc {
 struct ParsedTechnologyNode {
     token: Box<str>,
     branch: ResearchBranch,
+    categories: Vec<Box<str>>,
     start_year: u16,
     base_days: u16,
     leads_to: Vec<Box<str>>,
     exclusive_with: Vec<Box<str>>,
     modifiers: TechnologyModifiers,
     equipment_unlocks: Vec<crate::domain::EquipmentUnlock>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ParsedPolitics {
+    government: GovernmentIdeology,
+    elections_allowed: Option<bool>,
+    last_election: Option<GameDate>,
 }
 
 pub fn ingest_profile(
@@ -325,6 +338,11 @@ pub fn load_france_1936_scenario(
     scenario.initial_country.laws = setup.laws;
     scenario.initial_country.stability_bp = setup.starting_stability_bp;
     scenario.initial_country.war_support_bp = setup.starting_war_support_bp;
+    scenario.initial_country.government = setup.starting_government;
+    scenario.initial_country.elections_allowed = setup.starting_elections_allowed;
+    scenario.initial_country.last_election = setup.starting_last_election;
+    scenario.starting_naval_oob = setup.naval_oob;
+    scenario.starting_convoys = setup.starting_convoys;
     scenario = scenario.with_exact_focus_data(
         setup.starting_research_slots.max(1),
         setup.starting_ideas,
@@ -401,6 +419,8 @@ fn extract_exact_country_setup(
         starting_research_slots: 2,
         starting_stability_bp: 5_000,
         starting_war_support_bp: 5_000,
+        starting_government: GovernmentIdeology::Democratic,
+        starting_elections_allowed: true,
         ..ExactCountrySetup::default()
     };
     let mut law_tokens = Vec::new();
@@ -439,6 +459,11 @@ fn extract_exact_country_setup(
                     setup.air_oob = Some(value.into());
                 }
             }
+            "set_naval_oob" => {
+                if let Some(value) = assignment.value.as_str() {
+                    setup.naval_oob = Some(value.into());
+                }
+            }
             "starting_train_buffer" => {
                 if let Some(value) = assignment
                     .value
@@ -449,9 +474,31 @@ fn extract_exact_country_setup(
                 }
             }
             "add_ideas" => collect_boxed_strings(&assignment.value, &mut setup.starting_ideas),
+            "set_convoys" => {
+                if let Some(value) = assignment
+                    .value
+                    .as_u64()
+                    .and_then(|value| u16::try_from(value).ok())
+                {
+                    setup.starting_convoys = value;
+                }
+            }
             "set_country_flag" => {
                 if let Some(flag) = assignment.value.as_str() {
                     push_unique_boxed(&mut setup.starting_country_flags, flag);
+                }
+            }
+            "set_politics" => {
+                if let Some(block) = assignment.value.as_block()
+                    && let Some(politics) = parse_politics_block(block)
+                {
+                    setup.starting_government = politics.government;
+                    if let Some(elections_allowed) = politics.elections_allowed {
+                        setup.starting_elections_allowed = elections_allowed;
+                    }
+                    if politics.last_election.is_some() {
+                        setup.starting_last_election = politics.last_election;
+                    }
                 }
             }
             "set_technology" => {
@@ -563,6 +610,7 @@ fn parse_technology_tree(
             id: TechId(u16::try_from(index).unwrap_or(u16::MAX)),
             token: node.token,
             branch: node.branch,
+            categories: node.categories.into_boxed_slice(),
             start_year: node.start_year,
             base_days: node.base_days,
             prerequisites: prerequisites[index].clone().into_boxed_slice(),
@@ -610,6 +658,7 @@ fn parse_technology_node(
     Some(ParsedTechnologyNode {
         token: token.into(),
         branch,
+        categories,
         start_year: block
             .first_assignment("start_year")
             .and_then(ClausewitzValue::as_u64)
@@ -953,9 +1002,38 @@ fn parse_focus_condition_assignment(
                 });
             }
         }
+        "has_government" => {
+            if let Some(government) = assignment
+                .value
+                .as_str()
+                .and_then(GovernmentIdeology::from_token)
+            {
+                conditions.push(FocusCondition::HasGovernment(government));
+            }
+        }
         "has_idea" => {
             if let Some(id) = assignment.value.as_str() {
                 conditions.push(FocusCondition::HasIdea(id.into()));
+            }
+        }
+        "is_in_faction" => {
+            if let Some(value) = assignment.value.as_bool() {
+                conditions.push(FocusCondition::IsInFaction(value));
+            }
+        }
+        "is_puppet" => {
+            if let Some(value) = assignment.value.as_bool() {
+                conditions.push(FocusCondition::IsPuppet(value));
+            }
+        }
+        "is_subject" => {
+            if let Some(value) = assignment.value.as_bool() {
+                conditions.push(FocusCondition::IsSubject(value));
+            }
+        }
+        "original_tag" => {
+            if let Some(tag) = assignment.value.as_str() {
+                conditions.push(FocusCondition::OriginalTag(tag.into()));
             }
         }
         "has_war_support" => {
@@ -1183,6 +1261,26 @@ pub fn parse_dot_game_date(value: &str) -> Option<GameDate> {
     Some(GameDate::new(year, month, day))
 }
 
+fn parse_politics_block(block: &ClausewitzBlock) -> Option<ParsedPolitics> {
+    let government = block
+        .first_assignment("ruling_party")
+        .and_then(ClausewitzValue::as_str)
+        .and_then(GovernmentIdeology::from_token)?;
+    let elections_allowed = block
+        .first_assignment("elections_allowed")
+        .and_then(ClausewitzValue::as_bool);
+    let last_election = block
+        .first_assignment("last_election")
+        .and_then(ClausewitzValue::as_str)
+        .and_then(parse_dot_game_date);
+
+    Some(ParsedPolitics {
+        government,
+        elections_allowed,
+        last_election,
+    })
+}
+
 fn parse_research_slot_condition(
     operator: ClausewitzOperator,
     value: &ClausewitzValue,
@@ -1402,6 +1500,13 @@ fn parse_focus_effect_assignment(
                 effects.push(FocusEffect::AddDoctrineCostReduction(reduction));
             }
         }
+        "add_tech_bonus" => {
+            if let Some(child) = assignment.value.as_block()
+                && let Some(bonus) = parse_technology_bonus(child)
+            {
+                effects.push(FocusEffect::AddTechnologyBonus(bonus));
+            }
+        }
         "add_country_leader_trait" => {
             if let Some(trait_id) = assignment.value.as_str() {
                 effects.push(FocusEffect::AddCountryLeaderTrait(trait_id.into()));
@@ -1442,6 +1547,56 @@ fn parse_focus_effect_assignment(
                     flag: flag.into(),
                     days,
                 });
+            }
+        }
+        "set_politics" => {
+            if let Some(child) = assignment.value.as_block()
+                && let Some(politics) = parse_politics_block(child)
+            {
+                effects.push(FocusEffect::SetPolitics {
+                    government: politics.government,
+                    elections_allowed: politics.elections_allowed,
+                    last_election: politics.last_election,
+                });
+            }
+        }
+        "set_rule" => {
+            if let Some(child) = assignment.value.as_block() {
+                parse_country_rule_effects(child, effects);
+            }
+        }
+        "create_faction" | "create_faction_from_template" => {
+            if let Some(faction) = parse_create_faction_name(assignment) {
+                effects.push(FocusEffect::CreateFaction(faction));
+            }
+        }
+        "add_to_faction" => {
+            if let Some(tag) = assignment.value.as_str() {
+                effects.push(FocusEffect::JoinFaction(tag.into()));
+            }
+        }
+        "create_wargoal" => {
+            if let Some(child) = assignment.value.as_block()
+                && let Some(target) = child
+                    .first_assignment("target")
+                    .and_then(ClausewitzValue::as_str)
+                && let Some(kind) = child
+                    .first_assignment("type")
+                    .and_then(ClausewitzValue::as_str)
+            {
+                effects.push(FocusEffect::CreateWarGoal {
+                    target: target.into(),
+                    kind: kind.into(),
+                });
+            }
+        }
+        "transfer_state" => {
+            if let Some(state) = assignment
+                .value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+            {
+                effects.push(FocusEffect::TransferState(state));
             }
         }
         "if" | "IF" => {
@@ -1555,6 +1710,61 @@ fn parse_focus_effect_stat(assignment: &ClausewitzAssignment, effects: &mut Vec<
             }
         }
         _ => {}
+    }
+}
+
+fn parse_technology_bonus(block: &ClausewitzBlock) -> Option<TechnologyBonus> {
+    let name = block
+        .first_assignment("name")
+        .and_then(ClausewitzValue::as_str)?;
+    let bonus_bp = block
+        .first_assignment("bonus")
+        .and_then(clausewitz_percent_bp)?;
+    let uses = block
+        .first_assignment("uses")
+        .and_then(ClausewitzValue::as_u64)
+        .and_then(|value| u8::try_from(value).ok())?;
+    let categories = block
+        .assignments("category")
+        .filter_map(ClausewitzValue::as_str)
+        .map(Into::into)
+        .collect::<Vec<Box<str>>>();
+    if categories.is_empty() || uses == 0 {
+        return None;
+    }
+
+    Some(TechnologyBonus {
+        name: name.into(),
+        categories: categories.into_boxed_slice(),
+        bonus_bp,
+        uses,
+    })
+}
+
+fn parse_country_rule_effects(block: &ClausewitzBlock, effects: &mut Vec<FocusEffect>) {
+    for item in &block.items {
+        let ClausewitzItem::Assignment(assignment) = item else {
+            continue;
+        };
+        let Some(enabled) = assignment.value.as_bool() else {
+            continue;
+        };
+        effects.push(FocusEffect::SetCountryRule {
+            rule: assignment.key.clone(),
+            enabled,
+        });
+    }
+}
+
+fn parse_create_faction_name(assignment: &ClausewitzAssignment) -> Option<Box<str>> {
+    match assignment.value.as_str() {
+        Some(value) => Some(value.into()),
+        None => assignment
+            .value
+            .as_block()
+            .and_then(|child| child.first_assignment("name"))
+            .and_then(ClausewitzValue::as_str)
+            .map(Into::into),
     }
 }
 
@@ -1720,7 +1930,15 @@ fn collect_focus_effect_idea_ids(effects: &[FocusEffect], ids: &mut Vec<Box<str>
         match effect {
             FocusEffect::AddIdea(id) => push_unique_boxed(ids, id),
             FocusEffect::RemoveIdea(id) => push_unique_boxed(ids, id),
-            FocusEffect::SetCountryFlag { .. } | FocusEffect::Unsupported(_) => {}
+            FocusEffect::SetCountryFlag { .. }
+            | FocusEffect::AddTechnologyBonus(_)
+            | FocusEffect::CreateFaction(_)
+            | FocusEffect::CreateWarGoal { .. }
+            | FocusEffect::JoinFaction(_)
+            | FocusEffect::SetCountryRule { .. }
+            | FocusEffect::SetPolitics { .. }
+            | FocusEffect::TransferState(_)
+            | FocusEffect::Unsupported(_) => {}
             FocusEffect::AddTimedIdea { id, .. } => push_unique_boxed(ids, id),
             FocusEffect::SwapIdea { remove, add } => {
                 push_unique_boxed(ids, remove);
@@ -2443,11 +2661,14 @@ fn extract_country_laws_from_tokens(tokens: &[String]) -> CountryLaws {
         .rev()
         .find_map(|token| match token.as_str() {
             "civilian_economy" => Some(EconomyLaw::CivilianEconomy),
-            "early_mobilization" => Some(EconomyLaw::EarlyMobilization),
+            "low_economic_mobilisation" | "early_mobilization" => {
+                Some(EconomyLaw::EarlyMobilization)
+            }
             "partial_economic_mobilisation" | "partial_mobilization" => {
                 Some(EconomyLaw::PartialMobilization)
             }
             "war_economy" => Some(EconomyLaw::WarEconomy),
+            "tot_economic_mobilisation" => Some(EconomyLaw::TotalMobilization),
             _ => None,
         })
         .unwrap_or(defaults.economy);
@@ -3340,7 +3561,8 @@ mod tests {
     use crate::domain::GameDate;
     use crate::domain::{
         CountryLaws, DoctrineCostReduction, EconomyLaw, EquipmentDemand, EquipmentKind,
-        FocusCondition, FocusEffect, IdeaModifiers, MobilizationLaw, TimelineCondition, TradeLaw,
+        FocusCondition, FocusEffect, GovernmentIdeology, IdeaModifiers, MobilizationLaw,
+        TimelineCondition, TradeLaw,
     };
 
     use super::{
@@ -3467,6 +3689,39 @@ mod tests {
     }
 
     #[test]
+    fn focus_condition_parser_supports_politics_and_faction_checks() {
+        let root = parse_clausewitz(
+            r#"
+            available = {
+                has_government = democratic
+                is_subject = no
+                is_in_faction = yes
+                original_tag = FRA
+                is_puppet = no
+            }
+            "#,
+        )
+        .unwrap();
+        let block = root
+            .first_assignment("available")
+            .and_then(|value| value.as_block())
+            .unwrap();
+
+        let condition = parse_focus_condition_block(block);
+
+        assert_eq!(
+            condition,
+            FocusCondition::All(vec![
+                FocusCondition::HasGovernment(GovernmentIdeology::Democratic),
+                FocusCondition::IsSubject(false),
+                FocusCondition::IsInFaction(true),
+                FocusCondition::OriginalTag("FRA".into()),
+                FocusCondition::IsPuppet(false),
+            ])
+        );
+    }
+
+    #[test]
     fn parse_dot_game_date_rejects_out_of_range_components_without_panicking() {
         assert_eq!(parse_dot_game_date("1939.13.1"), None);
         assert_eq!(parse_dot_game_date("1939.0.1"), None);
@@ -3498,6 +3753,71 @@ mod tests {
                 flag: "FRA_popular_front_cooldown".into(),
                 days: Some(360),
             }]
+        );
+    }
+
+    #[test]
+    fn focus_effect_parser_supports_politics_diplomacy_and_technology_bonus_effects() {
+        let root = parse_clausewitz(
+            r#"
+            completion_reward = {
+                set_politics = { ruling_party = communism elections_allowed = no }
+                set_rule = { can_create_factions = yes can_send_volunteers = yes }
+                create_faction_from_template = {
+                    template = faction_template_popular_front
+                    name = FRA_popular_front
+                }
+                add_to_faction = ENG
+                create_wargoal = { target = GER type = topple_government }
+                transfer_state = 17
+                add_tech_bonus = {
+                    name = FRA_artillery_focus
+                    bonus = 1.0
+                    uses = 1
+                    category = artillery
+                    category = industry
+                }
+            }
+            "#,
+        )
+        .unwrap();
+        let block = root
+            .first_assignment("completion_reward")
+            .and_then(|value| value.as_block())
+            .unwrap();
+
+        let effects = parse_focus_effects_block(block);
+
+        assert_eq!(
+            effects,
+            vec![
+                FocusEffect::SetPolitics {
+                    government: GovernmentIdeology::Communism,
+                    elections_allowed: Some(false),
+                    last_election: None,
+                },
+                FocusEffect::SetCountryRule {
+                    rule: "can_create_factions".into(),
+                    enabled: true,
+                },
+                FocusEffect::SetCountryRule {
+                    rule: "can_send_volunteers".into(),
+                    enabled: true,
+                },
+                FocusEffect::CreateFaction("FRA_popular_front".into()),
+                FocusEffect::JoinFaction("ENG".into()),
+                FocusEffect::CreateWarGoal {
+                    target: "GER".into(),
+                    kind: "topple_government".into(),
+                },
+                FocusEffect::TransferState(17),
+                FocusEffect::AddTechnologyBonus(crate::domain::TechnologyBonus {
+                    name: "FRA_artillery_focus".into(),
+                    categories: vec!["artillery".into(), "industry".into()].into_boxed_slice(),
+                    bonus_bp: 10_000,
+                    uses: 1,
+                }),
+            ]
         );
     }
 
@@ -3561,6 +3881,38 @@ mod tests {
                 "construction1".into(),
                 "electronic_mechanical_engineering".into(),
             ]
+        );
+    }
+
+    #[test]
+    fn country_setup_extracts_politics_naval_oob_and_convoys() {
+        let history = parse_clausewitz(
+            r#"
+            if = {
+                limit = { has_dlc = "Man the Guns" }
+                set_naval_oob = "FRA_1936_naval_mtg"
+                else = { set_naval_oob = "FRA_1936_naval_legacy" }
+            }
+            set_convoys = 300
+            set_politics = {
+                ruling_party = democratic
+                last_election = "1932.5.1"
+                elections_allowed = yes
+            }
+            "#,
+        )
+        .unwrap();
+        let enabled_dlcs = vec![Box::<str>::from("Man the Guns")];
+
+        let setup = extract_exact_country_setup(&history, GameDate::new(1936, 1, 1), &enabled_dlcs);
+
+        assert_eq!(setup.naval_oob.as_deref(), Some("FRA_1936_naval_mtg"));
+        assert_eq!(setup.starting_convoys, 300);
+        assert_eq!(setup.starting_government, GovernmentIdeology::Democratic);
+        assert!(setup.starting_elections_allowed);
+        assert_eq!(
+            setup.starting_last_election,
+            Some(GameDate::new(1932, 5, 1))
         );
     }
 
@@ -3885,6 +4237,13 @@ mod tests {
             set_research_slots = 3
             set_stability = 0.45
             set_war_support = 0.15
+            set_naval_oob = "FRA_1936_naval"
+            set_convoys = 300
+            set_politics = {
+                ruling_party = democratic
+                last_election = "1932.5.1"
+                elections_allowed = yes
+            }
             add_ideas = { civilian_economy export_focus limited_conscription }
             set_production = { producer = FRA equipment = infantry_equipment_1 amount = 8 }
             set_production = { producer = FRA equipment = support_equipment_1 amount = 2 }
@@ -4121,6 +4480,13 @@ mod tests {
             set_research_slots = 3
             set_stability = 0.45
             set_war_support = 0.15
+            set_naval_oob = "FRA_1936_naval"
+            set_convoys = 300
+            set_politics = {
+                ruling_party = democratic
+                last_election = "1932.5.1"
+                elections_allowed = yes
+            }
             add_ideas = { civilian_economy export_focus limited_conscription }
             set_production = { producer = FRA equipment = infantry_equipment_1 amount = 8 }
             set_production = { producer = FRA equipment = support_equipment_1 amount = 2 }
@@ -4208,6 +4574,20 @@ mod tests {
         assert_eq!(scenario.starting_research_slots, 3);
         assert_eq!(scenario.initial_country.stability_bp, 4_500);
         assert_eq!(scenario.initial_country.war_support_bp, 1_500);
+        assert_eq!(
+            scenario.initial_country.government,
+            GovernmentIdeology::Democratic
+        );
+        assert!(scenario.initial_country.elections_allowed);
+        assert_eq!(
+            scenario.initial_country.last_election,
+            Some(GameDate::new(1932, 5, 1))
+        );
+        assert_eq!(
+            scenario.starting_naval_oob.as_deref(),
+            Some("FRA_1936_naval")
+        );
+        assert_eq!(scenario.starting_convoys, 300);
         assert_eq!(scenario.focuses.len(), 2);
         assert!(scenario.focus_by_id("FRA_begin_rearmament").is_some());
         assert!(scenario.idea_by_id("FRA_devalue_the_franc").is_some());

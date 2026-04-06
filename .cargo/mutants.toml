@@ -1,0 +1,19 @@
+all_features = true
+build_timeout_multiplier = 2.0
+cap_lints = true
+minimum_test_timeout = 60.0
+output = "mutants.out"
+skip_calls_defaults = true
+timeout_multiplier = 2.0
+
+# Start with the invariant-heavy modules that already have property tests.
+# This keeps mutation runs useful without turning solver/exact-scenario runs
+# into an always-on heavyweight gate.
+examine_globs = [
+    "src/data/clausewitz.rs",
+    "src/domain/calendar.rs",
+    "src/domain/laws.rs",
+    "src/domain/resources.rs",
+    "src/domain/templates.rs",
+    "src/sim/state.rs",
+]
